@@ -85,6 +85,7 @@ class PatternTab(QWidget):
             "Fe Kα1 (1.9373)",
             "Cr Kα1 (2.2897)",
             "Mo Kα1 (0.7107)",
+            "Mo Kα (0.2401)",
             "Custom"
         ])
         self.wavelength_combo.currentTextChanged.connect(self.wavelength_changed)
@@ -199,7 +200,7 @@ class PatternTab(QWidget):
             self,
             "Load Diffraction Pattern",
             "",
-            "Data files (*.xy *.xye *.txt *.dat *.csv);;All files (*.*)"
+            "Data files (*.xy *.xye *.xml *.txt *.dat *.csv);;All files (*.*)"
         )
         
         if file_path:
@@ -208,111 +209,28 @@ class PatternTab(QWidget):
     def load_pattern(self, file_path):
         """Load diffraction pattern from file"""
         try:
-            # First, preprocess the file to handle C-style comments and multiple spaces
-            processed_lines = []
-            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                in_c_comment = False
-                for line in f:
-                    line = line.strip()
-                    
-                    # Skip empty lines
-                    if not line:
-                        continue
-                    
-                    # Handle C-style comments /* */
-                    if '/*' in line:
-                        in_c_comment = True
-                        line = line[:line.find('/*')]
-                    if '*/' in line:
-                        in_c_comment = False
-                        line = line[line.find('*/') + 2:]
-                        
-                    # Skip lines inside C-style comments
-                    if in_c_comment:
-                        continue
-                        
-                    # Skip regular comments starting with #
-                    if line.startswith('#'):
-                        continue
-                        
-                    # If line has content after comment removal, add it
-                    if line.strip():
-                        processed_lines.append(line)
-            
-            # Write processed lines to temporary data for pandas
-            import io
-            data_string = '\n'.join(processed_lines)
-            
-            # Parse the data manually to handle multiple whitespace properly
-            parsed_data = []
-            for line in processed_lines:
-                # Split on any whitespace and filter out empty strings
-                values = [x for x in line.split() if x]
-                if len(values) >= 2:
-                    try:
-                        # Convert to float
-                        numeric_values = [float(v) for v in values]
-                        parsed_data.append(numeric_values)
-                    except ValueError:
-                        # Skip lines that can't be converted to numbers
-                        continue
-            
-            if not parsed_data:
-                raise ValueError("No valid numeric data found in file")
-            
-            # Convert to numpy array and then to DataFrame
-            data_array = np.array(parsed_data)
-            data = pd.DataFrame(data_array)
-            
-            if data.shape[1] < 2:
-                raise ValueError(f"Could not parse file - need at least 2 columns, found {data.shape[1]} columns")
-                
-            # Extract 2theta and intensity
-            two_theta = data.iloc[:, 0].values
-            intensity = data.iloc[:, 1].values
-            
-            # Check if we have error data (XYE format)
-            intensity_error = None
-            if data.shape[1] >= 3:
-                intensity_error = data.iloc[:, 2].values
-                # Remove NaN values from error column too
-                error_mask = ~np.isnan(intensity_error)
-                if np.any(error_mask):
-                    intensity_error = intensity_error[error_mask]
-                else:
-                    intensity_error = None
-            
-            # Remove any NaN values
-            mask = ~(np.isnan(two_theta) | np.isnan(intensity))
-            two_theta = two_theta[mask]
-            intensity = intensity[mask]
-            
-            # Apply mask to error data if it exists
-            if intensity_error is not None:
-                if len(intensity_error) == len(mask):
-                    intensity_error = intensity_error[mask]
-                elif len(intensity_error) != len(two_theta):
-                    # If error array doesn't match, disable error bars
-                    intensity_error = None
-            
-            # Sort by 2theta
-            sort_idx = np.argsort(two_theta)
-            two_theta = two_theta[sort_idx]
-            intensity = intensity[sort_idx]
-            
-            if intensity_error is not None:
-                if len(intensity_error) == len(sort_idx):
-                    intensity_error = intensity_error[sort_idx]
-                else:
-                    # If error array doesn't match after sorting, disable error bars
-                    intensity_error = None
+            # Check if it's an XML file
+            if file_path.lower().endswith('.xml'):
+                two_theta, intensity, intensity_error, wavelength = self.parse_xml_file(file_path)
+                file_format = 'XML'
+                # Update wavelength if found in XML
+                if wavelength:
+                    self.wavelength = wavelength
+                    # Update the wavelength combo to show custom
+                    self.wavelength_combo.setCurrentText("Custom")
+                    self.custom_wavelength.setValue(wavelength)
+                    self.custom_wavelength.setVisible(True)
+            else:
+                # Handle text-based formats (XY, XYE, etc.)
+                two_theta, intensity, intensity_error = self.parse_text_file(file_path)
+                file_format = 'XYE' if intensity_error is not None else 'XY'
             
             self.pattern_data = {
                 'two_theta': two_theta,
                 'intensity': intensity,
                 'intensity_error': intensity_error,
                 'file_path': file_path,
-                'file_format': 'XYE' if intensity_error is not None else 'XY',
+                'file_format': file_format,
                 'wavelength': self.wavelength
             }
             

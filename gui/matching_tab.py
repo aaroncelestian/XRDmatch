@@ -44,13 +44,14 @@ class PhaseMatchingThread(QThread):
         self.matching_complete.emit(results)
         
     def match_phase(self, phase):
-        """Match a single phase against experimental data"""
+        """Match a single phase against experimental data with intensity-weighted scoring"""
         if not self.experimental_peaks:
             return {
                 'phase': phase,
                 'matches': [],
                 'match_score': 0.0,
-                'coverage': 0.0
+                'coverage': 0.0,
+                'intensity_weighted_score': 0.0
             }
             
         exp_dspacings = self.experimental_peaks['d_spacing']
@@ -64,38 +65,61 @@ class PhaseMatchingThread(QThread):
                 'phase': phase,
                 'matches': [],
                 'match_score': 0.0,
-                'coverage': 0.0
+                'coverage': 0.0,
+                'intensity_weighted_score': 0.0
             }
             
-        # Find matches
+        # Normalize intensities for comparison
+        max_exp_int = np.max(exp_intensities) if len(exp_intensities) > 0 else 1
+        max_theo_int = np.max(theoretical_peaks['intensity']) if len(theoretical_peaks['intensity']) > 0 else 1
+        
+        # Find matches with intensity consideration
         matches = []
         matched_exp_peaks = set()
+        total_intensity_weight = 0
+        matched_intensity_weight = 0
         
         for theo_d, theo_int in zip(theoretical_peaks['d_spacing'], theoretical_peaks['intensity']):
+            # Normalize theoretical intensity (0-100 scale)
+            norm_theo_int = (theo_int / max_theo_int) * 100
+            total_intensity_weight += norm_theo_int
+            
             # Find closest experimental peak
             differences = np.abs(exp_dspacings - theo_d)
             min_idx = np.argmin(differences)
             min_diff = differences[min_idx]
             
             if min_diff <= self.tolerance and min_idx not in matched_exp_peaks:
+                # Calculate intensity similarity (0-1 scale, 1 = perfect match)
+                norm_exp_int = (exp_intensities[min_idx] / max_exp_int) * 100
+                intensity_ratio = min(norm_exp_int, norm_theo_int) / max(norm_exp_int, norm_theo_int) if max(norm_exp_int, norm_theo_int) > 0 else 0
+                
                 matches.append({
                     'exp_d': exp_dspacings[min_idx],
                     'theo_d': theo_d,
                     'exp_int': exp_intensities[min_idx],
                     'theo_int': theo_int,
-                    'difference': min_diff
+                    'difference': min_diff,
+                    'intensity_similarity': intensity_ratio,
+                    'norm_exp_int': norm_exp_int,
+                    'norm_theo_int': norm_theo_int
                 })
                 matched_exp_peaks.add(min_idx)
+                matched_intensity_weight += norm_theo_int
                 
-        # Calculate match score and coverage
-        match_score = len(matches) / len(theoretical_peaks) if theoretical_peaks else 0
+        # Calculate traditional match score (position-based)
+        match_score = len(matches) / len(theoretical_peaks['d_spacing']) if len(theoretical_peaks['d_spacing']) > 0 else 0
         coverage = len(matched_exp_peaks) / len(exp_dspacings) if exp_dspacings.size > 0 else 0
+        
+        # Calculate intensity-weighted match score
+        intensity_weighted_score = matched_intensity_weight / total_intensity_weight if total_intensity_weight > 0 else 0
         
         return {
             'phase': phase,
             'matches': matches,
             'match_score': match_score,
             'coverage': coverage,
+            'intensity_weighted_score': intensity_weighted_score,
             'theoretical_peaks': theoretical_peaks
         }
         
@@ -388,7 +412,7 @@ class MatchingTab(QWidget):
         self.min_score_spin = QDoubleSpinBox()
         self.min_score_spin.setRange(0.0, 1.0)
         self.min_score_spin.setDecimals(2)
-        self.min_score_spin.setValue(0.1)
+        self.min_score_spin.setValue(0.01)
         self.min_score_spin.setSingleStep(0.05)
         layout.addWidget(self.min_score_spin)
         
@@ -413,6 +437,48 @@ class MatchingTab(QWidget):
         self.fwhm_spin.setToolTip("Full Width at Half Maximum for theoretical peak profiles")
         self.fwhm_spin.valueChanged.connect(self.update_plot)
         layout.addWidget(self.fwhm_spin)
+        
+        # Minimum intensity filter for theoretical peaks
+        layout.addWidget(QLabel("Min. intensity (%):")); 
+        self.min_intensity_spin = QDoubleSpinBox()
+        self.min_intensity_spin.setRange(0, 100)
+        self.min_intensity_spin.setDecimals(1)
+        self.min_intensity_spin.setValue(1.0)
+        self.min_intensity_spin.setSingleStep(1.0)
+        self.min_intensity_spin.setSuffix("%")
+        self.min_intensity_spin.setToolTip("Minimum intensity percentage for theoretical peaks to be shown and considered in matching")
+        self.min_intensity_spin.valueChanged.connect(self.update_plot)
+        layout.addWidget(self.min_intensity_spin)
+        
+        # 2θ display limits
+        layout.addWidget(QLabel("2θ range:"))
+        self.min_2theta_spin = QDoubleSpinBox()
+        self.min_2theta_spin.setRange(0, 180)
+        self.min_2theta_spin.setDecimals(1)
+        self.min_2theta_spin.setValue(5.0)
+        self.min_2theta_spin.setSingleStep(1.0)
+        self.min_2theta_spin.setSuffix("°")
+        self.min_2theta_spin.setToolTip("Minimum 2θ angle to display")
+        self.min_2theta_spin.valueChanged.connect(self.update_plot)
+        layout.addWidget(self.min_2theta_spin)
+        
+        layout.addWidget(QLabel("to"))
+        
+        self.max_2theta_spin = QDoubleSpinBox()
+        self.max_2theta_spin.setRange(0, 180)
+        self.max_2theta_spin.setDecimals(1)
+        self.max_2theta_spin.setValue(60.0)
+        self.max_2theta_spin.setSingleStep(1.0)
+        self.max_2theta_spin.setSuffix("°")
+        self.max_2theta_spin.setToolTip("Maximum 2θ angle to display")
+        self.max_2theta_spin.valueChanged.connect(self.update_plot)
+        layout.addWidget(self.max_2theta_spin)
+        
+        # Auto-range button
+        self.auto_range_btn = QPushButton("Auto")
+        self.auto_range_btn.setToolTip("Auto-set 2θ range based on experimental data")
+        self.auto_range_btn.clicked.connect(self.auto_set_2theta_range)
+        layout.addWidget(self.auto_range_btn)
         
         layout.addStretch()
         
@@ -467,9 +533,9 @@ class MatchingTab(QWidget):
         
         # Results table
         self.results_table = QTableWidget()
-        self.results_table.setColumnCount(5)
+        self.results_table.setColumnCount(6)
         self.results_table.setHorizontalHeaderLabels([
-            'Phase', 'Match Score', 'Coverage', 'Matches', 'Show'
+            'Phase', 'Match Score', 'Int. Score', 'Coverage', 'Matches', 'Show'
         ])
         self.results_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         layout.addWidget(self.results_table)
@@ -479,9 +545,9 @@ class MatchingTab(QWidget):
         detail_layout = QVBoxLayout(detail_group)
         
         self.detail_table = QTableWidget()
-        self.detail_table.setColumnCount(7)
+        self.detail_table.setColumnCount(8)
         self.detail_table.setHorizontalHeaderLabels([
-            'Exp. d (Å)', 'Theo. d (Å)', 'Difference', 'Exp. Int.', 'Theo. Int.', 'Exp. 2θ (°)', 'Match Quality'
+            'Exp. d (Å)', 'Theo. d (Å)', 'Difference', 'Exp. Int.', 'Theo. Int.', 'Int. Sim.', 'Exp. 2θ (°)', 'Match Quality'
         ])
         detail_layout.addWidget(self.detail_table)
         
@@ -491,6 +557,24 @@ class MatchingTab(QWidget):
         self.results_table.itemSelectionChanged.connect(self.show_match_details)
         
         return group
+        
+    def auto_set_2theta_range(self):
+        """Automatically set 2θ range based on experimental data"""
+        pattern_to_use = self.processed_pattern or self.experimental_pattern
+        if pattern_to_use and 'two_theta' in pattern_to_use:
+            min_2theta = np.min(pattern_to_use['two_theta'])
+            max_2theta = np.max(pattern_to_use['two_theta'])
+            
+            # Add some padding
+            range_padding = (max_2theta - min_2theta) * 0.02
+            min_2theta = max(0, min_2theta - range_padding)
+            max_2theta = min(180, max_2theta + range_padding)
+            
+            # Update the spinboxes
+            self.min_2theta_spin.setValue(min_2theta)
+            self.max_2theta_spin.setValue(max_2theta)
+            
+            print(f"Auto-set 2θ range to {min_2theta:.1f}° - {max_2theta:.1f}°")
         
     def set_experimental_pattern(self, pattern_data):
         """Set the experimental pattern data (prioritize processed data)"""
@@ -503,6 +587,13 @@ class MatchingTab(QWidget):
             if self.processed_pattern is None:
                 self.experimental_pattern = pattern_data
                 print("Received raw pattern data for matching")
+        
+        # Auto-set 2θ range when first pattern is loaded
+        if pattern_data and 'two_theta' in pattern_data:
+            # Only auto-set if ranges are still at defaults
+            if (self.min_2theta_spin.value() == 5.0 and 
+                self.max_2theta_spin.value() == 60.0):
+                self.auto_set_2theta_range()
         
         self.update_matching_availability()
         self.update_plot()
@@ -585,23 +676,27 @@ class MatchingTab(QWidget):
             phase_name = phase.get('mineral', 'Unknown')
             self.results_table.setItem(i, 0, QTableWidgetItem(phase_name))
             
-            # Match score
+            # Match score (position-based)
             score_item = QTableWidgetItem(f"{result['match_score']:.3f}")
             self.results_table.setItem(i, 1, score_item)
             
+            # Intensity-weighted score
+            int_score_item = QTableWidgetItem(f"{result.get('intensity_weighted_score', 0):.3f}")
+            self.results_table.setItem(i, 2, int_score_item)
+            
             # Coverage
             coverage_item = QTableWidgetItem(f"{result['coverage']:.3f}")
-            self.results_table.setItem(i, 2, coverage_item)
+            self.results_table.setItem(i, 3, coverage_item)
             
             # Number of matches
             matches_item = QTableWidgetItem(str(len(result['matches'])))
-            self.results_table.setItem(i, 3, matches_item)
+            self.results_table.setItem(i, 4, matches_item)
             
             # Show checkbox
             show_checkbox = QCheckBox()
             show_checkbox.setChecked(i < 3)  # Show top 3 by default
             show_checkbox.stateChanged.connect(self.update_plot)
-            self.results_table.setCellWidget(i, 4, show_checkbox)
+            self.results_table.setCellWidget(i, 5, show_checkbox)
             
         self.update_plot()
         
@@ -644,13 +739,16 @@ class MatchingTab(QWidget):
             
             # Calculate match quality based on difference and intensity
             rel_diff = abs(match['difference']) / match['exp_d'] * 100  # Relative difference as percentage
-            if rel_diff < 0.1:
+            intensity_sim = match.get('intensity_similarity', 0)
+            
+            # Combined quality score (position + intensity)
+            if rel_diff < 0.1 and intensity_sim > 0.8:
                 quality = "Excellent"
-            elif rel_diff < 0.5:
+            elif rel_diff < 0.5 and intensity_sim > 0.6:
                 quality = "Very Good"
-            elif rel_diff < 1.0:
+            elif rel_diff < 1.0 and intensity_sim > 0.4:
                 quality = "Good"
-            elif rel_diff < 2.0:
+            elif rel_diff < 2.0 and intensity_sim > 0.2:
                 quality = "Fair"
             else:
                 quality = "Poor"
@@ -660,13 +758,23 @@ class MatchingTab(QWidget):
             self.detail_table.setItem(i, 2, QTableWidgetItem(f"{match['difference']:.4f}"))
             self.detail_table.setItem(i, 3, QTableWidgetItem(f"{match['exp_int']:.0f}"))
             self.detail_table.setItem(i, 4, QTableWidgetItem(f"{match['theo_int']:.0f}"))
-            self.detail_table.setItem(i, 5, QTableWidgetItem(f"{two_theta_deg:.2f}"))
-            self.detail_table.setItem(i, 6, QTableWidgetItem(quality))
+            self.detail_table.setItem(i, 5, QTableWidgetItem(f"{intensity_sim:.3f}"))
+            self.detail_table.setItem(i, 6, QTableWidgetItem(f"{two_theta_deg:.2f}"))
+            self.detail_table.setItem(i, 7, QTableWidgetItem(quality))
             
     def update_plot(self):
         """Update the comparison plot with normalized intensities"""
         self.ax_main.clear()
         self.ax_diff.clear()
+        
+        # Get user-defined 2θ range for consistent plotting
+        min_2theta = self.min_2theta_spin.value()
+        max_2theta = self.max_2theta_spin.value()
+        
+        # Ensure valid range
+        if min_2theta >= max_2theta:
+            max_2theta = min_2theta + 10
+            self.max_2theta_spin.setValue(max_2theta)
         
         # Plot experimental pattern (prefer processed over raw)
         pattern_to_plot = self.processed_pattern or self.experimental_pattern
@@ -707,7 +815,7 @@ class MatchingTab(QWidget):
         filtered_results.sort(key=lambda x: x['match_score'], reverse=True)
         
         for i in range(self.results_table.rowCount()):
-            checkbox = self.results_table.cellWidget(i, 4)
+            checkbox = self.results_table.cellWidget(i, 5)
             if checkbox and checkbox.isChecked():
                 # Use the filtered results to match the table display
                 result = filtered_results[i] if i < len(filtered_results) else None
@@ -724,6 +832,19 @@ class MatchingTab(QWidget):
                         # Use pre-calculated 2theta values (already converted for experimental wavelength)
                         two_theta = theo_peaks['two_theta']
                         intensities = theo_peaks['intensity']
+                        
+                        # Apply intensity filtering
+                        min_intensity_percent = self.min_intensity_spin.value()
+                        max_intensity = np.max(intensities) if len(intensities) > 0 else 1
+                        intensity_threshold = (min_intensity_percent / 100.0) * max_intensity
+                        
+                        # Filter peaks by minimum intensity
+                        intensity_mask = intensities >= intensity_threshold
+                        two_theta = two_theta[intensity_mask]
+                        intensities = intensities[intensity_mask]
+                        
+                        if len(intensities) == 0:
+                            continue  # Skip if no peaks pass the intensity filter
                     else:
                         continue
                     
@@ -734,6 +855,7 @@ class MatchingTab(QWidget):
                         wavelength = pattern_to_plot.get('wavelength', 1.5406)
                         fwhm = self.fwhm_spin.value()
                         scale_percentage = self.scale_spin.value() / 100.0
+                        min_intensity_percent = self.min_intensity_spin.value()
                         
                         # Create x-range for theoretical pattern based on experimental data range
                         x_min = np.min(pattern_to_plot['two_theta'])
@@ -742,7 +864,7 @@ class MatchingTab(QWidget):
                         
                         # Create cache key including all parameters that affect the pattern
                         x_range_hash = hash((x_min, x_max, len(x_range)))
-                        cache_key = (phase_id, wavelength, fwhm, x_range_hash, scale_percentage)
+                        cache_key = (phase_id, wavelength, fwhm, x_range_hash, scale_percentage, min_intensity_percent)
                         
                         # Check if we have this pattern cached
                         if cache_key in self.continuous_pattern_cache:
@@ -781,51 +903,88 @@ class MatchingTab(QWidget):
                                 two_theta, normalized_theo_intensities, fwhm, x_range
                             )
                             
-                            # Debug the final pattern
-                            if len(theoretical_pattern) > 0:
+                            # CRITICAL FIX: Normalize the final continuous pattern to match expected scaling
+                            if len(theoretical_pattern) > 0 and np.max(theoretical_pattern) > 0:
+                                # The expected max should be the scale percentage (e.g., 80 for 80%)
+                                expected_max = 100 * scale_percentage
+                                actual_max = np.max(theoretical_pattern)
+                                
+                                # Normalize the continuous pattern to the expected maximum
+                                theoretical_pattern = (theoretical_pattern / actual_max) * expected_max
+                                
                                 print(f"  Final continuous pattern for {phase_name}:")
-                                print(f"    Max intensity: {np.max(theoretical_pattern):.2f}")
+                                print(f"    Before final normalization: {actual_max:.2f}")
+                                print(f"    After final normalization: {np.max(theoretical_pattern):.2f}")
+                                print(f"    Expected max: {expected_max:.2f}")
                                 print(f"    Non-zero points: {np.count_nonzero(theoretical_pattern)}")
                             else:
                                 print(f"  Warning: Empty theoretical pattern generated for {phase_name}")
                             
                             # Cache the result
                             self.continuous_pattern_cache[cache_key] = theoretical_pattern
-                        
+                            
                         # Plot as continuous line
                         self.ax_main.plot(x_range, theoretical_pattern, 
                                         color=color, linewidth=1.5, alpha=0.8,
                                         label=phase_name)
-                    
-                    # Plot theoretical peaks in difference plot as bars close to experimental
-                    if len(theo_peaks.get('d_spacing', [])) > 0:
-                        theo_d_spacings = theo_peaks['d_spacing']
+                    # Plot theoretical peaks in difference plot as bars with intensity-based alpha
+                    if len(theo_peaks.get('two_theta', [])) > 0:
+                        theo_two_theta = theo_peaks['two_theta']
+                        theo_intensities = theo_peaks['intensity']
                         
-                        # Plot theoretical peaks as bars slightly offset from experimental
-                        y_position = -0.8 + (i * 0.15)  # Offset each phase slightly
-                        for d_spacing in theo_d_spacings:
-                            self.ax_diff.axvline(x=d_spacing, ymin=0.15 + (i * 0.1), ymax=0.25 + (i * 0.1), 
-                                               color=color, linewidth=2, alpha=0.8)
+                        # Apply same intensity filtering as above
+                        min_intensity_percent = self.min_intensity_spin.value()
+                        max_intensity = np.max(theo_intensities) if len(theo_intensities) > 0 else 1
+                        intensity_threshold = (min_intensity_percent / 100.0) * max_intensity
                         
-                        # Add legend entry
-                        self.ax_diff.scatter([theo_d_spacings[0]], [y_position], 
-                                           c=color, marker='|', s=100, label=phase_name)
+                        # Filter peaks by minimum intensity
+                        intensity_mask = theo_intensities >= intensity_threshold
+                        filtered_two_theta = theo_two_theta[intensity_mask]
+                        filtered_intensities = theo_intensities[intensity_mask]
+                        
+                        if len(filtered_intensities) > 0:
+                            # Normalize intensities for alpha calculation (0.3 to 1.0 range)
+                            norm_intensities = filtered_intensities / np.max(filtered_intensities)
+                            alphas = 0.3 + 0.7 * norm_intensities  # Scale to 0.3-1.0 range
+                            
+                            # Plot theoretical peaks as bars with intensity-based alpha
+                            y_position = -0.8 + (i * 0.15)  # Offset each phase slightly
+                            for tt, alpha in zip(filtered_two_theta, alphas):
+                                # Only plot peaks within the display range
+                                if min_2theta <= tt <= max_2theta:
+                                    self.ax_diff.axvline(x=tt, ymin=0.15 + (i * 0.1), ymax=0.25 + (i * 0.1), 
+                                                       color=color, linewidth=2, alpha=alpha)
+                            
+                            # Add legend entry (use first peak within range)
+                            visible_peaks = [(tt, alpha) for tt, alpha in zip(filtered_two_theta, alphas) if min_2theta <= tt <= max_2theta]
+                            if visible_peaks:
+                                self.ax_diff.scatter([visible_peaks[0][0]], [y_position], 
+                                                   c=color, marker='|', s=100, label=phase_name, alpha=visible_peaks[0][1])
                     
                 y_offset += 0.1
                 
-        # Plot experimental peaks in difference plot as bars
-        if self.experimental_peaks and len(self.experimental_peaks.get('d_spacing', [])) > 0:
-            exp_d_spacings = self.experimental_peaks['d_spacing']
-            exp_y_pos = [-1] * len(exp_d_spacings)
+        # Plot experimental peaks in difference plot as bars with intensity-based alpha
+        if self.experimental_peaks and len(self.experimental_peaks.get('two_theta', [])) > 0:
+            exp_two_theta = self.experimental_peaks['two_theta']
+            exp_intensities = self.experimental_peaks['intensity']
             
-            # Plot as vertical bars instead of circles
-            for d_spacing in exp_d_spacings:
-                self.ax_diff.axvline(x=d_spacing, ymin=0.0, ymax=0.1, 
-                                   color='blue', linewidth=2, alpha=0.8)
+            # Normalize experimental intensities for alpha calculation
+            max_exp_intensity = np.max(exp_intensities) if len(exp_intensities) > 0 else 1
+            norm_exp_intensities = exp_intensities / max_exp_intensity
+            exp_alphas = 0.3 + 0.7 * norm_exp_intensities  # Scale to 0.3-1.0 range
             
-            # Add a single legend entry for experimental peaks
-            self.ax_diff.scatter([exp_d_spacings[0]], [-1], 
-                               c='blue', marker='|', s=100, label='Experimental')
+            # Plot as vertical bars with intensity-based alpha
+            for tt, alpha in zip(exp_two_theta, exp_alphas):
+                # Only plot peaks within the display range
+                if min_2theta <= tt <= max_2theta:
+                    self.ax_diff.axvline(x=tt, ymin=0.0, ymax=0.1, 
+                                       color='blue', linewidth=2, alpha=alpha)
+            
+            # Add a single legend entry for experimental peaks (use first peak within range)
+            visible_exp_data = [(tt, alpha) for tt, alpha in zip(exp_two_theta, exp_alphas) if min_2theta <= tt <= max_2theta]
+            if visible_exp_data:
+                self.ax_diff.scatter([visible_exp_data[0][0]], [-1], 
+                                   c='blue', marker='|', s=100, label='Experimental', alpha=visible_exp_data[0][1])
             
         # Format plots
         self.ax_main.set_xlabel('2θ (degrees)')
@@ -838,13 +997,11 @@ class MatchingTab(QWidget):
         if self.ax_main.get_legend_handles_labels()[0]:  # Only show legend if there are items
             self.ax_main.legend(loc='upper right')
         
-        self.ax_diff.set_xlabel('d-spacing (Å)')
+        self.ax_diff.set_xlabel('2θ (degrees)')
         self.ax_diff.set_ylabel('Phase')
-        self.ax_diff.set_title('Peak Position Comparisons')
+        min_int_text = f" (Min. Int.: {self.min_intensity_spin.value():.1f}%)"
+        self.ax_diff.set_title('Peak Position Comparisons' + min_int_text)
         self.ax_diff.grid(True, alpha=0.3)
-        
-        # Invert x-axis so larger d-spacings are on the left
-        self.ax_diff.invert_xaxis()
         
         # Set y-axis limits to show the bars properly
         self.ax_diff.set_ylim(-1.2, 1.0)
@@ -855,30 +1012,24 @@ class MatchingTab(QWidget):
         if self.ax_diff.get_legend_handles_labels()[0]:  # Only show legend if there are items
             self.ax_diff.legend(loc='upper right')
         
-        # Set reasonable axis limits with normalized scale
-        if pattern_to_plot:
-            # Determine appropriate 2θ range based on experimental data
-            min_2theta = np.min(pattern_to_plot['two_theta'])
-            max_2theta = np.max(pattern_to_plot['two_theta'])
-            
-            # Add some padding
-            range_padding = (max_2theta - min_2theta) * 0.05
-            self.ax_main.set_xlim(max(0, min_2theta - range_padding), max_2theta + range_padding)
-            
-            # Set y-axis to normalized scale (0-110 to give some headroom)
-            self.ax_main.set_ylim(0, 110)
+        # Apply 2θ limits to both plots (synchronized)
+        self.ax_main.set_xlim(min_2theta, max_2theta)
+        self.ax_diff.set_xlim(min_2theta, max_2theta)
+        
+        # Set y-axis to normalized scale (0-110 to give some headroom)
+        self.ax_main.set_ylim(0, 110)
         
         self.canvas.draw()
         
     def clear_results(self):
         """Clear matching results"""
-        self.matching_results = []
         self.results_table.setRowCount(0)
         self.detail_table.setRowCount(0)
         
         # Clear pattern caches
         self.pattern_cache.clear()
         self.continuous_pattern_cache.clear()
+        print("Cleared pattern caches - next plot update will recalculate with normalization fix")
         
         self.update_plot()
         
@@ -886,7 +1037,6 @@ class MatchingTab(QWidget):
         """Save matching results to file"""
         if not self.matching_results:
             return
-            
         # Prepare data for saving
         data = []
         for result in self.matching_results:
