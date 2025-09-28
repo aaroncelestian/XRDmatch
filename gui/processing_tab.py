@@ -6,8 +6,10 @@ import numpy as np
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
                              QLabel, QComboBox, QDoubleSpinBox, QSpinBox,
                              QGroupBox, QSlider, QCheckBox, QSplitter,
-                             QMessageBox, QProgressBar)
+                             QMessageBox, QProgressBar, QTabWidget, QGridLayout,
+                             QFrame, QToolButton, QButtonGroup)
 from PyQt5.QtCore import Qt, pyqtSignal, QTimer
+from PyQt5.QtGui import QIcon
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
@@ -29,7 +31,10 @@ class ProcessingTab(QWidget):
         self.background_data = None
         self.processed_pattern_data = None
         self.peaks = None
+        self.manual_peaks = []  # User-added peaks
+        self.removed_peaks = []  # User-removed peaks
         self.wavelength = 1.5406  # Default Cu Ka1
+        self.peak_editing_mode = False  # Toggle for peak editing
         
         # Timer for real-time updates
         self.update_timer = QTimer()
@@ -58,27 +63,47 @@ class ProcessingTab(QWidget):
         splitter.setSizes([400, 900])
         
     def create_controls_panel(self):
-        """Create the controls panel"""
+        """Create the controls panel with tabbed interface"""
         widget = QWidget()
         layout = QVBoxLayout(widget)
         
-        # Pattern info
+        # Pattern info (always visible)
         info_group = self.create_pattern_info_group()
         layout.addWidget(info_group)
         
-        # Background subtraction controls
+        # Create tabbed interface for different processing options
+        tab_widget = QTabWidget()
+        
+        # Background subtraction tab
+        bg_tab = QWidget()
+        bg_layout = QVBoxLayout(bg_tab)
         bg_group = self.create_background_group()
-        layout.addWidget(bg_group)
+        bg_layout.addWidget(bg_group)
+        bg_layout.addStretch()
+        tab_widget.addTab(bg_tab, "Background")
         
-        # Smoothing and filtering controls
+        # Peak detection tab
+        peak_tab = QWidget()
+        peak_layout = QVBoxLayout(peak_tab)
+        peak_group = self.create_peak_detection_group()
+        peak_layout.addWidget(peak_group)
+        peak_layout.addStretch()
+        tab_widget.addTab(peak_tab, "Peak Detection")
+        
+        # Additional processing tab
+        filter_tab = QWidget()
+        filter_layout = QVBoxLayout(filter_tab)
         filter_group = self.create_filtering_group()
-        layout.addWidget(filter_group)
+        filter_layout.addWidget(filter_group)
+        filter_layout.addStretch()
+        tab_widget.addTab(filter_tab, "Filtering")
         
-        # Processing actions
+        layout.addWidget(tab_widget)
+        
+        # Action buttons (always visible at bottom)
         actions_group = self.create_actions_group()
         layout.addWidget(actions_group)
         
-        layout.addStretch()
         return widget
         
     def create_pattern_info_group(self):
@@ -98,8 +123,8 @@ class ProcessingTab(QWidget):
         return group
         
     def create_background_group(self):
-        """Create background subtraction controls"""
-        group = QGroupBox("Background Subtraction (ALS)")
+        """Create compact background subtraction controls"""
+        group = QGroupBox("ALS Background Subtraction")
         layout = QVBoxLayout(group)
         
         # Enable/disable background subtraction
@@ -107,58 +132,54 @@ class ProcessingTab(QWidget):
         self.enable_bg_subtraction.stateChanged.connect(self.on_bg_enable_changed)
         layout.addWidget(self.enable_bg_subtraction)
         
-        # Lambda parameter (smoothness)
-        lambda_layout = QHBoxLayout()
-        lambda_layout.addWidget(QLabel("Smoothness (λ):"))
+        # Parameters in grid layout for compactness
+        params_layout = QGridLayout()
         
+        # Lambda parameter (smoothness)
+        params_layout.addWidget(QLabel("Smoothness (λ):"), 0, 0)
         self.lambda_slider = QSlider(Qt.Orientation.Horizontal)
         self.lambda_slider.setRange(2, 8)  # 10^2 to 10^8
         self.lambda_slider.setValue(5)  # 10^5
         self.lambda_slider.valueChanged.connect(self.on_lambda_changed)
-        lambda_layout.addWidget(self.lambda_slider)
-        
+        params_layout.addWidget(self.lambda_slider, 0, 1)
         self.lambda_value_label = QLabel("1e5")
-        lambda_layout.addWidget(self.lambda_value_label)
-        layout.addLayout(lambda_layout)
+        params_layout.addWidget(self.lambda_value_label, 0, 2)
         
         # P parameter (asymmetry)
-        p_layout = QHBoxLayout()
-        p_layout.addWidget(QLabel("Asymmetry (p):"))
-        
+        params_layout.addWidget(QLabel("Asymmetry (p):"), 1, 0)
         self.p_spinbox = QDoubleSpinBox()
         self.p_spinbox.setRange(0.001, 0.1)
         self.p_spinbox.setValue(0.01)
         self.p_spinbox.setDecimals(3)
         self.p_spinbox.setSingleStep(0.001)
         self.p_spinbox.valueChanged.connect(self.on_parameter_changed)
-        p_layout.addWidget(self.p_spinbox)
-        layout.addLayout(p_layout)
+        params_layout.addWidget(self.p_spinbox, 1, 1, 1, 2)
         
         # Iterations
-        iter_layout = QHBoxLayout()
-        iter_layout.addWidget(QLabel("Iterations:"))
-        
+        params_layout.addWidget(QLabel("Iterations:"), 2, 0)
         self.iterations_spinbox = QSpinBox()
         self.iterations_spinbox.setRange(5, 50)
         self.iterations_spinbox.setValue(10)
         self.iterations_spinbox.valueChanged.connect(self.on_parameter_changed)
-        iter_layout.addWidget(self.iterations_spinbox)
-        layout.addLayout(iter_layout)
+        params_layout.addWidget(self.iterations_spinbox, 2, 1, 1, 2)
         
-        # Preview options
-        self.show_background = QCheckBox("Show Background")
+        layout.addLayout(params_layout)
+        
+        # Preview options in horizontal layout
+        preview_layout = QHBoxLayout()
+        self.show_background = QCheckBox("Show BG")
         self.show_background.setChecked(True)
         self.show_background.stateChanged.connect(self.update_plot)
-        layout.addWidget(self.show_background)
+        preview_layout.addWidget(self.show_background)
         
-        self.show_original = QCheckBox("Show Original")
+        self.show_original = QCheckBox("Show Orig")
         self.show_original.stateChanged.connect(self.update_plot)
-        layout.addWidget(self.show_original)
+        preview_layout.addWidget(self.show_original)
         
-        # Real-time preview
-        self.realtime_preview = QCheckBox("Real-time Preview")
+        self.realtime_preview = QCheckBox("Real-time")
         self.realtime_preview.setChecked(True)
-        layout.addWidget(self.realtime_preview)
+        preview_layout.addWidget(self.realtime_preview)
+        layout.addLayout(preview_layout)
         
         # Progress bar for processing
         self.progress_bar = QProgressBar()
@@ -198,86 +219,101 @@ class ProcessingTab(QWidget):
         
         return group
         
-    def create_actions_group(self):
-        """Create action buttons"""
-        group = QGroupBox("Actions")
+    def create_peak_detection_group(self):
+        """Create compact peak detection controls"""
+        group = QGroupBox("Peak Detection & Manual Editing")
         layout = QVBoxLayout(group)
         
-        # Apply processing
-        self.apply_btn = QPushButton("Apply Processing")
-        self.apply_btn.clicked.connect(self.apply_processing)
-        self.apply_btn.setEnabled(False)
-        layout.addWidget(self.apply_btn)
+        # Peak editing mode toggle
+        edit_layout = QHBoxLayout()
+        self.peak_edit_btn = QPushButton("Enable Peak Editing")
+        self.peak_edit_btn.setCheckable(True)
+        self.peak_edit_btn.clicked.connect(self.toggle_peak_editing)
+        edit_layout.addWidget(self.peak_edit_btn)
         
-        # Peak finding controls
-        peak_group = QGroupBox("Peak Detection")
-        peak_layout = QVBoxLayout(peak_group)
+        self.clear_manual_btn = QPushButton("Clear Manual")
+        self.clear_manual_btn.clicked.connect(self.clear_manual_peaks)
+        edit_layout.addWidget(self.clear_manual_btn)
+        layout.addLayout(edit_layout)
         
-        # Min height control
-        height_layout = QHBoxLayout()
-        height_layout.addWidget(QLabel("Min Height:"))
+        # Instructions
+        instructions = QLabel("Click plot to add peaks, right-click to remove")
+        instructions.setStyleSheet("color: gray; font-size: 10px;")
+        layout.addWidget(instructions)
+        
+        # Compact parameter grid
+        params_layout = QGridLayout()
+        
+        # Height and prominence
+        params_layout.addWidget(QLabel("Min Height:"), 0, 0)
         self.min_height = QSpinBox()
         self.min_height.setRange(1, 10000)
-        self.min_height.setValue(50)  # Lower default for small peaks
-        height_layout.addWidget(self.min_height)
-        peak_layout.addLayout(height_layout)
+        self.min_height.setValue(50)
+        params_layout.addWidget(self.min_height, 0, 1)
         
-        # Prominence control
-        prom_layout = QHBoxLayout()
-        prom_layout.addWidget(QLabel("Min Prominence:"))
+        params_layout.addWidget(QLabel("Min Prominence:"), 0, 2)
         self.min_prominence = QSpinBox()
         self.min_prominence.setRange(1, 1000)
-        self.min_prominence.setValue(10)  # Low default for small peaks
-        prom_layout.addWidget(self.min_prominence)
-        peak_layout.addLayout(prom_layout)
+        self.min_prominence.setValue(10)
+        params_layout.addWidget(self.min_prominence, 0, 3)
         
-        # Width control
-        width_layout = QHBoxLayout()
-        width_layout.addWidget(QLabel("Min Width (pts):"))
+        # Width and distance
+        params_layout.addWidget(QLabel("Min Width:"), 1, 0)
         self.min_width = QSpinBox()
         self.min_width.setRange(1, 20)
-        self.min_width.setValue(1)  # Allow very narrow peaks
-        width_layout.addWidget(self.min_width)
-        peak_layout.addLayout(width_layout)
+        self.min_width.setValue(1)
+        params_layout.addWidget(self.min_width, 1, 1)
         
-        # Distance control
-        dist_layout = QHBoxLayout()
-        dist_layout.addWidget(QLabel("Min Distance (pts):"))
+        params_layout.addWidget(QLabel("Min Distance:"), 1, 2)
         self.min_distance = QSpinBox()
         self.min_distance.setRange(1, 50)
-        self.min_distance.setValue(3)  # Allow close peaks
-        dist_layout.addWidget(self.min_distance)
-        peak_layout.addLayout(dist_layout)
+        self.min_distance.setValue(3)
+        params_layout.addWidget(self.min_distance, 1, 3)
         
-        # Sensitivity mode
+        layout.addLayout(params_layout)
+        
+        # Sensitivity and options
         sens_layout = QHBoxLayout()
         sens_layout.addWidget(QLabel("Sensitivity:"))
         self.sensitivity = QComboBox()
-        self.sensitivity.addItems(["High (small peaks)", "Medium", "Low (large peaks only)"])
-        self.sensitivity.setCurrentIndex(0)  # Default to high sensitivity
+        self.sensitivity.addItems(["High", "Medium", "Low"])
+        self.sensitivity.setCurrentIndex(0)
         sens_layout.addWidget(self.sensitivity)
-        peak_layout.addLayout(sens_layout)
         
-        # Show all candidates option
-        self.show_all_candidates = QCheckBox("Show all candidates (before filtering)")
+        self.show_all_candidates = QCheckBox("Show candidates")
         self.show_all_candidates.stateChanged.connect(self.update_plot)
-        peak_layout.addWidget(self.show_all_candidates)
+        sens_layout.addWidget(self.show_all_candidates)
+        layout.addLayout(sens_layout)
         
         # Find peaks button
         self.find_peaks_btn = QPushButton("Find Peaks")
         self.find_peaks_btn.clicked.connect(self.find_peaks)
         self.find_peaks_btn.setEnabled(False)
-        peak_layout.addWidget(self.find_peaks_btn)
+        layout.addWidget(self.find_peaks_btn)
         
-        layout.addWidget(peak_group)
+        return group
         
-        # Reset to original
-        self.reset_btn = QPushButton("Reset to Original")
+    def create_actions_group(self):
+        """Create compact action buttons"""
+        group = QGroupBox("Actions")
+        layout = QVBoxLayout(group)
+        
+        # Main action buttons in horizontal layout
+        main_layout = QHBoxLayout()
+        
+        self.apply_btn = QPushButton("Apply Processing")
+        self.apply_btn.clicked.connect(self.apply_processing)
+        self.apply_btn.setEnabled(False)
+        main_layout.addWidget(self.apply_btn)
+        
+        self.reset_btn = QPushButton("Reset")
         self.reset_btn.clicked.connect(self.reset_to_original)
         self.reset_btn.setEnabled(False)
-        layout.addWidget(self.reset_btn)
+        main_layout.addWidget(self.reset_btn)
         
-        # Export processed data
+        layout.addLayout(main_layout)
+        
+        # Export button
         self.export_btn = QPushButton("Export Processed Data")
         self.export_btn.clicked.connect(self.export_processed_data)
         self.export_btn.setEnabled(False)
@@ -304,7 +340,139 @@ class ProcessingTab(QWidget):
         self.ax.set_title('XRD Pattern Processing Preview')
         self.ax.grid(True, alpha=0.3)
         
+        # Connect mouse events for peak editing
+        self.canvas.mpl_connect('button_press_event', self.on_plot_click)
+        
         return group
+        
+    def toggle_peak_editing(self):
+        """Toggle peak editing mode"""
+        self.peak_editing_mode = self.peak_edit_btn.isChecked()
+        if self.peak_editing_mode:
+            self.peak_edit_btn.setText("Disable Peak Editing")
+            self.peak_edit_btn.setStyleSheet("QPushButton { background-color: #ffcccc; }")
+        else:
+            self.peak_edit_btn.setText("Enable Peak Editing")
+            self.peak_edit_btn.setStyleSheet("")
+            
+    def clear_manual_peaks(self):
+        """Clear all manually added/removed peaks"""
+        self.manual_peaks.clear()
+        self.removed_peaks.clear()
+        self.update_plot()
+        
+    def on_plot_click(self, event):
+        """Handle mouse clicks on the plot for peak editing"""
+        if not self.peak_editing_mode or event.inaxes != self.ax:
+            return
+            
+        if self.processed_pattern_data is None:
+            return
+            
+        # Get click position
+        click_2theta = event.xdata
+        if click_2theta is None:
+            return
+            
+        # Find closest data point
+        two_theta = self.processed_pattern_data['two_theta']
+        intensity = self.processed_pattern_data['intensity']
+        
+        # Find closest index
+        closest_idx = np.argmin(np.abs(two_theta - click_2theta))
+        closest_2theta = two_theta[closest_idx]
+        closest_intensity = intensity[closest_idx]
+        
+        if event.button == 1:  # Left click - add peak
+            # Check if peak already exists (within tolerance)
+            tolerance = 0.05  # 0.05 degrees tolerance
+            existing_peak = False
+            
+            # Check automatic peaks
+            if self.peaks is not None:
+                for peak_idx in self.peaks:
+                    if abs(two_theta[peak_idx] - closest_2theta) < tolerance:
+                        existing_peak = True
+                        break
+                        
+            # Check manual peaks
+            for manual_peak in self.manual_peaks:
+                if abs(manual_peak['two_theta'] - closest_2theta) < tolerance:
+                    existing_peak = True
+                    break
+                    
+            if not existing_peak:
+                # Add manual peak
+                manual_peak = {
+                    'index': closest_idx,
+                    'two_theta': closest_2theta,
+                    'intensity': closest_intensity,
+                    'd_spacing': self.wavelength / (2 * np.sin(np.radians(closest_2theta / 2)))
+                }
+                self.manual_peaks.append(manual_peak)
+                print(f"Added manual peak at 2θ = {closest_2theta:.3f}°")
+                
+        elif event.button == 3:  # Right click - remove peak
+            tolerance = 0.1  # Slightly larger tolerance for removal
+            
+            # Check if clicking on an automatic peak
+            if self.peaks is not None:
+                for peak_idx in self.peaks:
+                    if abs(two_theta[peak_idx] - closest_2theta) < tolerance:
+                        # Add to removed peaks list
+                        removed_peak = {
+                            'index': peak_idx,
+                            'two_theta': two_theta[peak_idx],
+                            'intensity': intensity[peak_idx]
+                        }
+                        if removed_peak not in self.removed_peaks:
+                            self.removed_peaks.append(removed_peak)
+                            print(f"Removed automatic peak at 2θ = {two_theta[peak_idx]:.3f}°")
+                        break
+                        
+            # Check if clicking on a manual peak
+            for i, manual_peak in enumerate(self.manual_peaks):
+                if abs(manual_peak['two_theta'] - closest_2theta) < tolerance:
+                    removed_peak = self.manual_peaks.pop(i)
+                    print(f"Removed manual peak at 2θ = {removed_peak['two_theta']:.3f}°")
+                    break
+                    
+        self.update_plot()
+        
+    def get_effective_peaks(self):
+        """Get the effective peak list (automatic + manual - removed)"""
+        effective_peaks = []
+        two_theta = self.processed_pattern_data['two_theta'] if self.processed_pattern_data else []
+        intensity = self.processed_pattern_data['intensity'] if self.processed_pattern_data else []
+        
+        # Add automatic peaks (excluding removed ones)
+        if self.peaks is not None and len(two_theta) > 0:
+            for peak_idx in self.peaks:
+                # Check if this peak was manually removed
+                is_removed = False
+                for removed_peak in self.removed_peaks:
+                    if removed_peak['index'] == peak_idx:
+                        is_removed = True
+                        break
+                        
+                if not is_removed and peak_idx < len(two_theta):
+                    effective_peaks.append({
+                        'index': peak_idx,
+                        'two_theta': two_theta[peak_idx],
+                        'intensity': intensity[peak_idx],
+                        'd_spacing': self.wavelength / (2 * np.sin(np.radians(two_theta[peak_idx] / 2))),
+                        'type': 'automatic'
+                    })
+                    
+        # Add manual peaks
+        for manual_peak in self.manual_peaks:
+            manual_peak['type'] = 'manual'
+            effective_peaks.append(manual_peak)
+            
+        # Sort by 2theta
+        effective_peaks.sort(key=lambda x: x['two_theta'])
+        
+        return effective_peaks
         
     def set_pattern_data(self, pattern_data):
         """Set the pattern data for processing"""
@@ -313,6 +481,8 @@ class ProcessingTab(QWidget):
         self.processed_pattern_data = pattern_data.copy()
         self.background_data = None
         self.peaks = None
+        self.manual_peaks.clear()
+        self.removed_peaks.clear()
         
         # Get wavelength from pattern data if available
         if 'wavelength' in pattern_data:
@@ -491,11 +661,38 @@ class ProcessingTab(QWidget):
                            self.processed_pattern_data['intensity'], 
                            'b-', linewidth=1, label='Processed')
         
-        # Plot peaks if they exist
+        # Plot automatic peaks (excluding removed ones)
         if self.peaks is not None and self.processed_pattern_data is not None:
-            peak_positions = self.processed_pattern_data['two_theta'][self.peaks]
-            peak_intensities = self.processed_pattern_data['intensity'][self.peaks]
-            self.ax.plot(peak_positions, peak_intensities, 'ro', markersize=4, label='Final Peaks')
+            auto_peaks = []
+            for peak_idx in self.peaks:
+                # Check if this peak was manually removed
+                is_removed = any(removed['index'] == peak_idx for removed in self.removed_peaks)
+                if not is_removed:
+                    auto_peaks.append(peak_idx)
+                    
+            if auto_peaks:
+                peak_positions = self.processed_pattern_data['two_theta'][auto_peaks]
+                peak_intensities = self.processed_pattern_data['intensity'][auto_peaks]
+                self.ax.plot(peak_positions, peak_intensities, 'ro', markersize=5, label='Auto Peaks')
+                
+        # Plot manual peaks
+        if self.manual_peaks:
+            manual_positions = [peak['two_theta'] for peak in self.manual_peaks]
+            manual_intensities = [peak['intensity'] for peak in self.manual_peaks]
+            self.ax.plot(manual_positions, manual_intensities, 'go', markersize=6, 
+                        marker='s', label='Manual Peaks')
+                        
+        # Plot removed peaks (grayed out)
+        if self.removed_peaks and self.processed_pattern_data is not None:
+            removed_positions = []
+            removed_intensities = []
+            for removed in self.removed_peaks:
+                if removed['index'] < len(self.processed_pattern_data['two_theta']):
+                    removed_positions.append(self.processed_pattern_data['two_theta'][removed['index']])
+                    removed_intensities.append(self.processed_pattern_data['intensity'][removed['index']])
+            if removed_positions:
+                self.ax.plot(removed_positions, removed_intensities, 'x', color='gray', 
+                           markersize=6, alpha=0.5, label='Removed Peaks')
             
         # Plot candidate peaks if requested and available
         if (hasattr(self, 'candidate_peaks') and self.candidate_peaks is not None and 
@@ -524,6 +721,8 @@ class ProcessingTab(QWidget):
             title += ' (Smoothed)'
         if self.enable_noise_reduction.isChecked():
             title += ' (Noise Reduced)'
+        if self.peak_editing_mode:
+            title += ' - Peak Editing Mode'
             
         self.ax.set_title(title)
         self.ax.grid(True, alpha=0.3)
@@ -695,13 +894,15 @@ class ProcessingTab(QWidget):
             
             self.peaks = filtered_peaks
             
-            # Calculate peak data for matching
-            if len(filtered_peaks) > 0:
-                peak_positions = two_theta[filtered_peaks]
-                peak_intensities = intensity[filtered_peaks]
-                
-                # Calculate d-spacings
-                d_spacings = self.wavelength / (2 * np.sin(np.radians(peak_positions / 2)))
+            # Get effective peaks (automatic + manual - removed)
+            effective_peaks = self.get_effective_peaks()
+            
+            # Calculate peak data for matching using effective peaks
+            if len(effective_peaks) > 0:
+                # Convert to arrays for consistency
+                peak_positions = np.array([p['two_theta'] for p in effective_peaks])
+                peak_intensities = np.array([p['intensity'] for p in effective_peaks])
+                peak_d_spacings = np.array([p['d_spacing'] for p in effective_peaks])
                 
                 # Calculate relative intensities
                 max_intensity = np.max(peak_intensities)
@@ -710,19 +911,31 @@ class ProcessingTab(QWidget):
                 peak_data = {
                     'two_theta': peak_positions,
                     'intensity': peak_intensities,
-                    'd_spacing': d_spacings,
+                    'd_spacing': peak_d_spacings,
                     'rel_intensity': rel_intensities,
-                    'wavelength': self.wavelength
+                    'wavelength': self.wavelength,
+                    'manual_count': len(self.manual_peaks),
+                    'removed_count': len(self.removed_peaks)
                 }
                 
-                # Emit peak data signal
+                # Emit effective peak data signal
                 self.peaks_found.emit(peak_data)
                 
-                QMessageBox.information(self, "Success", 
-                    f"Found {len(filtered_peaks)} significant peaks!\n"
-                    f"(Filtered from {len(peaks)} initial candidates)")
+                auto_count = len(filtered_peaks) - len(self.removed_peaks)
+                manual_count = len(self.manual_peaks)
+                total_count = len(effective_peaks)
+                
+                message = f"Found {total_count} effective peaks!\n"
+                message += f"({auto_count} automatic"
+                if manual_count > 0:
+                    message += f" + {manual_count} manual"
+                if len(self.removed_peaks) > 0:
+                    message += f" - {len(self.removed_peaks)} removed"
+                message += f", filtered from {len(peaks)} initial candidates)"
+                
+                QMessageBox.information(self, "Success", message)
             else:
-                QMessageBox.warning(self, "Warning", "No significant peaks found after filtering")
+                QMessageBox.warning(self, "Warning", "No effective peaks found after filtering and manual editing")
             
             self.update_plot()
             

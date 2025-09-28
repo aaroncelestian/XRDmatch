@@ -13,6 +13,8 @@ from pymatgen.core import Structure
 import hashlib
 from pathlib import Path
 import re
+import signal
+import time
 from utils.cif_parser import CIFParser
 
 class LocalCIFDatabase:
@@ -808,11 +810,46 @@ class LocalCIFDatabase:
                 conn.close()
                 return True
             
-            # Calculate diffraction pattern
+            # Calculate diffraction pattern with appropriate limits for wavelength
             cif_parser = CIFParser()
-            pattern = cif_parser.calculate_xrd_pattern_from_cif(
-                cif_content, wavelength, max_2theta=max_two_theta, min_d=min_d_spacing
-            )
+            
+            # Adjust limits based on wavelength to prevent excessive calculations
+            if wavelength < 0.5:  # Very short wavelengths like 0.2401Å
+                adjusted_max_2theta = min(max_two_theta, 30.0)  # Limit to 30° for short wavelengths
+                adjusted_min_d = max(min_d_spacing, 1.0)  # Increase minimum d-spacing
+            elif wavelength < 1.0:  # Short wavelengths like 0.7107Å
+                adjusted_max_2theta = min(max_two_theta, 60.0)
+                adjusted_min_d = max(min_d_spacing, 0.8)
+            else:  # Normal wavelengths
+                adjusted_max_2theta = max_two_theta
+                adjusted_min_d = min_d_spacing
+            
+            print(f"Calculating with limits: max_2θ={adjusted_max_2theta}°, min_d={adjusted_min_d}Å")
+            
+            # Add timeout for calculation to prevent hanging
+            start_time = time.time()
+            try:
+                pattern = cif_parser.calculate_xrd_pattern_from_cif(
+                    cif_content, wavelength, max_2theta=adjusted_max_2theta, min_d=adjusted_min_d
+                )
+                calc_time = time.time() - start_time
+                
+                # Skip if calculation took too long or generated too many peaks
+                if calc_time > 30.0:  # 30 second timeout
+                    print(f"⚠️ Calculation took too long ({calc_time:.1f}s), skipping {mineral_name}")
+                    conn.close()
+                    return False
+                
+                if len(pattern.get('two_theta', [])) > 10000:  # Limit peak count
+                    print(f"⚠️ Too many peaks ({len(pattern['two_theta'])}), skipping {mineral_name}")
+                    conn.close()
+                    return False
+                    
+            except Exception as calc_error:
+                calc_time = time.time() - start_time
+                print(f"❌ Calculation failed for {mineral_name} after {calc_time:.1f}s: {calc_error}")
+                conn.close()
+                return False
             
             if len(pattern.get('two_theta', [])) == 0:
                 print(f"Failed to calculate diffraction pattern for {mineral_name}")
@@ -851,36 +888,78 @@ class LocalCIFDatabase:
     def get_diffraction_pattern(self, mineral_id: int, wavelength: float = 1.5406, 
                               max_two_theta: float = 90.0, min_d_spacing: float = 0.5) -> Optional[Dict]:
         """
-        Retrieve pre-calculated diffraction pattern from database
+        Retrieve pre-calculated diffraction pattern from database and convert to target wavelength
         
         Args:
             mineral_id: Database ID of the mineral
-            wavelength: X-ray wavelength in Angstroms
-            max_two_theta: Maximum 2θ angle
-            min_d_spacing: Minimum d-spacing
+            wavelength: Target X-ray wavelength in Angstroms
+            max_two_theta: Maximum 2θ angle (not used for retrieval, kept for compatibility)
+            min_d_spacing: Minimum d-spacing (not used for retrieval, kept for compatibility)
             
         Returns:
-            Dictionary with 'two_theta', 'intensity', 'd_spacing' arrays or None
+            Dictionary with 'two_theta', 'intensity', 'd_spacing' arrays converted to target wavelength or None
         """
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
             
+            # Always look for Cu Kα pattern (our reference wavelength)
+            reference_wavelength = 1.5406
             cursor.execute('''
                 SELECT two_theta, intensities, d_spacings FROM diffraction_patterns
-                WHERE mineral_id = ? AND wavelength = ? AND max_two_theta = ? AND min_d_spacing = ?
-            ''', (mineral_id, wavelength, max_two_theta, min_d_spacing))
+                WHERE mineral_id = ? AND wavelength = ?
+                ORDER BY max_two_theta DESC, min_d_spacing ASC
+                LIMIT 1
+            ''', (mineral_id, reference_wavelength))
             
             result = cursor.fetchone()
             conn.close()
             
             if result:
                 two_theta_json, intensities_json, d_spacings_json = result
-                return {
-                    'two_theta': np.array(json.loads(two_theta_json)),
-                    'intensity': np.array(json.loads(intensities_json)),
-                    'd_spacing': np.array(json.loads(d_spacings_json))
-                }
+                
+                # Load the reference data
+                ref_two_theta = np.array(json.loads(two_theta_json))
+                intensities = np.array(json.loads(intensities_json))
+                d_spacings = np.array(json.loads(d_spacings_json))
+                
+                # Convert to target wavelength using Bragg's law if needed
+                if abs(wavelength - reference_wavelength) > 1e-6:  # Different wavelength
+                    # Calculate new 2θ values: λ = 2d sin(θ) → θ = arcsin(λ / 2d)
+                    new_two_theta = []
+                    valid_intensities = []
+                    valid_d_spacings = []
+                    
+                    for d, intensity in zip(d_spacings, intensities):
+                        if d > 0:
+                            sin_theta = wavelength / (2 * d)
+                            if sin_theta <= 1.0:  # Valid reflection
+                                theta_rad = np.arcsin(sin_theta)
+                                two_theta_deg = 2 * np.degrees(theta_rad)
+                                
+                                # Apply reasonable 2θ limits based on wavelength
+                                min_2theta = 1.0 if wavelength < 1.0 else 5.0
+                                max_2theta_limit = 90.0 if wavelength > 1.0 else 60.0
+                                
+                                if min_2theta <= two_theta_deg <= max_2theta_limit:
+                                    new_two_theta.append(two_theta_deg)
+                                    valid_intensities.append(intensity)
+                                    valid_d_spacings.append(d)
+                    
+                    print(f"Converted pattern from λ={reference_wavelength:.4f}Å to λ={wavelength:.4f}Å: {len(valid_d_spacings)} peaks")
+                    
+                    return {
+                        'two_theta': np.array(new_two_theta),
+                        'intensity': np.array(valid_intensities),
+                        'd_spacing': np.array(valid_d_spacings)
+                    }
+                else:
+                    # Same wavelength, return as-is
+                    return {
+                        'two_theta': ref_two_theta,
+                        'intensity': intensities,
+                        'd_spacing': d_spacings
+                    }
             
             return None
             
@@ -901,13 +980,10 @@ class LocalCIFDatabase:
             Number of patterns successfully calculated
         """
         if wavelengths is None:
-            # Common XRD wavelengths
+            # Only calculate for Cu Kα - d-spacings are wavelength independent
+            # We'll convert to other wavelengths using Bragg's law during matching
             wavelengths = [
-                1.5406,  # Cu Kα1
-                1.7902,  # Co Kα1  
-                1.9373,  # Fe Kα1
-                0.7107,  # Mo Kα1
-                0.2401   # Your Mo wavelength
+                1.5406,  # Cu Kα1 - standard reference wavelength
             ]
         
         try:
@@ -923,13 +999,28 @@ class LocalCIFDatabase:
             completed = 0
             successful = 0
             
-            print(f"Starting bulk diffraction pattern calculation for {len(minerals)} minerals at {len(wavelengths)} wavelengths...")
+            print(f"Starting bulk diffraction pattern calculation for {len(minerals)} minerals...")
+            print(f"Using Cu Kα reference wavelength (λ=1.5406Å) - other wavelengths calculated on-demand using Bragg's law")
             print(f"Total calculations: {total_calculations}")
+            print(f"Tip: Use 'Calculate Common Minerals Only' for much faster setup (~1000 minerals vs {len(minerals)})")
             
             for mineral_id, mineral_name in minerals:
-                for wavelength in wavelengths:
-                    if self.calculate_and_store_diffraction_pattern(mineral_id, wavelength):
-                        successful += 1
+                print(f"\nProcessing mineral: {mineral_name} (ID: {mineral_id})")
+                
+                for i, wavelength in enumerate(wavelengths):
+                    print(f"  Wavelength {i+1}/{len(wavelengths)}: {wavelength}Å")
+                    
+                    try:
+                        if self.calculate_and_store_diffraction_pattern(mineral_id, wavelength):
+                            successful += 1
+                        else:
+                            print(f"  ❌ Failed for {mineral_name} at λ={wavelength}Å")
+                    except KeyboardInterrupt:
+                        print(f"\n⚠️ Calculation interrupted by user at mineral {mineral_name}")
+                        print(f"Progress: {completed}/{total_calculations} ({completed/total_calculations*100:.1f}%) - {successful} successful")
+                        return successful
+                    except Exception as e:
+                        print(f"  ❌ Error for {mineral_name} at λ={wavelength}Å: {e}")
                     
                     completed += 1
                     
@@ -937,9 +1028,10 @@ class LocalCIFDatabase:
                         progress = int((completed / total_calculations) * 100)
                         progress_callback(progress)
                     
-                    # Progress reporting every 50 calculations
-                    if completed % 50 == 0:
-                        print(f"Progress: {completed}/{total_calculations} ({completed/total_calculations*100:.1f}%) - {successful} successful")
+                    # Progress reporting every 25 calculations for better feedback
+                    if completed % 25 == 0:
+                        success_rate = (successful / completed) * 100
+                        print(f"\nProgress: {completed}/{total_calculations} ({completed/total_calculations*100:.1f}%) - {successful} successful ({success_rate:.1f}% success rate)")
             
             print(f"\n=== Diffraction Pattern Calculation Complete ===")
             print(f"Total calculations attempted: {total_calculations}")

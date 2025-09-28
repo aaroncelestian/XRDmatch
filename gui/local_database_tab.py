@@ -68,6 +68,85 @@ class DiffractionCalculationThread(QThread):
             self.status_updated.emit(f"Calculation error: {str(e)}")
             self.calculation_complete.emit(0)
 
+class CommonMineralsCalculationThread(QThread):
+    """Thread for calculating diffraction patterns for common minerals only"""
+    
+    progress_updated = pyqtSignal(int)
+    status_updated = pyqtSignal(str)
+    calculation_complete = pyqtSignal(int)
+    
+    def __init__(self, db_manager):
+        super().__init__()
+        self.db_manager = db_manager
+    
+    def run(self):
+        """Run the diffraction pattern calculation for common minerals only"""
+        try:
+            # List of common mineral names to prioritize
+            common_minerals = [
+                'quartz', 'calcite', 'feldspar', 'albite', 'orthoclase', 'microcline',
+                'plagioclase', 'muscovite', 'biotite', 'chlorite', 'kaolinite', 'illite',
+                'montmorillonite', 'pyrite', 'hematite', 'magnetite', 'goethite',
+                'gypsum', 'anhydrite', 'halite', 'fluorite', 'apatite', 'zircon',
+                'rutile', 'anatase', 'brookite', 'corundum', 'spinel', 'olivine',
+                'pyroxene', 'amphibole', 'epidote', 'garnet', 'staurolite', 'andalusite',
+                'sillimanite', 'kyanite', 'cordierite', 'tourmaline', 'topaz',
+                'beryl', 'chrysoberyl', 'dolomite', 'siderite', 'magnesite',
+                'rhodochrosite', 'smithsonite', 'cerussite', 'malachite', 'azurite',
+                'epsomite', 'hexahydrite', 'meridianiite', 'pentahydrite', 'starkeyite',
+                'kieserite', 'sanderite', 'anhydrous magnesium sulfate', 'magnesium sulfate',
+                'mirabilite', 'thenardite', 'halotrichite'
+            ]
+            
+            self.status_updated.emit("Finding common minerals in database...")
+            
+            # Get mineral IDs for common minerals
+            conn = self.db_manager.db_path
+            import sqlite3
+            conn = sqlite3.connect(conn)
+            cursor = conn.cursor()
+            
+            mineral_ids = []
+            for mineral_name in common_minerals:
+                cursor.execute('''
+                    SELECT id, mineral_name FROM minerals 
+                    WHERE mineral_name LIKE ? 
+                    ORDER BY mineral_name
+                    LIMIT 20
+                ''', (f'%{mineral_name}%',))
+                
+                results = cursor.fetchall()
+                mineral_ids.extend(results)
+            
+            # Remove duplicates
+            unique_minerals = list(dict.fromkeys(mineral_ids))
+            conn.close()
+            
+            if not unique_minerals:
+                self.status_updated.emit("No common minerals found in database")
+                self.calculation_complete.emit(0)
+                return
+            
+            self.status_updated.emit(f"Calculating patterns for {len(unique_minerals)} common minerals...")
+            
+            successful_count = 0
+            for i, (mineral_id, mineral_name) in enumerate(unique_minerals):
+                try:
+                    if self.db_manager.calculate_and_store_diffraction_pattern(mineral_id, 1.5406):
+                        successful_count += 1
+                    
+                    progress = int((i + 1) / len(unique_minerals) * 100)
+                    self.progress_updated.emit(progress)
+                    
+                except Exception as e:
+                    print(f"Error calculating pattern for {mineral_name}: {e}")
+            
+            self.calculation_complete.emit(successful_count)
+            
+        except Exception as e:
+            self.status_updated.emit(f"Calculation error: {str(e)}")
+            self.calculation_complete.emit(0)
+
 class LocalDatabaseTab(QWidget):
     """Tab for managing local CIF database"""
     
@@ -140,8 +219,14 @@ class LocalDatabaseTab(QWidget):
         
         calc_patterns_btn = QPushButton("Calculate All Diffraction Patterns")
         calc_patterns_btn.clicked.connect(self.calculate_all_diffraction_patterns)
-        calc_patterns_btn.setToolTip("Pre-calculate diffraction patterns for all minerals (speeds up phase matching)")
+        calc_patterns_btn.setToolTip("Pre-calculate Cu Kα diffraction patterns for all minerals (other wavelengths converted on-demand)")
         diffraction_layout.addWidget(calc_patterns_btn)
+        
+        # Add selective calculation option
+        calc_subset_btn = QPushButton("Calculate Common Minerals Only")
+        calc_subset_btn.clicked.connect(self.calculate_common_minerals)
+        calc_subset_btn.setToolTip("Calculate patterns for ~1000 most common minerals (much faster)")
+        diffraction_layout.addWidget(calc_subset_btn)
         
         diffraction_stats_btn = QPushButton("Show Pattern Statistics")
         diffraction_stats_btn.clicked.connect(self.show_diffraction_statistics)
@@ -532,6 +617,29 @@ Database:
         
         self.calculation_thread.start()
     
+    def calculate_common_minerals(self):
+        """Calculate diffraction patterns for common minerals only"""
+        reply = QMessageBox.question(self, "Calculate Common Minerals",
+                                   "This will calculate diffraction patterns for ~1000 common minerals only.\n"
+                                   "This is much faster and covers most phase identification needs.\n\n"
+                                   "Continue?",
+                                   QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        
+        # Start calculation for common minerals only
+        self.calculation_thread = CommonMineralsCalculationThread(self.db_manager)
+        self.calculation_thread.progress_updated.connect(self.progress_bar.setValue)
+        self.calculation_thread.status_updated.connect(self.status_label.setText)
+        self.calculation_thread.calculation_complete.connect(self.on_calculation_complete)
+        
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.status_label.setText("Calculating patterns for common minerals...")
+        
+        self.calculation_thread.start()
+    
     def on_calculation_complete(self, successful_count):
         """Handle completion of diffraction pattern calculation"""
         self.progress_bar.setVisible(False)
@@ -562,14 +670,17 @@ Database:
         
         message = f"""Diffraction Pattern Statistics:
 
-Total Patterns: {stats.get('total_patterns', 0)}
+Total Patterns: {stats.get('total_patterns', 0)} (Cu Kα reference)
 Minerals with Patterns: {stats.get('minerals_with_patterns', 0)}
 Total Minerals: {stats.get('total_minerals', 0)}
 Coverage: {stats.get('coverage_percentage', 0):.1f}%
 
 Patterns by Wavelength:
 {wavelength_info}
-Pre-calculated patterns significantly speed up phase matching!
+
+Note: Only Cu Kα (1.5406Å) patterns are stored.
+Other wavelengths are calculated on-demand using Bragg's law conversion.
+This approach is much more efficient and provides the same accuracy!
         """.strip()
         
         QMessageBox.information(self, "Diffraction Pattern Statistics", message)
