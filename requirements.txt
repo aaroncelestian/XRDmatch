@@ -1,0 +1,10 @@
+PyQt5==5.15.10
+matplotlib==3.8.2
+numpy==1.26.2
+pandas==2.1.4
+requests==2.31.0
+scipy==1.11.4
+pymatgen==2023.12.18
+gemmi==0.6.4
+lxml==4.9.4
+beautifulsoup4==4.12.2
