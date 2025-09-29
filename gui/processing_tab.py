@@ -1,5 +1,10 @@
 """
-Data processing tab for XRD pattern preprocessing and background subtraction
+Data processing tab for XRD pattern preprocessing including:
+- Sample holder subtraction: Remove sample holder contributions from experimental data
+- Background subtraction: ALS (Asymmetric Least Squares) baseline correction
+- Peak detection: Automated and manual peak identification
+- Data corrections: Sample displacement and other systematic corrections
+- Filtering: Smoothing and noise reduction
 """
 
 import numpy as np
@@ -7,7 +12,7 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QLabel, QComboBox, QDoubleSpinBox, QSpinBox,
                              QGroupBox, QSlider, QCheckBox, QSplitter,
                              QMessageBox, QProgressBar, QTabWidget, QGridLayout,
-                             QFrame, QToolButton, QButtonGroup)
+                             QFrame, QToolButton, QButtonGroup, QFileDialog)
 from PyQt5.QtCore import Qt, pyqtSignal, QTimer
 from PyQt5.QtGui import QIcon
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -30,6 +35,7 @@ class ProcessingTab(QWidget):
         self.original_pattern_data = None
         self.background_data = None
         self.processed_pattern_data = None
+        self.sample_holder_data = None  # Sample holder pattern data
         self.peaks = None
         self.manual_peaks = []  # User-added peaks
         self.removed_peaks = []  # User-removed peaks
@@ -39,7 +45,7 @@ class ProcessingTab(QWidget):
         # Timer for real-time updates
         self.update_timer = QTimer()
         self.update_timer.setSingleShot(True)
-        self.update_timer.timeout.connect(self.update_background_preview)
+        self.update_timer.timeout.connect(self.update_processing_preview)
         
         self.init_ui()
         
@@ -73,6 +79,14 @@ class ProcessingTab(QWidget):
         
         # Create tabbed interface for different processing options
         tab_widget = QTabWidget()
+        
+        # Sample holder subtraction tab (should be first)
+        holder_tab = QWidget()
+        holder_layout = QVBoxLayout(holder_tab)
+        holder_group = self.create_sample_holder_group()
+        holder_layout.addWidget(holder_group)
+        holder_layout.addStretch()
+        tab_widget.addTab(holder_tab, "Sample Holder")
         
         # Background subtraction tab
         bg_tab = QWidget()
@@ -127,6 +141,89 @@ class ProcessingTab(QWidget):
         
         self.range_label = QLabel("2θ range: -")
         layout.addWidget(self.range_label)
+        
+        return group
+        
+    def create_sample_holder_group(self):
+        """Create sample holder subtraction controls"""
+        group = QGroupBox("Sample Holder Subtraction")
+        layout = QVBoxLayout(group)
+        
+        # Enable/disable sample holder subtraction
+        self.enable_holder_subtraction = QCheckBox("Enable Sample Holder Subtraction")
+        self.enable_holder_subtraction.stateChanged.connect(self.on_holder_enable_changed)
+        layout.addWidget(self.enable_holder_subtraction)
+        
+        # File loading section
+        file_layout = QHBoxLayout()
+        self.load_holder_btn = QPushButton("Load Sample Holder Pattern")
+        self.load_holder_btn.clicked.connect(self.load_sample_holder_pattern)
+        file_layout.addWidget(self.load_holder_btn)
+        
+        self.clear_holder_btn = QPushButton("Clear")
+        self.clear_holder_btn.clicked.connect(self.clear_sample_holder)
+        self.clear_holder_btn.setEnabled(False)
+        file_layout.addWidget(self.clear_holder_btn)
+        layout.addLayout(file_layout)
+        
+        # Sample holder info
+        self.holder_info_label = QLabel("No sample holder pattern loaded")
+        self.holder_info_label.setStyleSheet("QLabel { color: #666; font-size: 10px; }")
+        layout.addWidget(self.holder_info_label)
+        
+        # Help text
+        help_text = QLabel("Load a sample holder pattern (glass slide, aluminum plate, etc.) to subtract its contribution from your experimental data. This should be done first, before background subtraction.")
+        help_text.setStyleSheet("QLabel { color: #666; font-size: 9px; }")
+        help_text.setWordWrap(True)
+        layout.addWidget(help_text)
+        
+        # Scaling controls
+        scale_layout = QGridLayout()
+        
+        # Intensity scaling
+        scale_layout.addWidget(QLabel("Intensity Scale (%):"), 0, 0)
+        self.holder_scale_spin = QDoubleSpinBox()
+        self.holder_scale_spin.setRange(0.1, 500.0)
+        self.holder_scale_spin.setValue(100.0)
+        self.holder_scale_spin.setDecimals(1)
+        self.holder_scale_spin.setSingleStep(1.0)
+        self.holder_scale_spin.setSuffix("%")
+        self.holder_scale_spin.setToolTip("Scale the intensity of the sample holder pattern")
+        self.holder_scale_spin.valueChanged.connect(self.on_holder_parameter_changed)
+        scale_layout.addWidget(self.holder_scale_spin, 0, 1)
+        
+        # 2θ offset for alignment
+        scale_layout.addWidget(QLabel("2θ Offset (°):"), 1, 0)
+        self.holder_offset_spin = QDoubleSpinBox()
+        self.holder_offset_spin.setRange(-5.0, 5.0)
+        self.holder_offset_spin.setValue(0.0)
+        self.holder_offset_spin.setDecimals(3)
+        self.holder_offset_spin.setSingleStep(0.001)
+        self.holder_offset_spin.setToolTip("Shift sample holder pattern in 2θ for alignment")
+        self.holder_offset_spin.valueChanged.connect(self.on_holder_parameter_changed)
+        scale_layout.addWidget(self.holder_offset_spin, 1, 1)
+        
+        layout.addLayout(scale_layout)
+        
+        # Preview options
+        preview_layout = QHBoxLayout()
+        self.show_holder_pattern = QCheckBox("Show Holder")
+        self.show_holder_pattern.setChecked(True)
+        self.show_holder_pattern.stateChanged.connect(self.update_plot)
+        preview_layout.addWidget(self.show_holder_pattern)
+        
+        self.show_subtracted = QCheckBox("Show Subtracted")
+        self.show_subtracted.setChecked(True)
+        self.show_subtracted.stateChanged.connect(self.update_plot)
+        preview_layout.addWidget(self.show_subtracted)
+        
+        self.realtime_holder_preview = QCheckBox("Real-time")
+        self.realtime_holder_preview.setChecked(True)
+        preview_layout.addWidget(self.realtime_holder_preview)
+        layout.addLayout(preview_layout)
+        
+        # Initially disabled
+        self.set_holder_controls_enabled(False)
         
         return group
         
@@ -550,6 +647,336 @@ class ProcessingTab(QWidget):
         # Enable correction controls
         self.set_correction_controls_enabled(True)
         
+    def on_holder_enable_changed(self, state):
+        """Handle sample holder subtraction enable/disable"""
+        enabled = state == Qt.CheckState.Checked
+        self.set_holder_controls_enabled(enabled)
+        
+        if enabled and self.realtime_holder_preview.isChecked() and self.sample_holder_data is not None:
+            self.start_update_timer()
+        else:
+            self.update_plot()
+            
+    def set_holder_controls_enabled(self, enabled):
+        """Enable/disable sample holder subtraction controls"""
+        self.holder_scale_spin.setEnabled(enabled and self.sample_holder_data is not None)
+        self.holder_offset_spin.setEnabled(enabled and self.sample_holder_data is not None)
+        self.show_holder_pattern.setEnabled(enabled and self.sample_holder_data is not None)
+        self.show_subtracted.setEnabled(enabled and self.sample_holder_data is not None)
+        
+    def on_holder_parameter_changed(self):
+        """Handle sample holder parameter changes"""
+        if (self.realtime_holder_preview.isChecked() and 
+            self.sample_holder_data is not None and 
+            self.enable_holder_subtraction.isChecked()):
+            # Apply processing and update plot for real-time preview
+            self.start_update_timer()
+        else:
+            # Just update the plot visualization (no processing applied)
+            self.update_plot()
+            
+    def load_sample_holder_pattern(self):
+        """Load a sample holder diffraction pattern"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load Sample Holder Pattern",
+            "",
+            "XRD files (*.xy *.xye *.txt *.dat *.csv *.xml);;All files (*.*)"
+        )
+        
+        if file_path:
+            try:
+                # Parse the file directly using pattern parsing methods
+                two_theta, intensity, intensity_error = self.parse_pattern_file(file_path)
+                
+                if two_theta is not None and intensity is not None and len(two_theta) > 0:
+                    # Create holder data dictionary
+                    file_format = 'XYE' if intensity_error is not None else 'XY'
+                    if file_path.lower().endswith('.xml'):
+                        file_format = 'XML'
+                    
+                    holder_data = {
+                        'two_theta': two_theta,
+                        'intensity': intensity,
+                        'intensity_error': intensity_error,
+                        'file_path': file_path,
+                        'file_format': file_format,
+                        'wavelength': self.wavelength
+                    }
+                    
+                    self.sample_holder_data = holder_data
+                    
+                    # Update UI
+                    file_name = file_path.split('/')[-1]
+                    n_points = len(two_theta)
+                    min_2theta = np.min(two_theta)
+                    max_2theta = np.max(two_theta)
+                    
+                    self.holder_info_label.setText(
+                        f"Loaded: {file_name}\n"
+                        f"Points: {n_points}, Range: {min_2theta:.2f}° - {max_2theta:.2f}°"
+                    )
+                    
+                    self.clear_holder_btn.setEnabled(True)
+                    
+                    # Enable controls if subtraction is enabled
+                    if self.enable_holder_subtraction.isChecked():
+                        self.set_holder_controls_enabled(True)
+                    
+                    self.update_plot()
+                    
+                    QMessageBox.information(self, "Success", f"Sample holder pattern loaded successfully!\n{n_points} data points")
+                    
+                else:
+                    QMessageBox.warning(self, "Error", "Could not load sample holder pattern. Invalid file format.")
+                    
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Could not load sample holder pattern:\n{str(e)}")
+                
+    def clear_sample_holder(self):
+        """Clear the loaded sample holder pattern"""
+        self.sample_holder_data = None
+        self.holder_info_label.setText("No sample holder pattern loaded")
+        self.clear_holder_btn.setEnabled(False)
+        self.set_holder_controls_enabled(False)
+        self.update_plot()
+        
+    def parse_pattern_file(self, file_path):
+        """Parse a pattern file and return two_theta, intensity, intensity_error"""
+        try:
+            # Check if it's an XML file
+            if file_path.lower().endswith('.xml'):
+                return self.parse_xml_file(file_path)
+            else:
+                # Handle text-based formats (XY, XYE, etc.)
+                return self.parse_text_file(file_path)
+        except Exception as e:
+            print(f"Error parsing pattern file {file_path}: {e}")
+            return None, None, None
+    
+    def parse_xml_file(self, file_path):
+        """Parse XML file format"""
+        import xml.etree.ElementTree as ET
+        
+        try:
+            tree = ET.parse(file_path)
+            root = tree.getroot()
+            
+            two_theta_list = []
+            intensity_list = []
+            wavelength = None
+            
+            # Look for wavelength information
+            for w_elem in root.iter('w'):
+                try:
+                    wavelength = float(w_elem.text)
+                    break
+                except (ValueError, TypeError):
+                    continue
+            
+            # Extract intensity data
+            for intensity_elem in root.iter('intensity'):
+                try:
+                    x_val = float(intensity_elem.get('X', 0))  # 2theta
+                    y_val = float(intensity_elem.get('Y', 0))  # counts
+                    
+                    two_theta_list.append(x_val)
+                    intensity_list.append(y_val)
+                except (ValueError, TypeError):
+                    continue
+            
+            if len(two_theta_list) == 0:
+                return None, None, None
+            
+            # Convert to numpy arrays and sort by 2theta
+            two_theta = np.array(two_theta_list)
+            intensity = np.array(intensity_list)
+            
+            # Sort by 2theta
+            sort_indices = np.argsort(two_theta)
+            two_theta = two_theta[sort_indices]
+            intensity = intensity[sort_indices]
+            
+            # Calculate error bars as sqrt(counts) for Poisson statistics
+            intensity_error = np.sqrt(np.maximum(intensity, 1))
+            
+            return two_theta, intensity, intensity_error
+            
+        except Exception as e:
+            print(f"Error parsing XML file: {e}")
+            return None, None, None
+    
+    def parse_text_file(self, file_path):
+        """Parse text-based file formats (XY, XYE, etc.)"""
+        try:
+            # Detect format for XYE files
+            if file_path.lower().endswith('.xye'):
+                format_info = self.detect_xye_format(file_path)
+                if format_info == 'commented_xye':
+                    return self.parse_commented_xye(file_path)
+            
+            # Default to standard text file parsing
+            return self.parse_standard_text_file(file_path)
+            
+        except Exception as e:
+            print(f"Error parsing text file: {e}")
+            return None, None, None
+    
+    def detect_xye_format(self, file_path):
+        """Detect XYE file format"""
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                first_lines = []
+                for _ in range(10):
+                    line = f.readline()
+                    if not line:
+                        break
+                    first_lines.append(line.strip())
+            
+            # Check for C-style comments
+            has_c_comments = any('/*' in line for line in first_lines)
+            if has_c_comments:
+                return 'commented_xye'
+            else:
+                return 'standard_xye'
+                
+        except Exception:
+            return 'standard_xye'
+    
+    def parse_commented_xye(self, file_path):
+        """Parse XYE format with C-style comments"""
+        processed_lines = []
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            in_c_comment = False
+            
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                
+                # Handle C-style comments
+                if '/*' in line and '*/' in line:
+                    # Complete comment on one line - remove but keep surrounding content
+                    start_comment = line.find('/*')
+                    end_comment = line.find('*/') + 2
+                    line = line[:start_comment] + line[end_comment:]
+                elif '/*' in line:
+                    # Start of multi-line comment
+                    in_c_comment = True
+                    line = line[:line.find('/*')]
+                elif '*/' in line:
+                    # End of multi-line comment
+                    in_c_comment = False
+                    line = line[line.find('*/') + 2:]
+                elif in_c_comment:
+                    # Inside multi-line comment
+                    continue
+                
+                # Skip empty lines after comment removal
+                line = line.strip()
+                if line:
+                    processed_lines.append(line)
+        
+        return self.parse_numeric_data(processed_lines)
+    
+    def parse_standard_text_file(self, file_path):
+        """Parse standard text file formats"""
+        processed_lines = []
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                line = line.strip()
+                # Skip empty lines and comments
+                if line and not line.startswith('#') and not line.startswith('//'):
+                    processed_lines.append(line)
+        
+        return self.parse_numeric_data(processed_lines)
+    
+    def parse_numeric_data(self, processed_lines):
+        """Parse numeric data from processed text lines"""
+        parsed_data = []
+        
+        for line in processed_lines:
+            # Split by any whitespace and filter empty strings
+            parts = [p for p in line.split() if p]
+            
+            if len(parts) >= 2:
+                try:
+                    two_theta = float(parts[0])
+                    intensity = float(parts[1])
+                    error = float(parts[2]) if len(parts) >= 3 else None
+                    parsed_data.append((two_theta, intensity, error))
+                except ValueError:
+                    continue
+        
+        if not parsed_data:
+            return None, None, None
+        
+        # Convert to numpy arrays
+        two_theta = np.array([d[0] for d in parsed_data])
+        intensity = np.array([d[1] for d in parsed_data])
+        
+        # Handle error bars
+        errors = [d[2] for d in parsed_data if d[2] is not None]
+        if len(errors) == len(parsed_data):
+            intensity_error = np.array(errors)
+        else:
+            intensity_error = None
+        
+        return two_theta, intensity, intensity_error
+        
+    def subtract_sample_holder(self, exp_two_theta, exp_intensity):
+        """Subtract sample holder pattern from experimental data"""
+        if self.sample_holder_data is None:
+            return exp_intensity
+            
+        try:
+            # Get sample holder data
+            holder_two_theta = np.array(self.sample_holder_data['two_theta'])
+            holder_intensity = np.array(self.sample_holder_data['intensity'])
+            
+            # Apply 2θ offset to sample holder pattern
+            offset = self.holder_offset_spin.value()
+            holder_two_theta_shifted = holder_two_theta + offset
+            
+            # Apply intensity scaling
+            scale = self.holder_scale_spin.value() / 100.0
+            holder_intensity_scaled = holder_intensity * scale
+            
+            # Interpolate sample holder pattern to match experimental 2θ grid
+            from scipy.interpolate import interp1d
+            
+            # Find overlapping range
+            exp_min, exp_max = np.min(exp_two_theta), np.max(exp_two_theta)
+            holder_min, holder_max = np.min(holder_two_theta_shifted), np.max(holder_two_theta_shifted)
+            
+            # Create interpolation function (extrapolate with zeros)
+            interp_func = interp1d(
+                holder_two_theta_shifted, 
+                holder_intensity_scaled,
+                kind='linear',
+                bounds_error=False,
+                fill_value=0.0  # Fill with zeros outside range
+            )
+            
+            # Interpolate holder pattern to experimental grid
+            holder_interp = interp_func(exp_two_theta)
+            
+            # Subtract holder pattern from experimental data
+            subtracted_intensity = exp_intensity - holder_interp
+            
+            # Ensure no negative values
+            subtracted_intensity = np.maximum(subtracted_intensity, 0.0)
+            
+            print(f"Sample holder subtraction applied: scale={scale:.2f}, offset={offset:.3f}°")
+            print(f"Holder range: {holder_min:.2f}° - {holder_max:.2f}°")
+            print(f"Experimental range: {exp_min:.2f}° - {exp_max:.2f}°")
+            
+            return subtracted_intensity
+            
+        except Exception as e:
+            print(f"Error in sample holder subtraction: {e}")
+            return exp_intensity
+        
     def update_pattern_info(self):
         """Update pattern information display"""
         if self.pattern_data is None:
@@ -605,9 +1032,9 @@ class ProcessingTab(QWidget):
         self.update_timer.stop()
         self.update_timer.start(500)  # 500ms delay
         
-    def update_background_preview(self):
-        """Update background subtraction preview"""
-        if not self.enable_bg_subtraction.isChecked() or self.pattern_data is None:
+    def update_processing_preview(self):
+        """Update processing preview (sample holder, background, etc.)"""
+        if self.pattern_data is None:
             return
             
         try:
@@ -615,17 +1042,7 @@ class ProcessingTab(QWidget):
             self.progress_bar.setVisible(True)
             self.progress_bar.setRange(0, 0)  # Indeterminate
             
-            # Calculate background
-            lambda_val = 10**self.lambda_slider.value()
-            p_val = self.p_spinbox.value()
-            n_iter = self.iterations_spinbox.value()
-            
-            self.background_data = self.als_baseline(
-                self.original_pattern_data['intensity'],
-                lam=lambda_val, p=p_val, niter=n_iter
-            )
-            
-            # Apply processing
+            # Apply processing in correct order and calculate background from intermediate result
             self.apply_current_processing()
             self.update_plot()
             
@@ -633,7 +1050,7 @@ class ProcessingTab(QWidget):
             
         except Exception as e:
             self.progress_bar.setVisible(False)
-            print(f"Error in background preview: {e}")
+            print(f"Error in processing preview: {e}")
             
     def als_baseline(self, y, lam=1e5, p=0.01, niter=10):
         """
@@ -666,10 +1083,32 @@ class ProcessingTab(QWidget):
             
         # Start with original data
         processed_intensity = self.original_pattern_data['intensity'].copy()
+        processed_two_theta = self.original_pattern_data['two_theta'].copy()
         
-        # Apply background subtraction
-        if self.enable_bg_subtraction.isChecked() and self.background_data is not None:
-            processed_intensity = processed_intensity - self.background_data
+        # Apply sample holder subtraction first (if enabled)
+        if (self.enable_holder_subtraction.isChecked() and 
+            self.sample_holder_data is not None):
+            processed_intensity = self.subtract_sample_holder(
+                processed_two_theta, processed_intensity
+            )
+        
+        # Apply background subtraction (calculate from current processed data)
+        if self.enable_bg_subtraction.isChecked():
+            lambda_val = 10**self.lambda_slider.value()
+            p_val = self.p_spinbox.value()
+            n_iter = self.iterations_spinbox.value()
+            
+            # Calculate background from current processed intensity (after sample holder subtraction)
+            background_data = self.als_baseline(
+                processed_intensity,
+                lam=lambda_val, p=p_val, niter=n_iter
+            )
+            
+            # Store for visualization
+            self.background_data = background_data
+            
+            # Apply background subtraction
+            processed_intensity = processed_intensity - background_data
             processed_intensity = np.maximum(processed_intensity, 0)  # No negative values
             
         # Apply smoothing
@@ -756,6 +1195,24 @@ class ProcessingTab(QWidget):
             self.ax.plot(candidate_positions, candidate_intensities, 'yo', markersize=3, 
                         alpha=0.7, label='All Candidates')
         
+        # Plot sample holder pattern if requested and available
+        if (self.show_holder_pattern.isChecked() and 
+            self.enable_holder_subtraction.isChecked() and 
+            self.sample_holder_data is not None):
+            
+            # Get sample holder data with scaling and offset
+            holder_two_theta = np.array(self.sample_holder_data['two_theta'])
+            holder_intensity = np.array(self.sample_holder_data['intensity'])
+            
+            # Apply offset and scaling
+            offset = self.holder_offset_spin.value()
+            scale = self.holder_scale_spin.value() / 100.0
+            holder_two_theta_shifted = holder_two_theta + offset
+            holder_intensity_scaled = holder_intensity * scale
+            
+            self.ax.plot(holder_two_theta_shifted, holder_intensity_scaled, 
+                        'r--', linewidth=1, alpha=0.7, label='Sample Holder')
+        
         # Plot background if requested and available
         if (self.show_background.isChecked() and 
             self.enable_bg_subtraction.isChecked() and 
@@ -769,6 +1226,8 @@ class ProcessingTab(QWidget):
         
         # Update title based on processing status
         title = 'XRD Pattern Processing Preview'
+        if self.enable_holder_subtraction.isChecked() and self.sample_holder_data is not None:
+            title += ' (Holder Subtracted)'
         if self.enable_bg_subtraction.isChecked():
             title += ' (Background Subtracted)'
         if self.enable_smoothing.isChecked():
@@ -819,6 +1278,7 @@ class ProcessingTab(QWidget):
             self.background_data = None
             
             # Reset UI controls
+            self.enable_holder_subtraction.setChecked(False)
             self.enable_bg_subtraction.setChecked(False)
             self.enable_smoothing.setChecked(False)
             self.enable_noise_reduction.setChecked(False)

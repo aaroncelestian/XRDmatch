@@ -15,6 +15,7 @@ from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as Navigatio
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 from utils.cif_parser import CIFParser
+from utils.multi_phase_analyzer import MultiPhaseAnalyzer
 from scipy.special import wofz
 from scipy.stats import pearsonr
 from scipy.interpolate import interp1d
@@ -420,6 +421,10 @@ class MatchingTab(QWidget):
         self.reference_phases = []
         self.matching_results = []
         
+        # Multi-phase analysis
+        self.multi_phase_analyzer = MultiPhaseAnalyzer()
+        self.multi_phase_results = None
+        
         # Cache for calculated theoretical patterns to avoid recalculation
         self.pattern_cache = {}  # Key: (phase_id, wavelength), Value: theoretical pattern data
         self.continuous_pattern_cache = {}  # Key: (phase_id, wavelength, fwhm, x_range_hash), Value: continuous pattern
@@ -677,6 +682,13 @@ class MatchingTab(QWidget):
         self.match_btn.setEnabled(False)
         layout.addWidget(self.match_btn)
         
+        # Multi-phase analysis button
+        self.multi_phase_btn = QPushButton("Multi-Phase Analysis")
+        self.multi_phase_btn.clicked.connect(self.start_multi_phase_analysis)
+        self.multi_phase_btn.setEnabled(False)
+        self.multi_phase_btn.setToolTip("Sequential phase identification with residue analysis")
+        layout.addWidget(self.multi_phase_btn)
+        
         self.clear_btn = QPushButton("Clear Results")
         self.clear_btn.clicked.connect(self.clear_results)
         layout.addWidget(self.clear_btn)
@@ -806,6 +818,11 @@ class MatchingTab(QWidget):
                     has_pattern)
         self.match_btn.setEnabled(can_match)
         
+        # Multi-phase analysis requires matching results
+        can_multi_phase = (can_match and 
+                          len(self.matching_results) > 1)  # Need at least 2 phases
+        self.multi_phase_btn.setEnabled(can_multi_phase)
+        
     def start_matching(self):
         """Start the phase matching process"""
         if not self.experimental_peaks or not self.reference_phases:
@@ -914,6 +931,213 @@ class MatchingTab(QWidget):
             self.results_table.setCellWidget(i, 8, show_checkbox)
             
         self.update_plot()
+        
+        # Update multi-phase analysis availability
+        self.update_matching_availability()
+        
+    def start_multi_phase_analysis(self):
+        """Start multi-phase sequential analysis"""
+        if not self.matching_results or len(self.matching_results) < 2:
+            QMessageBox.warning(self, "Multi-Phase Analysis", 
+                              "Need at least 2 phase matches to perform multi-phase analysis.\n"
+                              "Run 'Start Matching' first to identify candidate phases.")
+            return
+            
+        # Get experimental data for analysis
+        pattern_to_use = self.processed_pattern or self.experimental_pattern
+        if not pattern_to_use:
+            QMessageBox.warning(self, "Multi-Phase Analysis", 
+                              "No experimental pattern data available.")
+            return
+            
+        # Prepare experimental data
+        experimental_data = {
+            'two_theta': pattern_to_use['two_theta'],
+            'intensity': pattern_to_use['intensity'],
+            'wavelength': pattern_to_use.get('wavelength', 1.5406)
+        }
+        
+        # Filter candidate phases (only those with good scores and theoretical data)
+        min_score = 0.05  # Lower threshold for multi-phase analysis
+        candidate_phases = []
+        
+        for result in self.matching_results:
+            if (result['match_score'] >= min_score and 
+                'theoretical_peaks' in result and
+                len(result['theoretical_peaks'].get('two_theta', [])) > 0):
+                candidate_phases.append(result)
+                
+        if len(candidate_phases) < 2:
+            QMessageBox.warning(self, "Multi-Phase Analysis", 
+                              f"Only {len(candidate_phases)} phases have sufficient data for analysis.\n"
+                              "Need at least 2 phases with theoretical patterns.")
+            return
+            
+        print(f"Starting multi-phase analysis with {len(candidate_phases)} candidate phases")
+        
+        # Show progress
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.multi_phase_btn.setEnabled(False)
+        
+        try:
+            # Perform sequential phase identification
+            self.multi_phase_results = self.multi_phase_analyzer.sequential_phase_identification(
+                experimental_data, 
+                candidate_phases,
+                max_phases=5,
+                residue_threshold=0.05
+            )
+            
+            # Display results
+            self.display_multi_phase_results()
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Multi-Phase Analysis Error", 
+                               f"Error during multi-phase analysis:\n{str(e)}")
+            print(f"Multi-phase analysis error: {e}")
+            
+        finally:
+            self.progress_bar.setVisible(False)
+            self.multi_phase_btn.setEnabled(True)
+            
+    def display_multi_phase_results(self):
+        """Display multi-phase analysis results"""
+        if not self.multi_phase_results:
+            return
+            
+        identified_phases = self.multi_phase_results['identified_phases']
+        
+        # Generate analysis report
+        report = self.multi_phase_analyzer.generate_residue_analysis_report(self.multi_phase_results)
+        
+        # Show results dialog
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Multi-Phase Analysis Results")
+        dialog.setText(f"Sequential Analysis Complete: {len(identified_phases)} phases identified")
+        dialog.setDetailedText(report)
+        dialog.setIcon(QMessageBox.Information)
+        dialog.exec_()
+        
+        # Update results table to show multi-phase results
+        self.update_results_table_with_multi_phase()
+        
+        # Update plot to show residue analysis
+        self.update_plot_with_residue_analysis()
+        
+    def update_results_table_with_multi_phase(self):
+        """Update results table to highlight identified phases from multi-phase analysis"""
+        if not self.multi_phase_results:
+            return
+            
+        identified_phase_ids = set()
+        for phase_result in self.multi_phase_results['identified_phases']:
+            phase_id = phase_result['phase'].get('id')
+            if phase_id:
+                identified_phase_ids.add(phase_id)
+                
+        # Update table to highlight multi-phase results
+        for i in range(self.results_table.rowCount()):
+            # Find corresponding phase in matching results
+            min_score = self.min_score_spin.value()
+            filtered_results = [r for r in self.matching_results if r['match_score'] >= min_score]
+            filtered_results.sort(key=lambda x: x.get('combined_score', x['match_score']), reverse=True)
+            
+            if i < len(filtered_results):
+                result = filtered_results[i]
+                phase_id = result['phase'].get('id')
+                
+                # Highlight if this phase was identified in multi-phase analysis
+                if phase_id in identified_phase_ids:
+                    # Set background color to indicate multi-phase identification
+                    for col in range(self.results_table.columnCount()):
+                        item = self.results_table.item(i, col)
+                        if item:
+                            item.setBackground(Qt.lightGray)
+                            
+    def update_plot_with_residue_analysis(self):
+        """Update plot to show residue analysis from multi-phase identification"""
+        if not self.multi_phase_results:
+            self.update_plot()
+            return
+            
+        # Create enhanced plot with residue analysis
+        self.ax_main.clear()
+        self.ax_diff.clear()
+        
+        # Get experimental data
+        pattern_to_plot = self.processed_pattern or self.experimental_pattern
+        if not pattern_to_plot:
+            return
+            
+        exp_two_theta = pattern_to_plot['two_theta']
+        original_intensity = pattern_to_plot['intensity']
+        
+        # Normalize original experimental data
+        max_exp_intensity = np.max(original_intensity)
+        normalized_exp_intensity = (original_intensity / max_exp_intensity) * 100
+        
+        # Plot original experimental pattern
+        self.ax_main.plot(exp_two_theta, normalized_exp_intensity, 
+                         'b-', linewidth=1.5, label='Original Experimental', alpha=0.8)
+        
+        # Plot final residue
+        final_residue = self.multi_phase_results['final_residue']
+        normalized_residue = (final_residue / max_exp_intensity) * 100
+        self.ax_main.plot(exp_two_theta, normalized_residue, 
+                         'r-', linewidth=1.5, label='Final Residue', alpha=0.8)
+        
+        # Plot individual phase contributions
+        colors = ['green', 'orange', 'purple', 'brown', 'pink']
+        
+        for i, phase_result in enumerate(self.multi_phase_results['identified_phases']):
+            phase_name = phase_result['phase'].get('mineral', f'Phase {i+1}')
+            color = colors[i % len(colors)]
+            
+            # Plot phase contribution
+            contribution = phase_result['contribution']
+            normalized_contribution = (contribution / max_exp_intensity) * 100
+            
+            self.ax_main.plot(exp_two_theta, normalized_contribution, 
+                             color=color, linewidth=1.5, alpha=0.7,
+                             label=f'{phase_name} (Iter {phase_result["iteration"]})')
+        
+        # Format main plot
+        self.ax_main.set_xlabel('2θ (degrees)')
+        self.ax_main.set_ylabel('Normalized Intensity (0-100)')
+        self.ax_main.set_title('Multi-Phase Analysis: Sequential Subtraction Results')
+        self.ax_main.grid(True, alpha=0.3)
+        self.ax_main.legend(loc='upper right')
+        
+        # Plot residue evolution in difference plot
+        residue_history = self.multi_phase_results['residue_history']
+        
+        for i, residue in enumerate(residue_history):
+            normalized_residue = (residue / max_exp_intensity) * 100
+            alpha = 1.0 - (i * 0.15)  # Fade older residues
+            alpha = max(alpha, 0.3)
+            
+            label = f'Residue {i}' if i > 0 else 'Original'
+            self.ax_diff.plot(exp_two_theta, normalized_residue, 
+                             alpha=alpha, linewidth=1.0, label=label)
+        
+        # Format difference plot
+        self.ax_diff.set_xlabel('2θ (degrees)')
+        self.ax_diff.set_ylabel('Normalized Intensity')
+        self.ax_diff.set_title('Residue Evolution During Sequential Analysis')
+        self.ax_diff.grid(True, alpha=0.3)
+        self.ax_diff.legend(loc='upper right')
+        
+        # Apply 2θ limits
+        min_2theta = self.min_2theta_spin.value()
+        max_2theta = self.max_2theta_spin.value()
+        self.ax_main.set_xlim(min_2theta, max_2theta)
+        self.ax_diff.set_xlim(min_2theta, max_2theta)
+        
+        # Set y-axis limits
+        self.ax_main.set_ylim(0, 110)
+        
+        self.canvas.draw()
         
     def apply_global_scaling(self):
         """Apply global scaling to all individual phase scales"""
