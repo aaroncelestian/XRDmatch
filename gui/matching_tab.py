@@ -16,6 +16,8 @@ from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 from utils.cif_parser import CIFParser
 from scipy.special import wofz
+from scipy.stats import pearsonr
+from scipy.interpolate import interp1d
 
 class PhaseMatchingThread(QThread):
     """Thread for phase matching calculations"""
@@ -23,11 +25,13 @@ class PhaseMatchingThread(QThread):
     matching_complete = pyqtSignal(list)
     progress_updated = pyqtSignal(int)
     
-    def __init__(self, experimental_peaks, reference_phases, tolerance):
+    def __init__(self, experimental_peaks, reference_phases, tolerance, peak_weight=0.6, corr_weight=0.4):
         super().__init__()
         self.experimental_peaks = experimental_peaks
         self.reference_phases = reference_phases
         self.tolerance = tolerance
+        self.peak_weight = peak_weight
+        self.corr_weight = corr_weight
         
     def run(self):
         """Run phase matching in separate thread"""
@@ -54,6 +58,7 @@ class PhaseMatchingThread(QThread):
                 'intensity_weighted_score': 0.0
             }
             
+        exp_two_theta = self.experimental_peaks['two_theta']
         exp_dspacings = self.experimental_peaks['d_spacing']
         exp_intensities = self.experimental_peaks['intensity']
         
@@ -73,23 +78,27 @@ class PhaseMatchingThread(QThread):
         max_exp_int = np.max(exp_intensities) if len(exp_intensities) > 0 else 1
         max_theo_int = np.max(theoretical_peaks['intensity']) if len(theoretical_peaks['intensity']) > 0 else 1
         
-        # Find matches with intensity consideration
+        # Find matches with intensity consideration using 2θ tolerance
         matches = []
         matched_exp_peaks = set()
         total_intensity_weight = 0
         matched_intensity_weight = 0
         
-        for theo_d, theo_int in zip(theoretical_peaks['d_spacing'], theoretical_peaks['intensity']):
+        theo_two_theta = theoretical_peaks['two_theta']
+        theo_dspacings = theoretical_peaks['d_spacing']
+        theo_intensities = theoretical_peaks['intensity']
+        
+        for i, (theo_2theta, theo_d, theo_int) in enumerate(zip(theo_two_theta, theo_dspacings, theo_intensities)):
             # Normalize theoretical intensity (0-100 scale)
             norm_theo_int = (theo_int / max_theo_int) * 100
             total_intensity_weight += norm_theo_int
             
-            # Find closest experimental peak
-            differences = np.abs(exp_dspacings - theo_d)
-            min_idx = np.argmin(differences)
-            min_diff = differences[min_idx]
+            # Find closest experimental peak using 2θ differences
+            two_theta_differences = np.abs(exp_two_theta - theo_2theta)
+            min_idx = np.argmin(two_theta_differences)
+            min_2theta_diff = two_theta_differences[min_idx]
             
-            if min_diff <= self.tolerance and min_idx not in matched_exp_peaks:
+            if min_2theta_diff <= self.tolerance and min_idx not in matched_exp_peaks:
                 # Calculate intensity similarity (0-1 scale, 1 = perfect match)
                 norm_exp_int = (exp_intensities[min_idx] / max_exp_int) * 100
                 intensity_ratio = min(norm_exp_int, norm_theo_int) / max(norm_exp_int, norm_theo_int) if max(norm_exp_int, norm_theo_int) > 0 else 0
@@ -97,9 +106,11 @@ class PhaseMatchingThread(QThread):
                 matches.append({
                     'exp_d': exp_dspacings[min_idx],
                     'theo_d': theo_d,
+                    'exp_2theta': exp_two_theta[min_idx],
+                    'theo_2theta': theo_2theta,
                     'exp_int': exp_intensities[min_idx],
                     'theo_int': theo_int,
-                    'difference': min_diff,
+                    'difference': min_2theta_diff,  # Now stores 2θ difference
                     'intensity_similarity': intensity_ratio,
                     'norm_exp_int': norm_exp_int,
                     'norm_theo_int': norm_theo_int
@@ -107,12 +118,64 @@ class PhaseMatchingThread(QThread):
                 matched_exp_peaks.add(min_idx)
                 matched_intensity_weight += norm_theo_int
                 
-        # Calculate traditional match score (position-based)
-        match_score = len(matches) / len(theoretical_peaks['d_spacing']) if len(theoretical_peaks['d_spacing']) > 0 else 0
+        # MULTI-MATCH REQUIREMENT SCORING SYSTEM
+        # Requires multiple good matches to score well - prevents single spurious matches
+        
+        # 1. Coverage Score: What fraction of experimental peaks are explained?
         coverage = len(matched_exp_peaks) / len(exp_dspacings) if exp_dspacings.size > 0 else 0
         
-        # Calculate intensity-weighted match score
+        # 2. Count high-quality matches and calculate score
+        high_quality_matches = []
+        total_quality_score = 0.0
+        
+        for match in matches:
+            # Position accuracy
+            two_theta_accuracy = max(0, 1.0 - (match['difference'] / self.tolerance))
+            
+            # Intensity similarity
+            intensity_similarity = match['intensity_similarity']
+            
+            # Combined quality
+            combined_quality = (0.7 * two_theta_accuracy) + (0.3 * intensity_similarity)
+            
+            # Only count reasonably good matches (> 0.4 threshold)
+            if combined_quality > 0.4:
+                high_quality_matches.append((match, combined_quality))
+                total_quality_score += combined_quality
+        
+        # 3. MULTI-MATCH PENALTY: Phases need multiple good matches to score well
+        num_good_matches = len(high_quality_matches)
+        
+        if num_good_matches == 0:
+            match_score = 0.0
+        elif num_good_matches == 1:
+            # Single matches get heavily penalized (max score 0.1)
+            base_score = total_quality_score / len(exp_dspacings)
+            match_score = min(0.1, base_score * 0.2)  # Heavy penalty for single matches
+        elif num_good_matches == 2:
+            # Two matches get moderate penalty
+            base_score = total_quality_score / len(exp_dspacings)
+            match_score = base_score * 0.6
+        else:
+            # Three or more matches get full score (real phases should have multiple matches)
+            base_score = total_quality_score / len(exp_dspacings)
+            # Bonus for having many matches (real phases)
+            match_bonus = min(1.5, 1.0 + (num_good_matches - 3) * 0.1)
+            match_score = base_score * match_bonus
+        
+        # 4. Intensity-weighted score (for reference)
         intensity_weighted_score = matched_intensity_weight / total_intensity_weight if total_intensity_weight > 0 else 0
+        
+        # 5. CORRELATION-BASED SCORING
+        # Calculate correlation between experimental and theoretical patterns
+        correlation_result = self._calculate_pattern_correlation(
+            exp_two_theta, exp_intensities, theo_two_theta, theo_intensities
+        )
+        
+        # 6. COMBINED SCORING: Combine peak-based and correlation-based scores
+        # Use configurable weights from UI
+        combined_score = (self.peak_weight * match_score + 
+                         self.corr_weight * correlation_result['correlation'])
         
         return {
             'phase': phase,
@@ -120,6 +183,10 @@ class PhaseMatchingThread(QThread):
             'match_score': match_score,
             'coverage': coverage,
             'intensity_weighted_score': intensity_weighted_score,
+            'correlation': correlation_result['correlation'],
+            'r_squared': correlation_result['r_squared'],
+            'rms_error': correlation_result['rms_error'],
+            'combined_score': combined_score,
             'theoretical_peaks': theoretical_peaks
         }
         
@@ -253,6 +320,94 @@ class PhaseMatchingThread(QThread):
                 'intensity': np.array([]),
                 'two_theta': np.array([])
             }
+    
+    def _calculate_pattern_correlation(self, exp_two_theta, exp_intensity, 
+                                     theo_two_theta, theo_intensity):
+        """Calculate correlation between experimental and theoretical patterns"""
+        try:
+            # Determine common 2θ range
+            min_2theta = max(np.min(exp_two_theta), np.min(theo_two_theta))
+            max_2theta = min(np.max(exp_two_theta), np.max(theo_two_theta))
+            
+            if min_2theta >= max_2theta:
+                return {'correlation': 0, 'r_squared': 0, 'rms_error': 1}
+            
+            # Create common 2θ grid with reasonable resolution
+            num_points = min(1000, int((max_2theta - min_2theta) / 0.02))  # 0.02° resolution
+            common_2theta = np.linspace(min_2theta, max_2theta, num_points)
+            
+            # Normalize experimental intensities
+            max_exp_int = np.max(exp_intensity) if len(exp_intensity) > 0 else 1
+            norm_exp_intensity = exp_intensity / max_exp_int
+            
+            # Create interpolation function for experimental data
+            exp_interp = interp1d(exp_two_theta, norm_exp_intensity, 
+                                bounds_error=False, fill_value=0, kind='linear')
+            exp_pattern = exp_interp(common_2theta)
+            
+            # Generate theoretical continuous pattern using pseudo-Voigt peaks
+            theo_pattern = self._generate_continuous_pattern(
+                theo_two_theta, theo_intensity, common_2theta, fwhm=0.1
+            )
+            
+            # Normalize theoretical pattern
+            max_theo_int = np.max(theo_pattern) if np.max(theo_pattern) > 0 else 1
+            theo_pattern = theo_pattern / max_theo_int
+            
+            # Remove NaN values
+            valid_mask = ~(np.isnan(exp_pattern) | np.isnan(theo_pattern))
+            if np.sum(valid_mask) < 10:  # Need minimum points for correlation
+                return {'correlation': 0, 'r_squared': 0, 'rms_error': 1}
+            
+            exp_valid = exp_pattern[valid_mask]
+            theo_valid = theo_pattern[valid_mask]
+            
+            # Calculate Pearson correlation
+            if np.std(exp_valid) == 0 or np.std(theo_valid) == 0:
+                correlation = 0
+            else:
+                correlation, _ = pearsonr(exp_valid, theo_valid)
+                if np.isnan(correlation):
+                    correlation = 0
+            
+            # R-squared
+            r_squared = correlation ** 2
+            
+            # RMS error
+            rms_error = np.sqrt(np.mean((exp_valid - theo_valid) ** 2))
+            
+            return {
+                'correlation': abs(correlation),  # Use absolute value
+                'r_squared': r_squared,
+                'rms_error': rms_error
+            }
+            
+        except Exception as e:
+            print(f"Error calculating pattern correlation: {e}")
+            return {'correlation': 0, 'r_squared': 0, 'rms_error': 1}
+    
+    def _generate_continuous_pattern(self, two_theta_peaks, intensities, 
+                                   x_range, fwhm=0.1):
+        """Generate continuous pattern from peak positions using pseudo-Voigt profiles"""
+        pattern = np.zeros_like(x_range)
+        
+        # Normalize intensities
+        max_intensity = np.max(intensities) if len(intensities) > 0 else 1
+        norm_intensities = intensities / max_intensity
+        
+        for center, intensity in zip(two_theta_peaks, norm_intensities):
+            if intensity > 0:
+                # Pseudo-Voigt profile (30% Lorentzian, 70% Gaussian)
+                sigma_g = fwhm / (2 * np.sqrt(2 * np.log(2)))
+                gamma_l = fwhm / 2
+                
+                gaussian = np.exp(-0.5 * ((x_range - center) / sigma_g) ** 2)
+                lorentzian = 1 / (1 + ((x_range - center) / gamma_l) ** 2)
+                
+                peak = intensity * (0.7 * gaussian + 0.3 * lorentzian)
+                pattern += peak
+        
+        return pattern
 
 class MatchingTab(QWidget):
     """Tab for phase matching analysis"""
@@ -399,12 +554,12 @@ class MatchingTab(QWidget):
         layout = QHBoxLayout(group)
         
         # Tolerance setting
-        layout.addWidget(QLabel("d-spacing tolerance (Å):"))
+        layout.addWidget(QLabel("2θ tolerance (°):"))
         self.tolerance_spin = QDoubleSpinBox()
-        self.tolerance_spin.setRange(0.001, 1.0)
-        self.tolerance_spin.setDecimals(3)
-        self.tolerance_spin.setValue(0.02)
-        self.tolerance_spin.setSingleStep(0.001)
+        self.tolerance_spin.setRange(0.01, 2.0)
+        self.tolerance_spin.setDecimals(2)
+        self.tolerance_spin.setValue(0.20)
+        self.tolerance_spin.setSingleStep(0.01)
         layout.addWidget(self.tolerance_spin)
         
         # Minimum match score
@@ -416,16 +571,17 @@ class MatchingTab(QWidget):
         self.min_score_spin.setSingleStep(0.05)
         layout.addWidget(self.min_score_spin)
         
-        # Theoretical pattern scaling
-        layout.addWidget(QLabel("Theory scale (%):"))
-        self.scale_spin = QDoubleSpinBox()
-        self.scale_spin.setRange(10, 200)
-        self.scale_spin.setDecimals(0)
-        self.scale_spin.setValue(80)
-        self.scale_spin.setSingleStep(10)
-        self.scale_spin.setSuffix("%")
-        self.scale_spin.valueChanged.connect(self.update_plot)
-        layout.addWidget(self.scale_spin)
+        # Global theoretical pattern scaling (now affects all phases)
+        layout.addWidget(QLabel("Global scale (%):"))
+        self.global_scale_spin = QDoubleSpinBox()
+        self.global_scale_spin.setRange(10, 200)
+        self.global_scale_spin.setDecimals(0)
+        self.global_scale_spin.setValue(80)
+        self.global_scale_spin.setSingleStep(10)
+        self.global_scale_spin.setSuffix("%")
+        self.global_scale_spin.setToolTip("Apply this scaling to all phases (updates individual phase scales)")
+        self.global_scale_spin.valueChanged.connect(self.apply_global_scaling)
+        layout.addWidget(self.global_scale_spin)
         
         # Peak width control for theoretical patterns
         layout.addWidget(QLabel("Peak FWHM (°):"))
@@ -482,6 +638,39 @@ class MatchingTab(QWidget):
         
         layout.addStretch()
         
+        # Correlation weighting controls
+        layout.addWidget(QLabel("Peak weight:"))
+        self.peak_weight_spin = QDoubleSpinBox()
+        self.peak_weight_spin.setRange(0.0, 1.0)
+        self.peak_weight_spin.setDecimals(2)
+        self.peak_weight_spin.setValue(0.6)
+        self.peak_weight_spin.setSingleStep(0.1)
+        self.peak_weight_spin.setToolTip("Weight for peak-based scoring in combined score")
+        layout.addWidget(self.peak_weight_spin)
+        
+        layout.addWidget(QLabel("Corr. weight:"))
+        self.corr_weight_spin = QDoubleSpinBox()
+        self.corr_weight_spin.setRange(0.0, 1.0)
+        self.corr_weight_spin.setDecimals(2)
+        self.corr_weight_spin.setValue(0.4)
+        self.corr_weight_spin.setSingleStep(0.1)
+        self.corr_weight_spin.setToolTip("Weight for correlation-based scoring in combined score")
+        layout.addWidget(self.corr_weight_spin)
+        
+        # Auto-normalize weights
+        def normalize_weights():
+            peak_weight = self.peak_weight_spin.value()
+            corr_weight = self.corr_weight_spin.value()
+            total = peak_weight + corr_weight
+            if total > 0:
+                self.peak_weight_spin.setValue(peak_weight / total)
+                self.corr_weight_spin.setValue(corr_weight / total)
+        
+        self.peak_weight_spin.valueChanged.connect(normalize_weights)
+        self.corr_weight_spin.valueChanged.connect(normalize_weights)
+        
+        layout.addStretch()
+        
         # Action buttons
         self.match_btn = QPushButton("Start Matching")
         self.match_btn.clicked.connect(self.start_matching)
@@ -533,9 +722,9 @@ class MatchingTab(QWidget):
         
         # Results table
         self.results_table = QTableWidget()
-        self.results_table.setColumnCount(6)
+        self.results_table.setColumnCount(9)
         self.results_table.setHorizontalHeaderLabels([
-            'Phase', 'Match Score', 'Int. Score', 'Coverage', 'Matches', 'Show'
+            'Phase', 'Peak Score', 'Corr. Score', 'Combined', 'Coverage', 'Matches', 'R²', 'Scale %', 'Show'
         ])
         self.results_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         layout.addWidget(self.results_table)
@@ -547,7 +736,7 @@ class MatchingTab(QWidget):
         self.detail_table = QTableWidget()
         self.detail_table.setColumnCount(8)
         self.detail_table.setHorizontalHeaderLabels([
-            'Exp. d (Å)', 'Theo. d (Å)', 'Difference', 'Exp. Int.', 'Theo. Int.', 'Int. Sim.', 'Exp. 2θ (°)', 'Match Quality'
+            'Exp. 2θ (°)', 'Theo. 2θ (°)', 'Δ 2θ (°)', 'Exp. Int.', 'Theo. Int.', 'Int. Sim.', 'Exp. d (Å)', 'Match Quality'
         ])
         detail_layout.addWidget(self.detail_table)
         
@@ -629,10 +818,14 @@ class MatchingTab(QWidget):
         
         # Start matching thread
         tolerance = self.tolerance_spin.value()
+        peak_weight = self.peak_weight_spin.value()
+        corr_weight = self.corr_weight_spin.value()
         self.matching_thread = PhaseMatchingThread(
             self.experimental_peaks, 
             self.reference_phases, 
-            tolerance
+            tolerance,
+            peak_weight,
+            corr_weight
         )
         self.matching_thread.matching_complete.connect(self.display_matching_results)
         self.matching_thread.progress_updated.connect(self.progress_bar.setValue)
@@ -663,8 +856,8 @@ class MatchingTab(QWidget):
         min_score = self.min_score_spin.value()
         filtered_results = [r for r in results if r['match_score'] >= min_score]
         
-        # Sort by match score (descending)
-        filtered_results.sort(key=lambda x: x['match_score'], reverse=True)
+        # Sort by combined score (descending), fallback to match score
+        filtered_results.sort(key=lambda x: x.get('combined_score', x['match_score']), reverse=True)
         
         # Update results table
         self.results_table.setRowCount(len(filtered_results))
@@ -676,29 +869,70 @@ class MatchingTab(QWidget):
             phase_name = phase.get('mineral', 'Unknown')
             self.results_table.setItem(i, 0, QTableWidgetItem(phase_name))
             
-            # Match score (position-based)
-            score_item = QTableWidgetItem(f"{result['match_score']:.3f}")
-            self.results_table.setItem(i, 1, score_item)
+            # Peak-based score
+            peak_score_item = QTableWidgetItem(f"{result['match_score']:.3f}")
+            self.results_table.setItem(i, 1, peak_score_item)
             
-            # Intensity-weighted score
-            int_score_item = QTableWidgetItem(f"{result.get('intensity_weighted_score', 0):.3f}")
-            self.results_table.setItem(i, 2, int_score_item)
+            # Correlation score
+            corr_score = result.get('correlation', 0)
+            corr_score_item = QTableWidgetItem(f"{corr_score:.3f}")
+            self.results_table.setItem(i, 2, corr_score_item)
+            
+            # Combined score
+            combined_score = result.get('combined_score', result['match_score'])
+            combined_score_item = QTableWidgetItem(f"{combined_score:.3f}")
+            self.results_table.setItem(i, 3, combined_score_item)
             
             # Coverage
             coverage_item = QTableWidgetItem(f"{result['coverage']:.3f}")
-            self.results_table.setItem(i, 3, coverage_item)
+            self.results_table.setItem(i, 4, coverage_item)
             
             # Number of matches
             matches_item = QTableWidgetItem(str(len(result['matches'])))
-            self.results_table.setItem(i, 4, matches_item)
+            self.results_table.setItem(i, 5, matches_item)
+            
+            # R-squared
+            r_squared = result.get('r_squared', 0)
+            r_squared_item = QTableWidgetItem(f"{r_squared:.3f}")
+            self.results_table.setItem(i, 6, r_squared_item)
+            
+            # Individual phase scaling control
+            scale_spin = QDoubleSpinBox()
+            scale_spin.setRange(1, 500)
+            scale_spin.setDecimals(0)
+            scale_spin.setValue(80)  # Default scaling
+            scale_spin.setSingleStep(5)
+            scale_spin.setSuffix("%")
+            scale_spin.setToolTip(f"Individual scaling for {phase_name}")
+            scale_spin.valueChanged.connect(self.update_plot)
+            self.results_table.setCellWidget(i, 7, scale_spin)
             
             # Show checkbox
             show_checkbox = QCheckBox()
             show_checkbox.setChecked(i < 3)  # Show top 3 by default
             show_checkbox.stateChanged.connect(self.update_plot)
-            self.results_table.setCellWidget(i, 5, show_checkbox)
+            self.results_table.setCellWidget(i, 8, show_checkbox)
             
         self.update_plot()
+        
+    def apply_global_scaling(self):
+        """Apply global scaling to all individual phase scales"""
+        global_scale = self.global_scale_spin.value()
+        
+        # Update all individual phase scaling controls
+        for i in range(self.results_table.rowCount()):
+            scale_widget = self.results_table.cellWidget(i, 7)  # Updated column index
+            if scale_widget and isinstance(scale_widget, QDoubleSpinBox):
+                scale_widget.setValue(global_scale)
+        
+        print(f"Applied global scaling of {global_scale}% to all phases")
+        
+    def get_phase_scaling(self, row_index):
+        """Get the individual scaling factor for a specific phase"""
+        scale_widget = self.results_table.cellWidget(row_index, 7)  # Updated column index
+        if scale_widget and isinstance(scale_widget, QDoubleSpinBox):
+            return scale_widget.value() / 100.0  # Convert percentage to decimal
+        return 0.8  # Default 80% scaling
         
     def show_match_details(self):
         """Show detailed matching information for selected phase"""
@@ -709,7 +943,7 @@ class MatchingTab(QWidget):
         # Get filtered results that match the current table display
         min_score = self.min_score_spin.value()
         filtered_results = [r for r in self.matching_results if r['match_score'] >= min_score]
-        filtered_results.sort(key=lambda x: x['match_score'], reverse=True)
+        filtered_results.sort(key=lambda x: x.get('combined_score', x['match_score']), reverse=True)
         
         if current_row >= len(filtered_results):
             return
@@ -721,24 +955,13 @@ class MatchingTab(QWidget):
         self.detail_table.setRowCount(len(matches))
         
         for i, match in enumerate(matches):
-            # Calculate 2θ from d-spacing using current wavelength
-            wavelength = 1.5406  # Default Cu Kα
-            if self.experimental_peaks and 'wavelength' in self.experimental_peaks:
-                wavelength = self.experimental_peaks['wavelength']
+            # Use stored 2θ values from matching algorithm
+            exp_two_theta_deg = match.get('exp_2theta', 0.0)
+            theo_two_theta_deg = match.get('theo_2theta', 0.0)
+            two_theta_difference = match.get('difference', 0.0)  # This is now 2θ difference
             
-            # Calculate 2θ using Bragg's law: λ = 2d sin(θ) → θ = arcsin(λ/2d)
-            try:
-                sin_theta = wavelength / (2 * match['exp_d'])
-                if sin_theta <= 1.0:
-                    theta_rad = np.arcsin(sin_theta)
-                    two_theta_deg = 2 * np.degrees(theta_rad)
-                else:
-                    two_theta_deg = 0.0
-            except:
-                two_theta_deg = 0.0
-            
-            # Calculate match quality based on difference and intensity
-            rel_diff = abs(match['difference']) / match['exp_d'] * 100  # Relative difference as percentage
+            # Calculate match quality based on 2θ difference and intensity
+            rel_diff = two_theta_difference / exp_two_theta_deg * 100 if exp_two_theta_deg > 0 else 100  # Relative difference as percentage
             intensity_sim = match.get('intensity_similarity', 0)
             
             # Combined quality score (position + intensity)
@@ -753,14 +976,15 @@ class MatchingTab(QWidget):
             else:
                 quality = "Poor"
             
-            self.detail_table.setItem(i, 0, QTableWidgetItem(f"{match['exp_d']:.4f}"))
-            self.detail_table.setItem(i, 1, QTableWidgetItem(f"{match['theo_d']:.4f}"))
-            self.detail_table.setItem(i, 2, QTableWidgetItem(f"{match['difference']:.4f}"))
-            self.detail_table.setItem(i, 3, QTableWidgetItem(f"{match['exp_int']:.0f}"))
-            self.detail_table.setItem(i, 4, QTableWidgetItem(f"{match['theo_int']:.0f}"))
-            self.detail_table.setItem(i, 5, QTableWidgetItem(f"{intensity_sim:.3f}"))
-            self.detail_table.setItem(i, 6, QTableWidgetItem(f"{two_theta_deg:.2f}"))
-            self.detail_table.setItem(i, 7, QTableWidgetItem(quality))
+            # Populate table with 2θ values first, then d-spacing
+            self.detail_table.setItem(i, 0, QTableWidgetItem(f"{exp_two_theta_deg:.3f}"))      # Exp. 2θ (°)
+            self.detail_table.setItem(i, 1, QTableWidgetItem(f"{theo_two_theta_deg:.3f}"))     # Theo. 2θ (°)
+            self.detail_table.setItem(i, 2, QTableWidgetItem(f"{two_theta_difference:.3f}"))   # Δ 2θ (°)
+            self.detail_table.setItem(i, 3, QTableWidgetItem(f"{match['exp_int']:.0f}"))       # Exp. Int.
+            self.detail_table.setItem(i, 4, QTableWidgetItem(f"{match['theo_int']:.0f}"))      # Theo. Int.
+            self.detail_table.setItem(i, 5, QTableWidgetItem(f"{intensity_sim:.3f}"))          # Int. Sim.
+            self.detail_table.setItem(i, 6, QTableWidgetItem(f"{match['exp_d']:.4f}"))         # Exp. d (Å)
+            self.detail_table.setItem(i, 7, QTableWidgetItem(quality))                         # Match Quality
             
     def update_plot(self):
         """Update the comparison plot with normalized intensities"""
@@ -812,10 +1036,10 @@ class MatchingTab(QWidget):
         # Get filtered results that match the current table display
         min_score = self.min_score_spin.value()
         filtered_results = [r for r in self.matching_results if r['match_score'] >= min_score]
-        filtered_results.sort(key=lambda x: x['match_score'], reverse=True)
+        filtered_results.sort(key=lambda x: x.get('combined_score', x['match_score']), reverse=True)
         
         for i in range(self.results_table.rowCount()):
-            checkbox = self.results_table.cellWidget(i, 5)
+            checkbox = self.results_table.cellWidget(i, 8)  # Updated column index
             if checkbox and checkbox.isChecked():
                 # Use the filtered results to match the table display
                 result = filtered_results[i] if i < len(filtered_results) else None
@@ -854,7 +1078,7 @@ class MatchingTab(QWidget):
                         phase_id = result['phase'].get('id', f"phase_{i}")
                         wavelength = pattern_to_plot.get('wavelength', 1.5406)
                         fwhm = self.fwhm_spin.value()
-                        scale_percentage = self.scale_spin.value() / 100.0
+                        scale_percentage = self.get_phase_scaling(i)  # Use individual phase scaling
                         min_intensity_percent = self.min_intensity_spin.value()
                         
                         # Create x-range for theoretical pattern based on experimental data range
@@ -1055,3 +1279,31 @@ class MatchingTab(QWidget):
             df.to_csv(file_path, index=False)
         else:
             df.to_string(file_path, index=False)
+    
+    def reset_for_new_pattern(self):
+        """Reset the matching tab when a new pattern is loaded"""
+        # Clear reference phases and results
+        self.reference_phases = []
+        self.matching_results = []
+        
+        # Clear pattern cache
+        self.pattern_cache.clear()
+        self.continuous_pattern_cache.clear()
+        
+        # Clear results table
+        self.results_table.setRowCount(0)
+        
+        # Clear match details table
+        self.detail_table.setRowCount(0)
+        
+        # Reset progress bar
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setValue(0)
+        
+        # Update availability
+        self.update_matching_availability()
+        
+        # Clear and update plot
+        self.update_plot()
+        
+        print("Matching tab reset for new pattern")

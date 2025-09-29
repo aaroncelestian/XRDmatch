@@ -234,6 +234,38 @@ class LocalDatabaseTab(QWidget):
         
         layout.addLayout(diffraction_layout)
         
+        # Intensity improvement controls
+        intensity_layout = QHBoxLayout()
+        
+        recalc_patterns_btn = QPushButton("Recalculate All Patterns (Improved Intensities)")
+        recalc_patterns_btn.clicked.connect(self.recalculate_all_patterns)
+        recalc_patterns_btn.setToolTip("Recalculate existing patterns with improved intensity calculations")
+        recalc_patterns_btn.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; font-weight: bold; }")
+        intensity_layout.addWidget(recalc_patterns_btn)
+        
+        validate_patterns_btn = QPushButton("Validate Pattern Quality")
+        validate_patterns_btn.clicked.connect(self.validate_pattern_quality)
+        validate_patterns_btn.setToolTip("Compare old vs new intensity calculations on sample patterns")
+        intensity_layout.addWidget(validate_patterns_btn)
+        
+        layout.addLayout(intensity_layout)
+        
+        # Database optimization controls
+        optimization_layout = QHBoxLayout()
+        
+        cleanup_patterns_btn = QPushButton("Remove Non-Cu Kα Patterns")
+        cleanup_patterns_btn.clicked.connect(self.cleanup_non_cu_patterns)
+        cleanup_patterns_btn.setToolTip("Remove all patterns except Cu Kα (1.5406Å) to optimize database")
+        cleanup_patterns_btn.setStyleSheet("QPushButton { background-color: #FF9800; color: white; font-weight: bold; }")
+        optimization_layout.addWidget(cleanup_patterns_btn)
+        
+        show_wavelengths_btn = QPushButton("Show Wavelength Distribution")
+        show_wavelengths_btn.clicked.connect(self.show_wavelength_distribution)
+        show_wavelengths_btn.setToolTip("Show distribution of wavelengths in stored patterns")
+        optimization_layout.addWidget(show_wavelengths_btn)
+        
+        layout.addLayout(optimization_layout)
+        
         # Progress bar
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
@@ -684,3 +716,243 @@ This approach is much more efficient and provides the same accuracy!
         """.strip()
         
         QMessageBox.information(self, "Diffraction Pattern Statistics", message)
+    
+    def recalculate_all_patterns(self):
+        """Recalculate all existing diffraction patterns with improved intensity calculations"""
+        # Confirm with user first
+        reply = QMessageBox.question(self, "Recalculate Patterns", 
+                                   "This will recalculate all existing diffraction patterns with improved intensity calculations.\n\n"
+                                   "This process may take some time depending on the number of patterns.\n"
+                                   "The existing patterns will be replaced with more accurate ones.\n\n"
+                                   "Do you want to continue?",
+                                   QMessageBox.Yes | QMessageBox.No)
+        
+        if reply != QMessageBox.Yes:
+            return
+        
+        # Start recalculation in background thread
+        self.recalc_thread = RecalculationThread(self.db_manager)
+        self.recalc_thread.progress_updated.connect(self.progress_bar.setValue)
+        self.recalc_thread.status_updated.connect(self.status_label.setText)
+        self.recalc_thread.recalculation_complete.connect(self.on_recalculation_complete)
+        
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.status_label.setText("Recalculating diffraction patterns with improved intensities...")
+        
+        self.recalc_thread.start()
+    
+    def on_recalculation_complete(self, successful_count):
+        """Handle completion of pattern recalculation"""
+        self.progress_bar.setVisible(False)
+        self.status_label.setText(f"Recalculation complete: {successful_count} patterns updated")
+        
+        QMessageBox.information(self, "Recalculation Complete",
+                              f"Successfully recalculated {successful_count} diffraction patterns with improved intensities.\n\n"
+                              f"Phase matching should now be more accurate with better intensity calculations!")
+        
+        # Update database stats
+        self.update_database_stats()
+    
+    def validate_pattern_quality(self):
+        """Validate pattern quality by comparing old vs new calculations"""
+        self.status_label.setText("Validating pattern quality...")
+        
+        try:
+            # Run validation on a sample of patterns
+            validation_results = self.db_manager.validate_pattern_intensities(sample_size=20)
+            
+            if 'error' in validation_results:
+                QMessageBox.warning(self, "Validation Error", f"Could not validate patterns: {validation_results['error']}")
+                self.status_label.setText("")
+                return
+            
+            # Format results message
+            total = validation_results.get('total_validated', 0)
+            improved = validation_results.get('improved_patterns', 0)
+            similar = validation_results.get('similar_patterns', 0)
+            failed = validation_results.get('failed_validations', 0)
+            avg_improvement = validation_results.get('average_improvement', 0.0)
+            
+            message = f"""Pattern Quality Validation Results:
+
+Patterns Validated: {total}
+Significantly Improved: {improved} ({improved/max(total,1)*100:.1f}%)
+Similar Quality: {similar} ({similar/max(total,1)*100:.1f}%)
+Failed Validations: {failed}
+
+Average Improvement: {avg_improvement:.1f}%
+
+The improved intensity calculations use:
+• Proper structure factors from atomic positions
+• Enhanced scattering factor tables
+• Lorentz-polarization corrections
+• Thermal factors (Debye-Waller)
+• Multiplicity considerations
+
+This provides more realistic and accurate intensity distributions
+for better phase identification results.
+            """.strip()
+            
+            QMessageBox.information(self, "Pattern Quality Validation", message)
+            self.status_label.setText("Validation complete")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Validation Error", f"Error during validation: {str(e)}")
+            self.status_label.setText("Validation failed")
+    
+    def cleanup_non_cu_patterns(self):
+        """Remove all non-Cu Kα patterns from the database"""
+        # First show current wavelength distribution
+        wavelength_stats = self.db_manager.get_wavelength_distribution()
+        
+        if not wavelength_stats or wavelength_stats.get('total_patterns', 0) == 0:
+            QMessageBox.information(self, "No Patterns", "No diffraction patterns found in database.")
+            return
+        
+        # Show current distribution
+        distribution = wavelength_stats.get('wavelength_distribution', {})
+        total = wavelength_stats.get('total_patterns', 0)
+        
+        current_info = "Current wavelength distribution:\n\n"
+        cu_patterns = 0
+        non_cu_patterns = 0
+        
+        for wavelength, count in sorted(distribution.items()):
+            current_info += f"λ = {wavelength:.4f} Å: {count} patterns\n"
+            if abs(wavelength - 1.5406) < 0.0001:  # Cu Kα
+                cu_patterns = count
+            else:
+                non_cu_patterns += count
+        
+        current_info += f"\nTotal: {total} patterns"
+        current_info += f"\nCu Kα patterns: {cu_patterns}"
+        current_info += f"\nNon-Cu Kα patterns: {non_cu_patterns}"
+        
+        if non_cu_patterns == 0:
+            QMessageBox.information(self, "Already Optimized", 
+                                  f"{current_info}\n\nDatabase is already optimized with only Cu Kα patterns!")
+            return
+        
+        # Confirm with user
+        reply = QMessageBox.question(self, "Remove Non-Cu Kα Patterns", 
+                                   f"{current_info}\n\n"
+                                   f"This will remove {non_cu_patterns} non-Cu Kα patterns, keeping only {cu_patterns} Cu Kα patterns.\n\n"
+                                   f"Other wavelengths will be calculated on-demand using Bragg's law conversion.\n"
+                                   f"This will make recalculation much faster!\n\n"
+                                   f"Do you want to continue?",
+                                   QMessageBox.Yes | QMessageBox.No)
+        
+        if reply != QMessageBox.Yes:
+            return
+        
+        # Perform cleanup
+        self.status_label.setText("Removing non-Cu Kα patterns...")
+        
+        try:
+            removed_count = self.db_manager.cleanup_non_cu_patterns()
+            
+            if removed_count > 0:
+                QMessageBox.information(self, "Cleanup Complete",
+                                      f"Successfully removed {removed_count} non-Cu Kα patterns.\n\n"
+                                      f"Database is now optimized for Cu Kα reference wavelength only.\n"
+                                      f"Other wavelengths will be calculated on-demand using Bragg's law.\n\n"
+                                      f"Recalculation will now be much faster!")
+                
+                # Update database stats
+                self.update_database_stats()
+                self.status_label.setText(f"Cleanup complete: {removed_count} patterns removed")
+            else:
+                self.status_label.setText("No patterns were removed")
+                
+        except Exception as e:
+            QMessageBox.critical(self, "Cleanup Error", f"Error during cleanup: {str(e)}")
+            self.status_label.setText("Cleanup failed")
+    
+    def show_wavelength_distribution(self):
+        """Show the distribution of wavelengths in stored patterns"""
+        self.status_label.setText("Getting wavelength distribution...")
+        
+        try:
+            wavelength_stats = self.db_manager.get_wavelength_distribution()
+            
+            if not wavelength_stats or wavelength_stats.get('total_patterns', 0) == 0:
+                QMessageBox.information(self, "No Patterns", "No diffraction patterns found in database.")
+                self.status_label.setText("")
+                return
+            
+            distribution = wavelength_stats.get('wavelength_distribution', {})
+            total = wavelength_stats.get('total_patterns', 0)
+            unique_wavelengths = wavelength_stats.get('unique_wavelengths', 0)
+            
+            # Format distribution message
+            message = f"Wavelength Distribution in Database:\n\n"
+            message += f"Total Patterns: {total}\n"
+            message += f"Unique Wavelengths: {unique_wavelengths}\n\n"
+            
+            cu_patterns = 0
+            non_cu_patterns = 0
+            
+            # Common wavelength names
+            wavelength_names = {
+                1.5406: "Cu Kα1",
+                1.5418: "Cu Kα",
+                1.7890: "Co Kα1", 
+                1.7902: "Co Kα",
+                1.9373: "Fe Kα1",
+                2.2897: "Cr Kα1",
+                0.7107: "Mo Kα1",
+                0.2401: "Mo Kα"
+            }
+            
+            for wavelength, count in sorted(distribution.items()):
+                name = wavelength_names.get(wavelength, "Unknown")
+                percentage = (count / total) * 100
+                message += f"{name} (λ = {wavelength:.4f} Å): {count} patterns ({percentage:.1f}%)\n"
+                
+                if abs(wavelength - 1.5406) < 0.0001:  # Cu Kα
+                    cu_patterns = count
+                else:
+                    non_cu_patterns += count
+            
+            message += f"\nSummary:\n"
+            message += f"Cu Kα patterns: {cu_patterns} ({cu_patterns/total*100:.1f}%)\n"
+            message += f"Non-Cu Kα patterns: {non_cu_patterns} ({non_cu_patterns/total*100:.1f}%)\n\n"
+            
+            if non_cu_patterns > 0:
+                message += f"💡 Recommendation: Remove non-Cu Kα patterns to optimize database.\n"
+                message += f"   Other wavelengths can be calculated on-demand using Bragg's law."
+            else:
+                message += f"✅ Database is optimized with only Cu Kα reference patterns!"
+            
+            QMessageBox.information(self, "Wavelength Distribution", message)
+            self.status_label.setText("Distribution analysis complete")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Distribution Error", f"Error getting wavelength distribution: {str(e)}")
+            self.status_label.setText("Distribution analysis failed")
+
+
+class RecalculationThread(QThread):
+    """Thread for recalculating diffraction patterns with improved intensities"""
+    
+    progress_updated = pyqtSignal(int)
+    status_updated = pyqtSignal(str)
+    recalculation_complete = pyqtSignal(int)
+    
+    def __init__(self, db_manager):
+        super().__init__()
+        self.db_manager = db_manager
+    
+    def run(self):
+        """Run the recalculation in a separate thread"""
+        try:
+            self.status_updated.emit("Starting pattern recalculation with improved intensities...")
+            successful_count = self.db_manager.recalculate_all_diffraction_patterns(
+                progress_callback=self.progress_updated.emit
+            )
+            self.recalculation_complete.emit(successful_count)
+            
+        except Exception as e:
+            self.status_updated.emit(f"Recalculation error: {str(e)}")
+            self.recalculation_complete.emit(0)

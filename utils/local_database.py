@@ -1083,3 +1083,324 @@ class LocalCIFDatabase:
         except Exception as e:
             print(f"Error getting diffraction statistics: {e}")
             return {}
+    
+    def recalculate_all_diffraction_patterns(self, progress_callback=None) -> int:
+        """
+        Recalculate all existing diffraction patterns with improved intensity calculations
+        
+        Args:
+            progress_callback: Function to call with progress updates
+            
+        Returns:
+            Number of patterns successfully recalculated
+        """
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # Get all existing patterns
+            cursor.execute('''
+                SELECT dp.id, dp.mineral_id, dp.wavelength, dp.max_two_theta, dp.min_d_spacing, 
+                       m.mineral_name, m.cif_content
+                FROM diffraction_patterns dp
+                JOIN minerals m ON dp.mineral_id = m.id
+                ORDER BY dp.mineral_id
+            ''')
+            
+            existing_patterns = cursor.fetchall()
+            conn.close()
+            
+            if not existing_patterns:
+                print("No existing diffraction patterns found to recalculate")
+                return 0
+            
+            print(f"🔄 Recalculating {len(existing_patterns)} diffraction patterns with improved intensity calculations...")
+            print("This will replace existing patterns with more accurate intensity values.")
+            
+            successful = 0
+            failed = 0
+            
+            for i, (pattern_id, mineral_id, wavelength, max_2theta, min_d, mineral_name, cif_content) in enumerate(existing_patterns):
+                try:
+                    print(f"\n[{i+1}/{len(existing_patterns)}] Recalculating: {mineral_name} (ID: {mineral_id})")
+                    
+                    # Calculate new pattern with improved method
+                    cif_parser = CIFParser()
+                    new_pattern = cif_parser.calculate_xrd_pattern_from_cif(
+                        cif_content, wavelength, max_2theta=max_2theta, min_d=min_d
+                    )
+                    
+                    if len(new_pattern.get('two_theta', [])) == 0:
+                        print(f"  ❌ Failed to calculate new pattern for {mineral_name}")
+                        failed += 1
+                        continue
+                    
+                    # Update the existing pattern in database
+                    conn = sqlite3.connect(self.db_path)
+                    cursor = conn.cursor()
+                    
+                    cursor.execute('''
+                        UPDATE diffraction_patterns 
+                        SET two_theta = ?, intensities = ?, d_spacings = ?, 
+                            calculation_method = 'pymatgen_improved'
+                        WHERE id = ?
+                    ''', (
+                        json.dumps(new_pattern['two_theta'].tolist()),
+                        json.dumps(new_pattern['intensity'].tolist()),
+                        json.dumps(new_pattern['d_spacing'].tolist()),
+                        pattern_id
+                    ))
+                    
+                    conn.commit()
+                    conn.close()
+                    
+                    print(f"  ✅ Updated pattern: {len(new_pattern['two_theta'])} peaks")
+                    successful += 1
+                    
+                except Exception as e:
+                    print(f"  ❌ Error recalculating pattern for {mineral_name}: {e}")
+                    failed += 1
+                    continue
+                
+                # Progress callback
+                if progress_callback:
+                    progress = int(((i + 1) / len(existing_patterns)) * 100)
+                    progress_callback(progress)
+                
+                # Progress reporting every 10 patterns
+                if (i + 1) % 10 == 0:
+                    success_rate = (successful / (i + 1)) * 100
+                    print(f"\n📊 Progress: {i+1}/{len(existing_patterns)} ({success_rate:.1f}% success rate)")
+            
+            print(f"\n=== Diffraction Pattern Recalculation Complete ===")
+            print(f"Total patterns processed: {len(existing_patterns)}")
+            print(f"Successfully recalculated: {successful}")
+            print(f"Failed: {failed}")
+            print(f"Success rate: {successful/len(existing_patterns)*100:.1f}%")
+            print(f"================================================")
+            
+            return successful
+            
+        except Exception as e:
+            print(f"Error in bulk diffraction pattern recalculation: {e}")
+            return 0
+    
+    def validate_pattern_intensities(self, sample_size: int = 10) -> Dict:
+        """
+        Validate intensity calculations by comparing a sample of patterns
+        
+        Args:
+            sample_size: Number of random patterns to validate
+            
+        Returns:
+            Dictionary with validation statistics
+        """
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # Get random sample of patterns
+            cursor.execute('''
+                SELECT dp.mineral_id, dp.wavelength, m.mineral_name, m.cif_content,
+                       dp.two_theta, dp.intensities, dp.calculation_method
+                FROM diffraction_patterns dp
+                JOIN minerals m ON dp.mineral_id = m.id
+                ORDER BY RANDOM()
+                LIMIT ?
+            ''', (sample_size,))
+            
+            patterns = cursor.fetchall()
+            conn.close()
+            
+            if not patterns:
+                return {'error': 'No patterns found for validation'}
+            
+            print(f"🔍 Validating intensity calculations for {len(patterns)} random patterns...")
+            
+            validation_results = {
+                'total_validated': 0,
+                'improved_patterns': 0,
+                'similar_patterns': 0,
+                'failed_validations': 0,
+                'average_improvement': 0.0,
+                'details': []
+            }
+            
+            total_improvement = 0.0
+            
+            for mineral_id, wavelength, mineral_name, cif_content, old_2theta_json, old_intensities_json, calc_method in patterns:
+                try:
+                    print(f"\n📋 Validating: {mineral_name}")
+                    
+                    # Parse old pattern
+                    old_intensities = np.array(json.loads(old_intensities_json))
+                    
+                    # Calculate new pattern
+                    cif_parser = CIFParser()
+                    new_pattern = cif_parser.calculate_xrd_pattern_from_cif(cif_content, wavelength)
+                    
+                    if len(new_pattern.get('intensity', [])) == 0:
+                        print(f"  ❌ Failed to calculate new pattern")
+                        validation_results['failed_validations'] += 1
+                        continue
+                    
+                    new_intensities = new_pattern['intensity']
+                    
+                    # Compare intensity distributions
+                    old_max = np.max(old_intensities) if len(old_intensities) > 0 else 1.0
+                    new_max = np.max(new_intensities) if len(new_intensities) > 0 else 1.0
+                    
+                    # Normalize both to 100 for comparison
+                    old_norm = (old_intensities / old_max) * 100 if old_max > 0 else old_intensities
+                    new_norm = (new_intensities / new_max) * 100 if new_max > 0 else new_intensities
+                    
+                    # Calculate improvement metrics
+                    intensity_range_old = np.max(old_norm) - np.min(old_norm) if len(old_norm) > 0 else 0
+                    intensity_range_new = np.max(new_norm) - np.min(new_norm) if len(new_norm) > 0 else 0
+                    
+                    improvement = (intensity_range_new - intensity_range_old) / max(intensity_range_old, 1.0) * 100
+                    total_improvement += improvement
+                    
+                    detail = {
+                        'mineral_name': mineral_name,
+                        'old_method': calc_method,
+                        'old_peaks': len(old_intensities),
+                        'new_peaks': len(new_intensities),
+                        'intensity_improvement': improvement,
+                        'old_range': intensity_range_old,
+                        'new_range': intensity_range_new
+                    }
+                    
+                    validation_results['details'].append(detail)
+                    
+                    if abs(improvement) > 10:  # Significant improvement
+                        validation_results['improved_patterns'] += 1
+                        print(f"  ✅ Significant improvement: {improvement:.1f}% better intensity range")
+                    else:
+                        validation_results['similar_patterns'] += 1
+                        print(f"  ➖ Similar quality: {improvement:.1f}% change")
+                    
+                    validation_results['total_validated'] += 1
+                    
+                except Exception as e:
+                    print(f"  ❌ Validation error: {e}")
+                    validation_results['failed_validations'] += 1
+                    continue
+            
+            if validation_results['total_validated'] > 0:
+                validation_results['average_improvement'] = total_improvement / validation_results['total_validated']
+            
+            print(f"\n=== Intensity Validation Results ===")
+            print(f"Patterns validated: {validation_results['total_validated']}")
+            print(f"Significantly improved: {validation_results['improved_patterns']}")
+            print(f"Similar quality: {validation_results['similar_patterns']}")
+            print(f"Failed validations: {validation_results['failed_validations']}")
+            print(f"Average improvement: {validation_results['average_improvement']:.1f}%")
+            print(f"===================================")
+            
+            return validation_results
+            
+        except Exception as e:
+            print(f"Error in pattern validation: {e}")
+            return {'error': str(e)}
+    
+    def cleanup_non_cu_patterns(self) -> int:
+        """
+        Remove all diffraction patterns that are not Cu Kα (1.5406Å) wavelength
+        This optimizes the database to use only the reference wavelength
+        
+        Returns:
+            Number of patterns removed
+        """
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # First, get count of non-Cu patterns
+            cu_wavelength = 1.5406
+            cursor.execute('''
+                SELECT COUNT(*) FROM diffraction_patterns 
+                WHERE ABS(wavelength - ?) > 0.0001
+            ''', (cu_wavelength,))
+            
+            non_cu_count = cursor.fetchone()[0]
+            
+            if non_cu_count == 0:
+                print("✅ No non-Cu Kα patterns found. Database is already optimized.")
+                conn.close()
+                return 0
+            
+            print(f"🧹 Found {non_cu_count} non-Cu Kα patterns to remove...")
+            
+            # Get details of patterns to be removed
+            cursor.execute('''
+                SELECT wavelength, COUNT(*) as count 
+                FROM diffraction_patterns 
+                WHERE ABS(wavelength - ?) > 0.0001
+                GROUP BY wavelength
+                ORDER BY wavelength
+            ''', (cu_wavelength,))
+            
+            wavelength_counts = cursor.fetchall()
+            
+            print("Patterns to be removed:")
+            for wavelength, count in wavelength_counts:
+                print(f"  λ = {wavelength:.4f} Å: {count} patterns")
+            
+            # Remove non-Cu patterns
+            cursor.execute('''
+                DELETE FROM diffraction_patterns 
+                WHERE ABS(wavelength - ?) > 0.0001
+            ''', (cu_wavelength,))
+            
+            removed_count = cursor.rowcount
+            conn.commit()
+            conn.close()
+            
+            print(f"✅ Successfully removed {removed_count} non-Cu Kα patterns")
+            print(f"💡 Database now optimized for Cu Kα reference wavelength only")
+            print(f"   Other wavelengths will be calculated on-demand using Bragg's law")
+            
+            return removed_count
+            
+        except Exception as e:
+            print(f"❌ Error cleaning up non-Cu patterns: {e}")
+            return 0
+    
+    def get_wavelength_distribution(self) -> Dict:
+        """
+        Get distribution of wavelengths in the diffraction patterns table
+        
+        Returns:
+            Dictionary with wavelength statistics
+        """
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT wavelength, COUNT(*) as count 
+                FROM diffraction_patterns 
+                GROUP BY wavelength
+                ORDER BY wavelength
+            ''')
+            
+            wavelength_data = cursor.fetchall()
+            conn.close()
+            
+            distribution = {}
+            total_patterns = 0
+            
+            for wavelength, count in wavelength_data:
+                distribution[wavelength] = count
+                total_patterns += count
+            
+            return {
+                'wavelength_distribution': distribution,
+                'total_patterns': total_patterns,
+                'unique_wavelengths': len(distribution)
+            }
+            
+        except Exception as e:
+            print(f"Error getting wavelength distribution: {e}")
+            return {}

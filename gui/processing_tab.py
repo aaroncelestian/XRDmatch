@@ -82,6 +82,14 @@ class ProcessingTab(QWidget):
         bg_layout.addStretch()
         tab_widget.addTab(bg_tab, "Background")
         
+        # Corrections tab
+        corr_tab = QWidget()
+        corr_layout = QVBoxLayout(corr_tab)
+        corr_group = self.create_corrections_group()
+        corr_layout.addWidget(corr_group)
+        corr_layout.addStretch()
+        tab_widget.addTab(corr_tab, "Corrections")
+        
         # Peak detection tab
         peak_tab = QWidget()
         peak_layout = QVBoxLayout(peak_tab)
@@ -188,6 +196,49 @@ class ProcessingTab(QWidget):
         
         # Initially disabled
         self.set_bg_controls_enabled(False)
+        
+        return group
+        
+    def create_corrections_group(self):
+        """Create sample displacement and other corrections"""
+        group = QGroupBox("Sample Displacement & Corrections")
+        layout = QVBoxLayout(group)
+        
+        # Sample displacement correction
+        disp_layout = QHBoxLayout()
+        disp_layout.addWidget(QLabel("2θ offset (°):"))
+        
+        self.displacement_spin = QDoubleSpinBox()
+        self.displacement_spin.setRange(-2.0, 2.0)
+        self.displacement_spin.setDecimals(4)
+        self.displacement_spin.setValue(0.0000)
+        self.displacement_spin.setSingleStep(0.0010)
+        self.displacement_spin.setToolTip("Sample displacement correction - shifts all 2θ values by this amount")
+        self.displacement_spin.valueChanged.connect(self.apply_displacement_correction)
+        disp_layout.addWidget(self.displacement_spin)
+        
+        # Auto-correct button
+        auto_correct_btn = QPushButton("Auto-Correct")
+        auto_correct_btn.setToolTip("Automatically estimate displacement using peak positions")
+        auto_correct_btn.clicked.connect(self.auto_correct_displacement)
+        disp_layout.addWidget(auto_correct_btn)
+        
+        # Reset button
+        reset_btn = QPushButton("Reset")
+        reset_btn.setToolTip("Reset displacement to zero")
+        reset_btn.clicked.connect(self.reset_displacement)
+        disp_layout.addWidget(reset_btn)
+        
+        layout.addLayout(disp_layout)
+        
+        # Info label
+        self.displacement_info = QLabel("Sample displacement can cause systematic peak shifts.\nAdjust the offset to align experimental peaks with reference patterns.")
+        self.displacement_info.setStyleSheet("QLabel { color: #666; font-size: 10px; }")
+        self.displacement_info.setWordWrap(True)
+        layout.addWidget(self.displacement_info)
+        
+        # Initially disabled
+        self.set_correction_controls_enabled(False)
         
         return group
         
@@ -495,6 +546,9 @@ class ProcessingTab(QWidget):
         self.find_peaks_btn.setEnabled(True)
         self.reset_btn.setEnabled(False)
         self.export_btn.setEnabled(True)
+        
+        # Enable correction controls
+        self.set_correction_controls_enabled(True)
         
     def update_pattern_info(self):
         """Update pattern information display"""
@@ -981,3 +1035,68 @@ class ProcessingTab(QWidget):
                 
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Could not export data:\n{str(e)}")
+    
+    def set_correction_controls_enabled(self, enabled):
+        """Enable/disable correction controls"""
+        self.displacement_spin.setEnabled(enabled)
+    
+    def apply_displacement_correction(self):
+        """Apply sample displacement correction to the pattern"""
+        if self.original_pattern_data is None:
+            return
+        
+        # Get displacement value
+        displacement = self.displacement_spin.value()
+        
+        # Apply displacement to 2theta values (always from original data)
+        corrected_two_theta = self.original_pattern_data['two_theta'] + displacement
+        
+        # Update pattern data
+        self.pattern_data = self.original_pattern_data.copy()
+        self.pattern_data['two_theta'] = corrected_two_theta
+        self.pattern_data['displacement_correction'] = displacement
+        
+        # Update processed pattern if it exists - apply displacement to original processed data
+        if hasattr(self, 'processed_pattern_data') and self.processed_pattern_data:
+            # Store original processed data if not already stored
+            if not hasattr(self, 'original_processed_pattern_data'):
+                self.original_processed_pattern_data = self.processed_pattern_data.copy()
+            
+            # Apply displacement to original processed data
+            self.processed_pattern_data = self.original_processed_pattern_data.copy()
+            self.processed_pattern_data['two_theta'] = self.original_processed_pattern_data['two_theta'] + displacement
+            self.processed_pattern_data['displacement_correction'] = displacement
+        
+        # Replot and emit signal
+        self.update_plot()
+        
+        # Emit the corrected pattern
+        pattern_to_emit = self.processed_pattern_data if hasattr(self, 'processed_pattern_data') and self.processed_pattern_data else self.pattern_data
+        if pattern_to_emit:
+            pattern_to_emit['processed'] = hasattr(self, 'processed_pattern_data') and self.processed_pattern_data is not None
+            self.pattern_processed.emit(pattern_to_emit)
+    
+    def auto_correct_displacement(self):
+        """Automatically estimate sample displacement correction"""
+        if self.pattern_data is None:
+            QMessageBox.warning(self, "Warning", "No pattern loaded")
+            return
+        
+        # This is a simplified auto-correction
+        # In practice, you might compare with known reference peaks
+        QMessageBox.information(self, "Auto-Correction", 
+            "Auto-correction requires reference peak positions.\n"
+            "For now, manually adjust the 2θ offset based on known peak positions.\n\n"
+            "Tip: If you know a peak should be at a specific 2θ value,\n"
+            "calculate the difference and enter it as the offset.")
+    
+    def reset_displacement(self):
+        """Reset displacement correction to zero"""
+        self.displacement_spin.setValue(0.0)
+        
+        # Reset processed pattern data to original if it exists
+        if hasattr(self, 'original_processed_pattern_data'):
+            self.processed_pattern_data = self.original_processed_pattern_data.copy()
+            delattr(self, 'original_processed_pattern_data')
+        
+        # This will trigger apply_displacement_correction with 0.0 displacement

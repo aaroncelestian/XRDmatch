@@ -239,7 +239,7 @@ class PatternTab(QWidget):
             self.background_data = None
             
             self.plot_pattern()
-            format_info = " (XYE format)" if intensity_error is not None else " (XY format)"
+            format_info = f" ({file_format} format)"
             self.file_label.setText(f"Loaded: {file_path.split('/')[-1]}{format_info}")
             self.file_label.setStyleSheet("QLabel { color: #000; font-style: normal; }")
             
@@ -302,8 +302,246 @@ class PatternTab(QWidget):
             for url in event.mimeData().urls():
                 if url.isLocalFile():
                     file_path = url.toLocalFile()
-                    if any(file_path.lower().endswith(ext) for ext in ['.xy', '.xye', '.txt', '.dat', '.csv']):
+                    if any(file_path.lower().endswith(ext) for ext in ['.xy', '.xye', '.xml', '.txt', '.dat', '.csv']):
                         self.load_pattern(file_path)
                         event.acceptProposedAction()
                         return
         event.ignore()
+    
+    def parse_xml_file(self, file_path):
+        """Parse XML file format"""
+        import xml.etree.ElementTree as ET
+        
+        two_theta = []
+        intensity = []
+        intensity_error = []
+        wavelength = None
+        
+        try:
+            tree = ET.parse(file_path)
+            root = tree.getroot()
+            
+            # Extract wavelength if available
+            w_elem = root.find('w')
+            if w_elem is not None:
+                try:
+                    wavelength = float(w_elem.text)
+                except (ValueError, TypeError):
+                    pass
+            
+            # Extract intensity data points
+            for intensity_elem in root.findall('intensity'):
+                try:
+                    x_val = float(intensity_elem.get('X'))
+                    y_val = float(intensity_elem.get('Y'))
+                    t_val = float(intensity_elem.get('T', 1.0))  # Default to 1 if T not present
+                    
+                    two_theta.append(x_val)
+                    intensity.append(y_val)
+                    
+                    # Calculate error as sqrt(counts) if T (time) is available
+                    if t_val > 0:
+                        error = np.sqrt(y_val) if y_val > 0 else 0
+                        intensity_error.append(error)
+                    
+                except (ValueError, TypeError):
+                    continue
+            
+            if not two_theta:
+                raise ValueError("No valid intensity data found in XML file")
+            
+            # Convert to numpy arrays
+            two_theta = np.array(two_theta)
+            intensity = np.array(intensity)
+            intensity_error = np.array(intensity_error) if intensity_error else None
+            
+            # Sort by 2theta
+            sort_idx = np.argsort(two_theta)
+            two_theta = two_theta[sort_idx]
+            intensity = intensity[sort_idx]
+            if intensity_error is not None:
+                intensity_error = intensity_error[sort_idx]
+            
+            return two_theta, intensity, intensity_error, wavelength
+            
+        except ET.ParseError as e:
+            raise ValueError(f"Could not parse XML file: {str(e)}")
+    
+    def detect_xye_format(self, file_path):
+        """Detect the specific XYE format by examining the first few lines"""
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            first_lines = [f.readline().strip() for _ in range(10)]
+        
+        # Check for C-style comments (/* */) - indicates commented XYE format
+        has_c_comments = any('/*' in line for line in first_lines)
+        
+        # Check for hash comments - indicates standard format
+        has_hash_comments = any(line.startswith('#') for line in first_lines)
+        
+        # Look for data pattern in first non-comment line
+        data_line = None
+        for line in first_lines:
+            if line and not line.startswith('#') and '/*' not in line:
+                data_line = line
+                break
+        
+        format_info = {
+            'has_c_comments': has_c_comments,
+            'has_hash_comments': has_hash_comments,
+            'data_line': data_line,
+            'format_type': 'standard'  # default
+        }
+        
+        # Determine format type
+        if has_c_comments:
+            format_info['format_type'] = 'commented_xye'
+        elif has_hash_comments:
+            format_info['format_type'] = 'standard_xye'
+        elif data_line:
+            # Check number of columns in first data line
+            values = data_line.split()
+            if len(values) == 3:
+                format_info['format_type'] = 'simple_xye'
+            elif len(values) == 2:
+                format_info['format_type'] = 'xy'
+        
+        return format_info
+    
+    def parse_text_file(self, file_path):
+        """Parse text-based file formats (XY, XYE, etc.) with format detection"""
+        # Detect format for XYE files
+        if file_path.lower().endswith('.xye'):
+            format_info = self.detect_xye_format(file_path)
+            print(f"Detected XYE format: {format_info['format_type']}")
+            
+            if format_info['format_type'] == 'commented_xye':
+                return self.parse_commented_xye(file_path)
+            else:
+                return self.parse_standard_text_file(file_path)
+        else:
+            return self.parse_standard_text_file(file_path)
+    
+    def parse_commented_xye(self, file_path):
+        """Parse XYE format with C-style comments"""
+        processed_lines = []
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            in_c_comment = False
+            for line in f:
+                line = line.strip()
+                
+                # Skip empty lines
+                if not line:
+                    continue
+                
+                # Handle C-style comments /* */
+                # Check for complete comment on single line first
+                if '/*' in line and '*/' in line:
+                    # Remove the comment but keep any content before/after
+                    start_comment = line.find('/*')
+                    end_comment = line.find('*/') + 2
+                    line = line[:start_comment] + line[end_comment:]
+                elif '/*' in line:
+                    in_c_comment = True
+                    line = line[:line.find('/*')]
+                elif '*/' in line:
+                    in_c_comment = False
+                    line = line[line.find('*/') + 2:]
+                    
+                # Skip lines inside C-style comments
+                if in_c_comment:
+                    continue
+                    
+                # If line has content after comment removal, add it
+                if line.strip():
+                    processed_lines.append(line)
+        
+        return self.parse_numeric_data(processed_lines)
+    
+    def parse_standard_text_file(self, file_path):
+        """Parse standard text file formats (XY, standard XYE, etc.)"""
+        processed_lines = []
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                line = line.strip()
+                
+                # Skip empty lines
+                if not line:
+                    continue
+                    
+                # Skip regular comments starting with #
+                if line.startswith('#'):
+                    continue
+                    
+                # Add data lines
+                processed_lines.append(line)
+        
+        return self.parse_numeric_data(processed_lines)
+    
+    def parse_numeric_data(self, processed_lines):
+        """Parse numeric data from processed text lines"""
+        # Parse the data manually to handle multiple whitespace properly
+        parsed_data = []
+        for line in processed_lines:
+            # Split on any whitespace and filter out empty strings
+            values = [x for x in line.split() if x]
+            
+            if len(values) >= 2:
+                try:
+                    # Convert to float
+                    numeric_values = [float(v) for v in values]
+                    parsed_data.append(numeric_values)
+                except ValueError:
+                    # Skip lines that can't be converted to numbers
+                    continue
+        
+        if not parsed_data:
+            raise ValueError("No valid numeric data found in file")
+        
+        # Convert to numpy array and then to DataFrame
+        data_array = np.array(parsed_data)
+        data = pd.DataFrame(data_array)
+        
+        if data.shape[1] < 2:
+            raise ValueError(f"Could not parse file - need at least 2 columns, found {data.shape[1]} columns")
+            
+        # Extract 2theta and intensity
+        two_theta = data.iloc[:, 0].values
+        intensity = data.iloc[:, 1].values
+        
+        # Check if we have error data (XYE format)
+        intensity_error = None
+        if data.shape[1] >= 3:
+            intensity_error = data.iloc[:, 2].values
+            # Remove NaN values from error column too
+            error_mask = ~np.isnan(intensity_error)
+            if np.any(error_mask):
+                intensity_error = intensity_error[error_mask]
+            else:
+                intensity_error = None
+        
+        # Remove any NaN values
+        mask = ~(np.isnan(two_theta) | np.isnan(intensity))
+        two_theta = two_theta[mask]
+        intensity = intensity[mask]
+        
+        # Apply mask to error data if it exists
+        if intensity_error is not None:
+            if len(intensity_error) == len(mask):
+                intensity_error = intensity_error[mask]
+            elif len(intensity_error) != len(two_theta):
+                # If error array doesn't match, disable error bars
+                intensity_error = None
+        
+        # Sort by 2theta
+        sort_idx = np.argsort(two_theta)
+        two_theta = two_theta[sort_idx]
+        intensity = intensity[sort_idx]
+        
+        if intensity_error is not None:
+            if len(intensity_error) == len(sort_idx):
+                intensity_error = intensity_error[sort_idx]
+            else:
+                # If error array doesn't match after sorting, disable error bars
+                intensity_error = None
+        
+        return two_theta, intensity, intensity_error

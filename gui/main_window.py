@@ -12,6 +12,7 @@ from .pattern_tab import PatternTab
 from .processing_tab import ProcessingTab
 from .database_tab import DatabaseTab
 from .local_database_tab import LocalDatabaseTab
+from .pattern_search_tab import PatternSearchTab
 from .matching_tab import MatchingTab
 from .settings_tab import SettingsTab
 
@@ -45,6 +46,7 @@ class XRDMainWindow(QMainWindow):
         self.processing_tab = ProcessingTab()
         self.database_tab = DatabaseTab()
         self.local_database_tab = LocalDatabaseTab()
+        self.pattern_search_tab = PatternSearchTab()
         self.matching_tab = MatchingTab()
         self.settings_tab = SettingsTab()
         
@@ -53,16 +55,27 @@ class XRDMainWindow(QMainWindow):
         self.tab_widget.addTab(self.processing_tab, "Data Processing")
         self.tab_widget.addTab(self.database_tab, "AMCSD Search")
         self.tab_widget.addTab(self.local_database_tab, "Local Database")
+        self.tab_widget.addTab(self.pattern_search_tab, "Pattern Search")
         self.tab_widget.addTab(self.matching_tab, "Phase Matching")
         self.tab_widget.addTab(self.settings_tab, "Settings")
         
-        # Connect signals
+        # Connect signals - order matters: reset first, then set new data
+        # Reset tabs when new pattern is loaded to clear previous data
+        self.pattern_tab.pattern_loaded.connect(self.matching_tab.reset_for_new_pattern)
+        self.pattern_tab.pattern_loaded.connect(self.pattern_search_tab.reset_for_new_pattern)
+        
+        # Then set the new pattern data
         self.pattern_tab.pattern_loaded.connect(self.processing_tab.set_pattern_data)
         self.pattern_tab.pattern_loaded.connect(self.matching_tab.set_experimental_pattern)
+        self.pattern_tab.pattern_loaded.connect(self.pattern_search_tab.set_experimental_pattern)
+        
         self.processing_tab.pattern_processed.connect(self.matching_tab.set_experimental_pattern)
+        self.processing_tab.pattern_processed.connect(self.pattern_search_tab.set_experimental_pattern)
         self.processing_tab.peaks_found.connect(self.matching_tab.set_experimental_peaks)
+        self.processing_tab.peaks_found.connect(self.pattern_search_tab.set_experimental_peaks)
         self.database_tab.phases_selected.connect(self.matching_tab.add_reference_phases)
         self.local_database_tab.phases_selected.connect(self.matching_tab.add_reference_phases)
+        self.pattern_search_tab.phases_found.connect(self.matching_tab.add_reference_phases)
         
     def setup_menus(self):
         """Setup application menus"""
@@ -94,6 +107,12 @@ class XRDMainWindow(QMainWindow):
         peak_find_action = QAction('&Find Peaks', self)
         peak_find_action.triggered.connect(self.processing_tab.find_peaks)
         tools_menu.addAction(peak_find_action)
+        
+        tools_menu.addSeparator()
+        
+        pattern_search_action = QAction('&Pattern Search', self)
+        pattern_search_action.triggered.connect(lambda: self.tab_widget.setCurrentWidget(self.pattern_search_tab))
+        tools_menu.addAction(pattern_search_action)
         
         # Help menu
         help_menu = menubar.addMenu('&Help')
