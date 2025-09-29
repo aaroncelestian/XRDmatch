@@ -77,6 +77,10 @@ class XRDMainWindow(QMainWindow):
         self.local_database_tab.phases_selected.connect(self.matching_tab.add_reference_phases)
         self.pattern_search_tab.phases_found.connect(self.matching_tab.add_reference_phases)
         
+        # Connect Le Bail refinement components
+        # Share the multi-phase analyzer between tabs for refined phase caching
+        self.pattern_search_tab.set_multi_phase_analyzer(self.matching_tab.multi_phase_analyzer)
+        
     def setup_menus(self):
         """Setup application menus"""
         menubar = self.menuBar()

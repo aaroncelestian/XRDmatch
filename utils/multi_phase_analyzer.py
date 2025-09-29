@@ -7,6 +7,7 @@ from scipy.interpolate import interp1d
 from scipy.optimize import minimize
 from typing import Dict, List, Tuple, Optional
 import copy
+from .lebail_refinement import LeBailRefinement
 
 class MultiPhaseAnalyzer:
     """
@@ -18,11 +19,14 @@ class MultiPhaseAnalyzer:
         self.identified_phases = []
         self.residue_history = []
         self.optimization_history = []
+        self.lebail_engine = LeBailRefinement()
+        self.refined_phases_cache = {}
         
     def sequential_phase_identification(self, experimental_data: Dict, 
                                      candidate_phases: List[Dict],
                                      max_phases: int = 5,
-                                     residue_threshold: float = 0.05) -> Dict:
+                                     residue_threshold: float = 0.05,
+                                     use_lebail: bool = True) -> Dict:
         """
         Perform sequential phase identification with residue analysis
         
@@ -111,12 +115,21 @@ class MultiPhaseAnalyzer:
             
         print(f"\nSequential identification complete: {len(identified_phases)} phases identified")
         
+        # Perform Le Bail refinement on identified phases if requested
+        refinement_results = None
+        if use_lebail and identified_phases:
+            print("\n=== Starting Le Bail Refinement ===")
+            refinement_results = self.perform_lebail_refinement(
+                experimental_data, identified_phases
+            )
+            
         return {
             'identified_phases': identified_phases,
             'residue_history': residue_history,
             'final_residue': current_residue,
             'experimental_data': experimental_data,
-            'residue_fraction': np.max(current_residue) / np.max(experimental_data['intensity'])
+            'residue_fraction': np.max(current_residue) / np.max(experimental_data['intensity']),
+            'lebail_refinement': refinement_results
         }
     
     def _find_best_phase_for_residue(self, exp_two_theta: np.ndarray, 
@@ -331,3 +344,147 @@ class MultiPhaseAnalyzer:
             report.append("Analysis Quality: Poor - High residue suggests missing phases")
             
         return "\n".join(report)
+        
+    def perform_lebail_refinement(self, experimental_data: Dict, 
+                                identified_phases: List[Dict]) -> Dict:
+        """
+        Perform Le Bail refinement on identified phases
+        
+        Args:
+            experimental_data: Experimental diffraction data
+            identified_phases: List of identified phases from sequential analysis
+            
+        Returns:
+            Dictionary with refinement results
+        """
+        try:
+            # Initialize Le Bail engine
+            self.lebail_engine = LeBailRefinement()
+            
+            # Set experimental data
+            errors = experimental_data.get('errors')
+            if errors is None:
+                # Estimate errors as sqrt(intensity) for Poisson statistics
+                errors = np.sqrt(np.maximum(experimental_data['intensity'], 1))
+                
+            self.lebail_engine.set_experimental_data(
+                experimental_data['two_theta'],
+                experimental_data['intensity'],
+                errors
+            )
+            
+            # Add identified phases to refinement
+            for phase_result in identified_phases:
+                phase_data = {
+                    'phase': phase_result['phase'],
+                    'theoretical_peaks': phase_result['theoretical_peaks']
+                }
+                
+                # Set initial parameters based on sequential analysis results
+                initial_params = {
+                    'scale_factor': phase_result.get('optimized_scaling', 1.0),
+                    'u_param': 0.01,
+                    'v_param': -0.001,
+                    'w_param': 0.01,
+                    'eta_param': 0.5,
+                    'zero_shift': 0.0,
+                    'refine_cell': True,
+                    'refine_profile': True,
+                    'refine_scale': True
+                }
+                
+                self.lebail_engine.add_phase(phase_data, initial_params)
+                
+            # Perform refinement
+            refinement_results = self.lebail_engine.refine_phases(
+                max_iterations=30,
+                convergence_threshold=1e-5
+            )
+            
+            # Generate report
+            refinement_report = self.lebail_engine.generate_refinement_report()
+            
+            # Get refined phases for future searches
+            refined_phases = self.lebail_engine.get_refined_phases_for_search()
+            
+            # Cache refined phases for ultra-fast searching
+            for refined_phase in refined_phases:
+                phase_id = refined_phase['phase'].get('id')
+                if phase_id:
+                    self.refined_phases_cache[phase_id] = refined_phase
+                    
+            print("Le Bail refinement completed successfully")
+            print(f"Final Rwp: {refinement_results['final_r_factors']['Rwp']:.3f}%")
+            
+            return {
+                'success': True,
+                'refinement_results': refinement_results,
+                'refinement_report': refinement_report,
+                'refined_phases': refined_phases,
+                'r_factors': refinement_results['final_r_factors']
+            }
+            
+        except Exception as e:
+            print(f"Le Bail refinement failed: {e}")
+            return {
+                'success': False,
+                'error': str(e),
+                'refinement_results': None,
+                'refined_phases': []
+            }
+            
+    def get_refined_phases_for_search(self) -> List[Dict]:
+        """
+        Get cached refined phases optimized for ultra-fast pattern searching
+        
+        Returns:
+            List of refined phase data with optimized parameters
+        """
+        return list(self.refined_phases_cache.values())
+        
+    def update_candidate_phases_with_refinement(self, candidate_phases: List[Dict]) -> List[Dict]:
+        """
+        Update candidate phases with refined parameters from previous analyses
+        
+        Args:
+            candidate_phases: Original candidate phases from database search
+            
+        Returns:
+            Updated candidate phases with refined parameters where available
+        """
+        updated_phases = []
+        
+        for phase in candidate_phases:
+            phase_id = phase['phase'].get('id')
+            
+            # Check if we have refined parameters for this phase
+            if phase_id in self.refined_phases_cache:
+                refined_phase = self.refined_phases_cache[phase_id]
+                
+                # Create updated phase with refined parameters
+                updated_phase = phase.copy()
+                updated_phase['theoretical_peaks'] = refined_phase['theoretical_peaks']
+                updated_phase['refinement_quality'] = refined_phase['refinement_quality']
+                updated_phase['search_priority'] = refined_phase['search_priority']
+                updated_phase['refined'] = True
+                
+                print(f"Using refined parameters for {phase['phase'].get('mineral', 'Unknown')}")
+                updated_phases.append(updated_phase)
+            else:
+                # Use original phase data
+                updated_phase = phase.copy()
+                updated_phase['refined'] = False
+                updated_phases.append(updated_phase)
+                
+        # Sort by search priority (refined phases with good fits first)
+        updated_phases.sort(
+            key=lambda x: (x.get('refined', False), x.get('search_priority', 0)), 
+            reverse=True
+        )
+        
+        return updated_phases
+        
+    def clear_refined_cache(self):
+        """Clear the refined phases cache"""
+        self.refined_phases_cache.clear()
+        print("Refined phases cache cleared")

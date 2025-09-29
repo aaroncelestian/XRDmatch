@@ -15,6 +15,7 @@ from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as Navigatio
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 from utils.pattern_search import PatternSearchEngine
+from utils.fast_pattern_search import FastPatternSearchEngine
 import time
 
 class PatternSearchThread(QThread):
@@ -71,7 +72,9 @@ class PatternSearchTab(QWidget):
         self.experimental_pattern = None
         self.experimental_peaks = None
         self.search_engine = PatternSearchEngine()
+        self.fast_search_engine = FastPatternSearchEngine()
         self.search_results = []
+        self.multi_phase_analyzer = None  # Will be set by main window
         
         self.init_ui()
     
@@ -221,6 +224,57 @@ class PatternSearchTab(QWidget):
         combined_layout.addRow("Max Results:", self.combined_max_results_spin)
         
         self.search_tabs.addTab(combined_tab, "Combined")
+        
+        # Ultra-Fast search tab
+        fast_tab = QWidget()
+        fast_layout = QFormLayout(fast_tab)
+        
+        # Index status and controls
+        self.index_status_label = QLabel("Index Status: Not Built")
+        fast_layout.addRow("Status:", self.index_status_label)
+        
+        # Build index button
+        index_button_layout = QHBoxLayout()
+        self.build_index_btn = QPushButton("Build Search Index")
+        self.build_index_btn.clicked.connect(self.build_search_index)
+        self.build_index_btn.setToolTip("Build optimized search index for ultra-fast searching")
+        index_button_layout.addWidget(self.build_index_btn)
+        
+        self.benchmark_btn = QPushButton("Benchmark")
+        self.benchmark_btn.clicked.connect(self.benchmark_search)
+        self.benchmark_btn.setEnabled(False)
+        self.benchmark_btn.setToolTip("Test search speed performance")
+        index_button_layout.addWidget(self.benchmark_btn)
+        
+        fast_layout.addRow("Index:", index_button_layout)
+        
+        # Fast search parameters
+        self.fast_min_correlation_spin = QDoubleSpinBox()
+        self.fast_min_correlation_spin.setRange(0.1, 1.0)
+        self.fast_min_correlation_spin.setDecimals(2)
+        self.fast_min_correlation_spin.setValue(0.3)
+        self.fast_min_correlation_spin.setToolTip("Minimum correlation for ultra-fast search")
+        fast_layout.addRow("Min. Correlation:", self.fast_min_correlation_spin)
+        
+        self.fast_max_results_spin = QSpinBox()
+        self.fast_max_results_spin.setRange(10, 200)
+        self.fast_max_results_spin.setValue(50)
+        fast_layout.addRow("Max Results:", self.fast_max_results_spin)
+        
+        # Grid resolution for index building
+        self.grid_resolution_spin = QDoubleSpinBox()
+        self.grid_resolution_spin.setRange(0.005, 0.1)
+        self.grid_resolution_spin.setDecimals(3)
+        self.grid_resolution_spin.setValue(0.02)
+        self.grid_resolution_spin.setSuffix("°")
+        self.grid_resolution_spin.setToolTip("Grid resolution for search index (smaller = more accurate but larger)")
+        fast_layout.addRow("Grid Resolution:", self.grid_resolution_spin)
+        
+        # Performance info
+        self.performance_label = QLabel("Performance: Not tested")
+        fast_layout.addRow("Speed:", self.performance_label)
+        
+        self.search_tabs.addTab(fast_tab, "🚀 Ultra-Fast")
         
         # Action buttons
         button_layout = QHBoxLayout()
@@ -389,7 +443,26 @@ class PatternSearchTab(QWidget):
                 'two_theta_range': (self.min_2theta_corr_spin.value(), 
                                   self.max_2theta_corr_spin.value())
             }
-        else:  # Combined
+        elif current_tab == 2:  # Combined
+            if not (self.experimental_pattern and self.experimental_peaks):
+                QMessageBox.warning(self, "Incomplete Data", 
+                                  "Both pattern and peak data are required for combined search.")
+                return
+            # Combine pattern and peak data
+            experimental_data = self.experimental_pattern.copy()
+            experimental_data.update(self.experimental_peaks)
+            search_method = 'combined'
+            search_params = {
+                'peak_tolerance': self.combined_peak_tolerance_spin.value(),
+                'min_correlation': self.combined_min_correlation_spin.value(),
+                'peak_weight': self.peak_weight_spin.value(),
+                'correlation_weight': self.correlation_weight_spin.value(),
+                'max_results': self.combined_max_results_spin.value()
+            }
+        elif current_tab == 3:  # Ultra-Fast
+            self.start_ultra_fast_search()
+            return
+        else:  # Fallback for Combined (old index)
             if not (self.experimental_pattern and self.experimental_peaks):
                 QMessageBox.warning(self, "Incomplete Data", 
                                   "Both pattern and peak data are required for combined search.")
@@ -423,17 +496,26 @@ class PatternSearchTab(QWidget):
     
     def display_search_results(self, results):
         """Display search results"""
-        self.search_results = results
+        # Prioritize refined phases if available
+        prioritized_results = self.prioritize_refined_phases(results)
+        
+        self.search_results = prioritized_results
         self.progress_bar.setVisible(False)
         self.search_btn.setEnabled(True)
-        self.export_btn.setEnabled(len(results) > 0)
+        self.export_btn.setEnabled(len(prioritized_results) > 0)
         
         # Update results table
-        self.results_table.setRowCount(len(results))
+        self.results_table.setRowCount(len(prioritized_results))
         
-        for i, result in enumerate(results):
-            # Mineral name
-            self.results_table.setItem(i, 0, QTableWidgetItem(result['mineral_name']))
+        for i, result in enumerate(prioritized_results):
+            # Mineral name - add [Refined] indicator if applicable
+            mineral_name = result['mineral_name']
+            if result.get('refined', False):
+                mineral_name += " [Refined]"
+            name_item = QTableWidgetItem(mineral_name)
+            if result.get('refined', False):
+                name_item.setBackground(Qt.lightGreen)
+            self.results_table.setItem(i, 0, name_item)
             
             # Formula
             formula = result.get('chemical_formula', 'Unknown')
@@ -575,3 +657,219 @@ class PatternSearchTab(QWidget):
         # The experimental pattern will be updated via set_experimental_pattern
         
         print("Pattern search tab reset for new pattern")
+    
+    def build_search_index(self):
+        """Build the ultra-fast search index"""
+        try:
+            self.build_index_btn.setEnabled(False)
+            self.build_index_btn.setText("Building...")
+            self.index_status_label.setText("Building index...")
+            
+            # Get parameters
+            grid_resolution = self.grid_resolution_spin.value()
+            
+            # Build index in separate thread to avoid UI freezing
+            success = self.fast_search_engine.build_search_index(
+                grid_resolution=grid_resolution,
+                force_rebuild=True
+            )
+            
+            if success:
+                stats = self.fast_search_engine.get_search_statistics()
+                self.index_status_label.setText(f"Ready: {stats['database_size']} patterns")
+                self.benchmark_btn.setEnabled(True)
+                
+                # Update performance info
+                build_time = stats['index_build_time_s']
+                self.performance_label.setText(f"Index built in {build_time:.2f}s")
+                
+                QMessageBox.information(self, "Index Built", 
+                    f"Search index built successfully!\n\n"
+                    f"Database size: {stats['database_size']} patterns\n"
+                    f"Grid points: {stats['grid_points']}\n"
+                    f"Build time: {build_time:.2f}s\n"
+                    f"Memory usage: {stats['matrix_size_mb']:.1f} MB")
+            else:
+                self.index_status_label.setText("Build failed")
+                QMessageBox.warning(self, "Build Failed", 
+                    "Failed to build search index. Check console for details.")
+                
+        except Exception as e:
+            self.index_status_label.setText("Build failed")
+            QMessageBox.critical(self, "Build Error", f"Error building index: {str(e)}")
+            
+        finally:
+            self.build_index_btn.setEnabled(True)
+            self.build_index_btn.setText("Build Search Index")
+    
+    def benchmark_search(self):
+        """Benchmark the ultra-fast search performance"""
+        if not self.experimental_pattern:
+            QMessageBox.warning(self, "No Pattern", 
+                              "Load an experimental pattern first to benchmark search speed.")
+            return
+            
+        try:
+            self.benchmark_btn.setEnabled(False)
+            self.benchmark_btn.setText("Benchmarking...")
+            
+            # Run benchmark
+            benchmark_results = self.fast_search_engine.benchmark_search_speed(
+                self.experimental_pattern, num_iterations=5
+            )
+            
+            # Update performance display
+            avg_time = benchmark_results['average_time_ms']
+            patterns_per_sec = benchmark_results['patterns_per_second']
+            
+            self.performance_label.setText(f"{avg_time:.1f}ms ({patterns_per_sec:.0f} patterns/s)")
+            
+            # Show detailed results
+            QMessageBox.information(self, "Benchmark Results",
+                f"Ultra-Fast Search Performance:\n\n"
+                f"Average search time: {avg_time:.1f}ms\n"
+                f"Min/Max time: {benchmark_results['min_time_ms']:.1f}/{benchmark_results['max_time_ms']:.1f}ms\n"
+                f"Database size: {benchmark_results['database_size']} patterns\n"
+                f"Search rate: {patterns_per_sec:.0f} patterns/second\n\n"
+                f"This is searching through {benchmark_results['database_size']} patterns\n"
+                f"in under {avg_time:.0f} milliseconds!")
+                
+        except Exception as e:
+            QMessageBox.critical(self, "Benchmark Error", f"Benchmark failed: {str(e)}")
+            
+        finally:
+            self.benchmark_btn.setEnabled(True)
+            self.benchmark_btn.setText("Benchmark")
+    
+    def start_ultra_fast_search(self):
+        """Start ultra-fast correlation search"""
+        if not self.experimental_pattern:
+            QMessageBox.warning(self, "No Pattern Data", 
+                              "Full pattern data is required for ultra-fast search.")
+            return
+            
+        if self.fast_search_engine.search_index is None:
+            reply = QMessageBox.question(self, "Index Required", 
+                "Search index not built. Build it now?\n\n"
+                "This is a one-time setup that enables instant searching.",
+                QMessageBox.Yes | QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                self.build_search_index()
+                if self.fast_search_engine.search_index is None:
+                    return  # Build failed
+            else:
+                return
+        
+        try:
+            # Show progress (though it should be very fast)
+            self.progress_bar.setVisible(True)
+            self.progress_bar.setRange(0, 0)
+            self.search_btn.setEnabled(False)
+            self.status_label.setText("Ultra-fast searching...")
+            
+            # Get parameters
+            min_correlation = self.fast_min_correlation_spin.value()
+            max_results = self.fast_max_results_spin.value()
+            
+            # Perform ultra-fast search
+            results = self.fast_search_engine.ultra_fast_correlation_search(
+                self.experimental_pattern,
+                min_correlation=min_correlation,
+                max_results=max_results
+            )
+            
+            # Display results
+            self.display_search_results(results)
+            
+            # Update performance info
+            search_time = self.fast_search_engine.last_search_time * 1000
+            self.performance_label.setText(f"Last search: {search_time:.1f}ms")
+            
+        except Exception as e:
+            self.handle_search_error(str(e))
+            
+        finally:
+            self.progress_bar.setVisible(False)
+            self.search_btn.setEnabled(True)
+            
+    def set_multi_phase_analyzer(self, analyzer):
+        """Set the multi-phase analyzer for refined phase integration"""
+        self.multi_phase_analyzer = analyzer
+        
+    def prioritize_refined_phases(self, results):
+        """Prioritize refined phases in search results"""
+        if not self.multi_phase_analyzer:
+            return results
+            
+        refined_phases = self.multi_phase_analyzer.get_refined_phases_for_search()
+        if not refined_phases:
+            return results
+            
+        # Create a mapping of phase IDs to refined phases
+        refined_phase_map = {}
+        for refined_phase in refined_phases:
+            phase_id = refined_phase['phase'].get('id')
+            if phase_id:
+                refined_phase_map[phase_id] = refined_phase
+                
+        # Separate refined and non-refined results
+        refined_results = []
+        regular_results = []
+        
+        for result in results:
+            phase_id = result.get('phase_id') or result.get('id')
+            if phase_id in refined_phase_map:
+                # This is a refined phase - boost its score and add refinement info
+                refined_phase = refined_phase_map[phase_id]
+                result = result.copy()
+                result['refined'] = True
+                result['refinement_quality'] = refined_phase['refinement_quality']
+                result['search_priority'] = refined_phase['search_priority']
+                
+                # Boost the score based on refinement quality
+                original_score = result.get('combined_score', result.get('correlation', 0))
+                refinement_boost = min(0.2, refined_phase['search_priority'] / 10.0)
+                result['boosted_score'] = original_score + refinement_boost
+                
+                refined_results.append(result)
+            else:
+                result = result.copy()
+                result['refined'] = False
+                result['boosted_score'] = result.get('combined_score', result.get('correlation', 0))
+                regular_results.append(result)
+                
+        # Sort refined phases by boosted score, regular phases by original score
+        refined_results.sort(key=lambda x: x['boosted_score'], reverse=True)
+        regular_results.sort(key=lambda x: x['boosted_score'], reverse=True)
+        
+        # Combine with refined phases first
+        prioritized_results = refined_results + regular_results
+        
+        if refined_results:
+            print(f"Prioritized {len(refined_results)} refined phases in search results")
+            
+        return prioritized_results
+        
+    def update_search_with_refinement_feedback(self):
+        """Update search engines with refined phase feedback"""
+        if not self.multi_phase_analyzer:
+            return
+            
+        refined_phases = self.multi_phase_analyzer.get_refined_phases_for_search()
+        if not refined_phases:
+            return
+            
+        # Update search engines with refined parameters
+        for refined_phase in refined_phases:
+            phase_id = refined_phase['phase'].get('id')
+            if phase_id:
+                # Update theoretical peaks with refined parameters
+                refined_peaks = refined_phase['theoretical_peaks']
+                refinement_quality = refined_phase['refinement_quality']
+                
+                # Inform search engines about the refined phase
+                if hasattr(self.search_engine, 'update_refined_phase'):
+                    self.search_engine.update_refined_phase(phase_id, refined_peaks, refinement_quality)
+                    
+                if hasattr(self.fast_search_engine, 'update_refined_phase'):
+                    self.fast_search_engine.update_refined_phase(phase_id, refined_peaks, refinement_quality)
