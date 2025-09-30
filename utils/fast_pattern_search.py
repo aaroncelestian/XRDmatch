@@ -9,6 +9,7 @@ import json
 from typing import Dict, List, Tuple, Optional
 from scipy.fft import fft, ifft
 from scipy.signal import correlate
+from utils.ima_mineral_database import get_ima_database
 import time
 
 class FastPatternSearchEngine:
@@ -21,6 +22,7 @@ class FastPatternSearchEngine:
         """Initialize with pre-computed search indices"""
         from utils.local_database import LocalCIFDatabase
         self.local_db = LocalCIFDatabase(db_path)
+        self.ima_db = get_ima_database()
         
         # Pre-computed search indices for ultra-fast searching
         self.search_index = None
@@ -110,9 +112,14 @@ class FastPatternSearchEngine:
             mineral_id, mineral_name, formula, space_group, two_theta_json, intensities_json, d_spacings_json = row
             
             try:
-                # Parse pattern data
-                theo_two_theta = np.array(json.loads(two_theta_json))
-                theo_intensity = np.array(json.loads(intensities_json))
+                # Parse pattern data - handle both JSON and comma-separated formats
+                try:
+                    theo_two_theta = np.array(json.loads(two_theta_json))
+                    theo_intensity = np.array(json.loads(intensities_json))
+                except (json.JSONDecodeError, ValueError):
+                    # Fallback to comma-separated format
+                    theo_two_theta = np.array([float(x) for x in two_theta_json.split(',')])
+                    theo_intensity = np.array([float(x) for x in intensities_json.split(',')])
                 
                 # Generate continuous pattern on common grid using fast binning
                 continuous_pattern = self._fast_pattern_generation(
@@ -248,7 +255,7 @@ class FastPatternSearchEngine:
             correlation = correlations[idx]
             metadata = self.mineral_metadata[idx]
             
-            results.append({
+            result = {
                 'mineral_id': metadata['id'],
                 'mineral_name': metadata['name'],
                 'chemical_formula': metadata['formula'],
@@ -256,7 +263,18 @@ class FastPatternSearchEngine:
                 'correlation': float(correlation),
                 'r_squared': float(correlation ** 2),
                 'search_method': 'ultra_fast_correlation'
-            })
+            }
+            
+            # Cross-reference with IMA database for authoritative info
+            ima_info = self.ima_db.get_mineral_info(metadata['name'])
+            if ima_info:
+                result['ima_chemistry'] = ima_info.get('chemistry', metadata['formula'])
+                result['ima_space_group'] = ima_info.get('space_group', metadata['space_group'])
+                result['ima_verified'] = True
+            else:
+                result['ima_verified'] = False
+            
+            results.append(result)
         
         self.last_search_time = time.time() - start_time
         

@@ -757,12 +757,6 @@ class MatchingTab(QWidget):
         self.multi_phase_btn.setToolTip("Sequential phase identification with residue analysis")
         layout.addWidget(self.multi_phase_btn)
         
-        # Le Bail refinement button
-        self.lebail_btn = QPushButton("Le Bail Refinement")
-        self.lebail_btn.clicked.connect(self.start_lebail_refinement)
-        self.lebail_btn.setEnabled(False)
-        self.lebail_btn.setToolTip("Optimize phase fits using Le Bail method")
-        layout.addWidget(self.lebail_btn)
         
         self.clear_btn = QPushButton("Clear Results")
         self.clear_btn.clicked.connect(self.clear_results)
@@ -898,11 +892,6 @@ class MatchingTab(QWidget):
                           len(self.matching_results) > 1)  # Need at least 2 phases
         self.multi_phase_btn.setEnabled(can_multi_phase)
         
-        # Le Bail refinement requires at least one good match
-        can_lebail = (can_match and 
-                     len(self.matching_results) > 0 and
-                     any(r['match_score'] > 0.1 for r in self.matching_results))
-        self.lebail_btn.setEnabled(can_lebail)
         
     def start_matching(self):
         """Start the phase matching process"""
@@ -1553,128 +1542,6 @@ class MatchingTab(QWidget):
         
         self.canvas.draw()
         
-    def start_lebail_refinement(self):
-        """Start Le Bail refinement on selected phases"""
-        if not self.matching_results:
-            QMessageBox.warning(self, "Le Bail Refinement", 
-                              "No phase matches available for refinement.\n"
-                              "Run 'Start Matching' first to identify phases.")
-            return
-            
-        # Get experimental data for refinement
-        pattern_to_use = self.processed_pattern or self.experimental_pattern
-        if not pattern_to_use:
-            QMessageBox.warning(self, "Le Bail Refinement", 
-                              "No experimental pattern data available.")
-            return
-            
-        # Get selected phases from results table
-        selected_phases = []
-        for i in range(self.results_table.rowCount()):
-            checkbox = self.results_table.cellWidget(i, 8)  # Show checkbox column
-            if checkbox and checkbox.isChecked():
-                # Get corresponding result
-                min_score = self.min_score_spin.value()
-                filtered_results = [r for r in self.matching_results if r['match_score'] >= min_score]
-                filtered_results.sort(key=lambda x: x.get('combined_score', x['match_score']), reverse=True)
-                
-                if i < len(filtered_results):
-                    selected_phases.append(filtered_results[i])
-                    
-        if not selected_phases:
-            QMessageBox.warning(self, "Le Bail Refinement", 
-                              "No phases selected for refinement.\n"
-                              "Check the 'Show' boxes for phases you want to refine.")
-            return
-            
-        print(f"Starting Le Bail refinement with {len(selected_phases)} selected phases")
-        
-        # Show progress
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setValue(0)
-        self.lebail_btn.setEnabled(False)
-        
-        try:
-            # Prepare experimental data
-            experimental_data = {
-                'two_theta': pattern_to_use['two_theta'],
-                'intensity': pattern_to_use['intensity'],
-                'wavelength': pattern_to_use.get('wavelength', 1.5406),
-                'errors': pattern_to_use.get('intensity_error')
-            }
-            
-            # Perform Le Bail refinement using multi-phase analyzer
-            refinement_results = self.multi_phase_analyzer.perform_lebail_refinement(
-                experimental_data, selected_phases
-            )
-            
-            # Display results
-            self.display_lebail_results(refinement_results)
-            
-        except Exception as e:
-            QMessageBox.critical(self, "Le Bail Refinement Error", 
-                               f"Error during Le Bail refinement:\n{str(e)}")
-            print(f"Le Bail refinement error: {e}")
-            
-        finally:
-            self.progress_bar.setVisible(False)
-            self.lebail_btn.setEnabled(True)
-            
-    def display_lebail_results(self, refinement_results: Dict):
-        """Display Le Bail refinement results"""
-        if not refinement_results['success']:
-            QMessageBox.critical(self, "Le Bail Refinement Failed", 
-                               f"Refinement failed: {refinement_results.get('error', 'Unknown error')}")
-            return
-            
-        r_factors = refinement_results['r_factors']
-        report = refinement_results['refinement_report']
-        
-        # Show results dialog
-        dialog = QMessageBox(self)
-        dialog.setWindowTitle("Le Bail Refinement Results")
-        dialog.setText(f"Refinement Complete!\n\n"
-                      f"Final R-factors:\n"
-                      f"Rp = {r_factors['Rp']:.3f}%\n"
-                      f"Rwp = {r_factors['Rwp']:.3f}%\n"
-                      f"GoF = {r_factors['GoF']:.3f}")
-        dialog.setDetailedText(report)
-        dialog.setIcon(QMessageBox.Information)
-        dialog.exec_()
-        
-        # Update results table with refined information
-        self._update_results_with_refinement(refinement_results)
-        
-        # Update plot to show refined fit
-        self.update_plot()
-        
-        # Show feedback message about improved search
-        refined_phases = refinement_results.get('refined_phases', [])
-        if refined_phases:
-            QMessageBox.information(self, "Search Optimization", 
-                                  f"Refined parameters for {len(refined_phases)} phases have been cached.\n\n"
-                                  f"Future pattern searches will prioritize these optimized phases "
-                                  f"for faster and more accurate results.")
-                                  
-    def _update_results_with_refinement(self, refinement_results: Dict):
-        """Update results table to show refinement quality"""
-        if not refinement_results['success']:
-            return
-            
-        refined_phases = refinement_results.get('refined_phases', [])
-        r_factors = refinement_results['r_factors']
-        
-        # Add refinement quality indicators to table
-        for i in range(self.results_table.rowCount()):
-            checkbox = self.results_table.cellWidget(i, 8)
-            if checkbox and checkbox.isChecked():
-                # This phase was refined - add quality indicator
-                phase_item = self.results_table.item(i, 0)
-                if phase_item:
-                    original_text = phase_item.text()
-                    if "[Refined]" not in original_text:
-                        phase_item.setText(f"{original_text} [Refined]")
-                        phase_item.setBackground(Qt.lightGreen)
                         
     def _apply_refined_phase_priorities(self):
         """Apply refined phase priorities from previous analyses"""

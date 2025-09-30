@@ -10,7 +10,6 @@ from PyQt5.QtGui import QKeySequence
 
 from .pattern_tab import PatternTab
 from .processing_tab import ProcessingTab
-from .database_tab import DatabaseTab
 from .local_database_tab import LocalDatabaseTab
 from .pattern_search_tab import PatternSearchTab
 from .matching_tab import MatchingTab
@@ -45,7 +44,6 @@ class XRDMainWindow(QMainWindow):
         # Create tabs
         self.pattern_tab = PatternTab()
         self.processing_tab = ProcessingTab()
-        self.database_tab = DatabaseTab()
         self.local_database_tab = LocalDatabaseTab()
         self.pattern_search_tab = PatternSearchTab()
         self.matching_tab = MatchingTab()
@@ -55,8 +53,7 @@ class XRDMainWindow(QMainWindow):
         # Add tabs to widget
         self.tab_widget.addTab(self.pattern_tab, "Pattern Data")
         self.tab_widget.addTab(self.processing_tab, "Data Processing")
-        self.tab_widget.addTab(self.database_tab, "AMCSD Search")
-        self.tab_widget.addTab(self.local_database_tab, "Local Database")
+        self.tab_widget.addTab(self.local_database_tab, "Database Manager")
         self.tab_widget.addTab(self.pattern_search_tab, "Pattern Search")
         self.tab_widget.addTab(self.matching_tab, "Phase Matching")
         self.tab_widget.addTab(self.visualization_tab, "Visualization & Export")
@@ -76,7 +73,6 @@ class XRDMainWindow(QMainWindow):
         self.processing_tab.pattern_processed.connect(self.pattern_search_tab.set_experimental_pattern)
         self.processing_tab.peaks_found.connect(self.matching_tab.set_experimental_peaks)
         self.processing_tab.peaks_found.connect(self.pattern_search_tab.set_experimental_peaks)
-        self.database_tab.phases_selected.connect(self.matching_tab.add_reference_phases)
         self.local_database_tab.phases_selected.connect(self.matching_tab.add_reference_phases)
         self.pattern_search_tab.phases_found.connect(self.matching_tab.add_reference_phases)
         
@@ -221,8 +217,8 @@ class XRDMainWindow(QMainWindow):
             <p><b>Features:</b></p>
             <ul>
             <li>Load and analyze diffraction patterns</li>
-            <li>Search AMCSD crystal structure database</li>
-            <li>Multiple wavelength support</li>
+            <li>Local DIF database management</li>
+            <li>Ultra-fast pattern search</li>
             <li>Automated phase matching</li>
             <li>Le Bail refinement</li>
             <li>Advanced visualization and export</li>

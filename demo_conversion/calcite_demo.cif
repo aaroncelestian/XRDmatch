@@ -1,0 +1,21 @@
+data_calcite
+_chemical_name_mineral                 'Calcite'
+_chemical_formula_sum                  'Ca C O3'
+_symmetry_space_group_name_H-M         'R -3 c'
+_cell_length_a                         4.9896
+_cell_length_b                         4.9896
+_cell_length_c                         17.0610
+_cell_angle_alpha                      90.0
+_cell_angle_beta                       90.0
+_cell_angle_gamma                      120.0
+_publ_author_name                      'Demo Author'
+_journal_name_full                     'Demo Journal'
+
+loop_
+_atom_site_label
+_atom_site_fract_x
+_atom_site_fract_y
+_atom_site_fract_z
+Ca1  0.0000  0.0000  0.0000
+C1   0.0000  0.0000  0.2500
+O1   0.2569  0.0000  0.2500

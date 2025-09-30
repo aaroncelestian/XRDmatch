@@ -630,6 +630,549 @@ class LocalCIFDatabase:
         conn.close()
         return None
     
+    def bulk_import_amcsd_dif(self, dif_file_path: str, progress_callback=None) -> int:
+        """
+        Import entire AMCSD bulk DIF file with all minerals
+        
+        Args:
+            dif_file_path: Path to the AMCSD bulk DIF file
+            progress_callback: Optional callback function for progress updates
+            
+        Returns:
+            Number of patterns imported
+        """
+        try:
+            print(f"\n🔨 Starting bulk AMCSD DIF import from: {dif_file_path}")
+            
+            with open(dif_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+            
+            # Split into individual mineral blocks
+            mineral_blocks = self._split_amcsd_dif_blocks(content)
+            total_blocks = len(mineral_blocks)
+            
+            print(f"📊 Found {total_blocks} mineral blocks to process")
+            
+            imported_count = 0
+            skipped_count = 0
+            error_count = 0
+            
+            for i, block in enumerate(mineral_blocks):
+                try:
+                    # Parse this mineral block
+                    dif_data = self._parse_amcsd_single_block(block)
+                    
+                    if dif_data and len(dif_data['two_theta']) > 0:
+                        # Import this mineral
+                        result = self._import_single_mineral(dif_data, dif_file_path)
+                        if result == 1:
+                            imported_count += 1
+                        elif result == 0:
+                            skipped_count += 1
+                        else:
+                            error_count += 1
+                    else:
+                        skipped_count += 1
+                    
+                    # Progress callback
+                    if progress_callback and (i + 1) % 10 == 0:
+                        progress = int((i + 1) / total_blocks * 100)
+                        progress_callback(progress)
+                    
+                    # Status update every 100 minerals
+                    if (i + 1) % 100 == 0:
+                        print(f"   Progress: {i+1}/{total_blocks} blocks processed "
+                              f"({imported_count} imported, {skipped_count} skipped, {error_count} errors)")
+                
+                except Exception as e:
+                    error_count += 1
+                    if i < 5:  # Print first few errors for debugging
+                        print(f"   Error processing block {i+1}: {e}")
+                    continue
+            
+            print(f"\n✅ Bulk import complete!")
+            print(f"   Total blocks: {total_blocks}")
+            print(f"   Imported: {imported_count}")
+            print(f"   Skipped: {skipped_count}")
+            print(f"   Errors: {error_count}")
+            
+            return imported_count
+            
+        except Exception as e:
+            print(f"❌ Error in bulk import: {e}")
+            import traceback
+            traceback.print_exc()
+            return 0
+    
+    def _split_amcsd_dif_blocks(self, content: str) -> list:
+        """Split AMCSD bulk DIF file into individual mineral blocks"""
+        blocks = []
+        current_block = []
+        
+        lines = content.split('\n')
+        in_block = False
+        
+        for line in lines:
+            # Separator marks the end of a mineral block
+            if '================================================================================' in line:
+                if current_block:
+                    blocks.append('\n'.join(current_block))
+                    current_block = []
+                in_block = True
+            elif in_block:
+                current_block.append(line)
+        
+        # Add last block
+        if current_block:
+            blocks.append('\n'.join(current_block))
+        
+        return blocks
+    
+    def _parse_amcsd_single_block(self, block: str) -> Optional[Dict]:
+        """Parse a single AMCSD mineral block"""
+        lines = block.split('\n')
+        return self._parse_amcsd_dif_format(lines)
+    
+    def _import_single_mineral(self, dif_data: dict, source_file: str) -> int:
+        """
+        Import a single mineral's diffraction pattern
+        
+        Returns:
+            1 = imported, 0 = skipped (already exists), -1 = error
+        """
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # Check if mineral already exists
+            existing = None
+            if dif_data.get('amcsd_id'):
+                cursor.execute('SELECT id FROM minerals WHERE amcsd_id = ?', (dif_data['amcsd_id'],))
+                existing = cursor.fetchone()
+            
+            if not existing:
+                cursor.execute('''
+                    SELECT id FROM minerals 
+                    WHERE mineral_name = ? AND chemical_formula = ?
+                ''', (dif_data['mineral_name'], dif_data['chemical_formula']))
+                existing = cursor.fetchone()
+            
+            if existing:
+                mineral_id = existing[0]
+            else:
+                # Create new mineral entry
+                cursor.execute('''
+                    INSERT INTO minerals (
+                        mineral_name, chemical_formula, space_group, crystal_system,
+                        cell_a, cell_b, cell_c, cell_alpha, cell_beta, cell_gamma,
+                        cell_volume, density, amcsd_id, authors, journal, year, doi,
+                        cif_content, cif_hash
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    dif_data['mineral_name'],
+                    dif_data['chemical_formula'],
+                    dif_data.get('space_group', 'Unknown'),
+                    dif_data.get('crystal_system', 'Unknown'),
+                    dif_data.get('cell_a'),
+                    dif_data.get('cell_b'),
+                    dif_data.get('cell_c'),
+                    dif_data.get('cell_alpha', 90.0),
+                    dif_data.get('cell_beta', 90.0),
+                    dif_data.get('cell_gamma', 90.0),
+                    dif_data.get('cell_volume'),
+                    None,
+                    dif_data.get('amcsd_id'),
+                    None, None, None, None,
+                    f"# DIF imported from {os.path.basename(source_file)}",
+                    hashlib.md5(f"{dif_data['mineral_name']}{dif_data.get('amcsd_id', '')}".encode()).hexdigest()
+                ))
+                
+                mineral_id = cursor.lastrowid
+                
+                # Add elements
+                for element, count in dif_data.get('elements', {}).items():
+                    cursor.execute('''
+                        INSERT INTO mineral_elements (mineral_id, element, count)
+                        VALUES (?, ?, ?)
+                    ''', (mineral_id, element, count))
+            
+            # Check if pattern already exists
+            cursor.execute('''
+                SELECT id FROM diffraction_patterns 
+                WHERE mineral_id = ? AND wavelength = ?
+            ''', (mineral_id, dif_data['wavelength']))
+            
+            if cursor.fetchone():
+                conn.close()
+                return 0  # Already exists
+            
+            # Store diffraction pattern
+            cursor.execute('''
+                INSERT INTO diffraction_patterns 
+                (mineral_id, wavelength, two_theta, intensities, d_spacings, 
+                 max_two_theta, min_d_spacing, calculation_method)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                mineral_id,
+                dif_data['wavelength'],
+                json.dumps(dif_data['two_theta']),
+                json.dumps(dif_data['intensities']),
+                json.dumps(dif_data['d_spacings']),
+                max(dif_data['two_theta']) if dif_data['two_theta'] else 90.0,
+                min(dif_data['d_spacings']) if dif_data['d_spacings'] else 0.5,
+                'DIF_import'
+            ))
+            
+            conn.commit()
+            conn.close()
+            return 1  # Successfully imported
+            
+        except Exception as e:
+            if 'conn' in locals():
+                conn.close()
+            return -1  # Error
+    
+    def import_dif_file(self, dif_file_path: str) -> int:
+        """
+        Import a DIF file with diffraction pattern data into the database
+        
+        Args:
+            dif_file_path: Path to the DIF file
+            
+        Returns:
+            Number of patterns imported (0 or 1)
+        """
+        try:
+            with open(dif_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+            
+            # Parse DIF file
+            dif_data = self._parse_dif_file(content)
+            
+            if not dif_data:
+                print(f"Failed to parse DIF file: {dif_file_path}")
+                return 0
+            
+            # Check if mineral already exists
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # Try to find existing mineral by AMCSD ID first (most reliable)
+            existing = None
+            if dif_data.get('amcsd_id'):
+                cursor.execute('''
+                    SELECT id FROM minerals 
+                    WHERE amcsd_id = ?
+                ''', (dif_data['amcsd_id'],))
+                existing = cursor.fetchone()
+            
+            # If not found by AMCSD ID, try by name and formula
+            if not existing:
+                cursor.execute('''
+                    SELECT id FROM minerals 
+                    WHERE mineral_name = ? AND chemical_formula = ?
+                ''', (dif_data['mineral_name'], dif_data['chemical_formula']))
+                existing = cursor.fetchone()
+            
+            if existing:
+                mineral_id = existing[0]
+                print(f"Found existing mineral: {dif_data['mineral_name']} (ID: {mineral_id})")
+            else:
+                # Create new mineral entry with all required fields
+                cursor.execute('''
+                    INSERT INTO minerals (
+                        mineral_name, chemical_formula, space_group, crystal_system,
+                        cell_a, cell_b, cell_c, cell_alpha, cell_beta, cell_gamma,
+                        cell_volume, density, amcsd_id, authors, journal, year, doi,
+                        cif_content, cif_hash
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    dif_data['mineral_name'],
+                    dif_data['chemical_formula'],
+                    dif_data.get('space_group', 'Unknown'),
+                    dif_data.get('crystal_system', 'Unknown'),
+                    dif_data.get('cell_a'),
+                    dif_data.get('cell_b'),
+                    dif_data.get('cell_c'),
+                    dif_data.get('cell_alpha', 90.0),
+                    dif_data.get('cell_beta', 90.0),
+                    dif_data.get('cell_gamma', 90.0),
+                    dif_data.get('cell_volume'),
+                    None,  # density
+                    dif_data.get('amcsd_id'),
+                    None,  # authors
+                    None,  # journal
+                    None,  # year
+                    None,  # doi
+                    f"# DIF imported from {os.path.basename(dif_file_path)}",
+                    hashlib.md5(content.encode()).hexdigest()
+                ))
+                
+                mineral_id = cursor.lastrowid
+                print(f"Created new mineral: {dif_data['mineral_name']} (ID: {mineral_id})")
+                
+                # Add elements
+                for element, count in dif_data.get('elements', {}).items():
+                    cursor.execute('''
+                        INSERT INTO mineral_elements (mineral_id, element, count)
+                        VALUES (?, ?, ?)
+                    ''', (mineral_id, element, count))
+            
+            # Check if pattern already exists
+            cursor.execute('''
+                SELECT id FROM diffraction_patterns 
+                WHERE mineral_id = ? AND wavelength = ?
+            ''', (mineral_id, dif_data['wavelength']))
+            
+            if cursor.fetchone():
+                print(f"Diffraction pattern already exists for {dif_data['mineral_name']}")
+                conn.close()
+                return 0
+            
+            # Store diffraction pattern
+            cursor.execute('''
+                INSERT INTO diffraction_patterns 
+                (mineral_id, wavelength, two_theta, intensities, d_spacings, 
+                 max_two_theta, min_d_spacing, calculation_method)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                mineral_id,
+                dif_data['wavelength'],
+                json.dumps(dif_data['two_theta']),
+                json.dumps(dif_data['intensities']),
+                json.dumps(dif_data['d_spacings']),
+                max(dif_data['two_theta']) if dif_data['two_theta'] else 90.0,
+                min(dif_data['d_spacings']) if dif_data['d_spacings'] else 0.5,
+                'DIF_import'
+            ))
+            
+            conn.commit()
+            conn.close()
+            
+            print(f"✅ Successfully imported DIF pattern for {dif_data['mineral_name']} ({len(dif_data['two_theta'])} peaks)")
+            return 1
+            
+        except Exception as e:
+            print(f"Error importing DIF file {dif_file_path}: {e}")
+            import traceback
+            traceback.print_exc()
+            return 0
+    
+    def _parse_dif_file(self, content: str) -> Optional[Dict]:
+        """
+        Parse DIF file content - supports both standard DIF and AMCSD bulk format
+        
+        DIF format typically contains:
+        - Header with mineral name, formula, wavelength
+        - Data columns: 2theta, d-spacing, intensity (or d-spacing, intensity, hkl for AMCSD)
+        """
+        try:
+            lines = content.strip().split('\n')
+            
+            # Check if this is AMCSD bulk format (multiple minerals)
+            if '================================================================================' in content:
+                print("⚠️ Detected AMCSD bulk DIF format with multiple minerals")
+                print("   This format contains many minerals - use bulk import for better handling")
+                print("   Attempting to parse first mineral entry...")
+                return self._parse_amcsd_dif_format(lines)
+            
+            # Standard DIF format
+            # Initialize data structure
+            data = {
+                'mineral_name': 'Unknown',
+                'chemical_formula': 'Unknown',
+                'wavelength': 1.5406,  # Default Cu Kα
+                'two_theta': [],
+                'intensities': [],
+                'd_spacings': [],
+                'elements': {}
+            }
+            
+            # Parse header and data
+            in_data_section = False
+            
+            for line in lines:
+                line = line.strip()
+                
+                # Skip empty lines and comments
+                if not line or line.startswith('#'):
+                    continue
+                
+                # Parse header information
+                if line.startswith('_pd_phase_name') or line.startswith('_chemical_name_mineral'):
+                    data['mineral_name'] = line.split(None, 1)[1].strip().strip("'\"")
+                elif line.startswith('_chemical_formula_sum'):
+                    data['chemical_formula'] = line.split(None, 1)[1].strip().strip("'\"")
+                    data['elements'] = self.extract_elements_from_formula(data['chemical_formula'])
+                elif line.startswith('_diffrn_radiation_wavelength'):
+                    try:
+                        data['wavelength'] = float(line.split()[1])
+                    except (ValueError, IndexError):
+                        pass
+                elif line.startswith('_cell_length_a'):
+                    try:
+                        data['cell_a'] = float(line.split()[1].split('(')[0])
+                    except (ValueError, IndexError):
+                        pass
+                elif line.startswith('_cell_length_b'):
+                    try:
+                        data['cell_b'] = float(line.split()[1].split('(')[0])
+                    except (ValueError, IndexError):
+                        pass
+                elif line.startswith('_cell_length_c'):
+                    try:
+                        data['cell_c'] = float(line.split()[1].split('(')[0])
+                    except (ValueError, IndexError):
+                        pass
+                elif line.startswith('_symmetry_space_group_name_H-M'):
+                    data['space_group'] = line.split(None, 1)[1].strip().strip("'\"")
+                
+                # Check for data section start
+                elif line.startswith('loop_') or line.startswith('_pd_proc_2theta'):
+                    in_data_section = True
+                    continue
+                
+                # Parse data lines (2theta, d-spacing, intensity)
+                elif in_data_section and not line.startswith('_'):
+                    try:
+                        parts = line.split()
+                        if len(parts) >= 3:
+                            two_theta = float(parts[0])
+                            d_spacing = float(parts[1])
+                            intensity = float(parts[2])
+                            
+                            data['two_theta'].append(two_theta)
+                            data['d_spacings'].append(d_spacing)
+                            data['intensities'].append(intensity)
+                    except (ValueError, IndexError):
+                        continue
+            
+            # Validate that we have data
+            if not data['two_theta']:
+                print("No diffraction data found in DIF file")
+                return None
+            
+            return data
+            
+        except Exception as e:
+            print(f"Error parsing DIF file: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def _parse_amcsd_dif_format(self, lines: List[str]) -> Optional[Dict]:
+        """
+        Parse AMCSD bulk DIF format - extracts FIRST mineral only
+        Format: d-spacing, intensity, hkl indices, multiplicity
+        """
+        try:
+            data = {
+                'mineral_name': 'Unknown',
+                'chemical_formula': 'Unknown',
+                'wavelength': 1.5406,  # Cu Kα
+                'two_theta': [],
+                'intensities': [],
+                'd_spacings': [],
+                'elements': {},
+                'amcsd_id': None
+            }
+            
+            in_data_section = False
+            data_line_count = 0
+            
+            for i, line in enumerate(lines):
+                line = line.strip()
+                
+                # Stop if we've collected too many reflections (safety limit)
+                if data_line_count > 10000:
+                    print(f"   Reached safety limit of 10000 reflections")
+                    break
+                
+                # Look for _END_ marker
+                if '_END_' in line:
+                    continue
+                
+                # Look for mineral name (appears after _END_)
+                if not in_data_section and line and not line.startswith('_'):
+                    # Check if this looks like a mineral name (capitalized, not a number)
+                    if line and line[0].isupper() and not any(char.isdigit() for char in line[:5]):
+                        # Skip common header/reference lines
+                        skip_keywords = ['XPOW', 'Copyright', 'For reference', 'American Mineralogist', 
+                                       'Locality', 'Studies', 'Journal', 'Acta', 'Zeitschrift']
+                        if any(keyword in line for keyword in skip_keywords):
+                            continue
+                        
+                        if data['mineral_name'] == 'Unknown':
+                            data['mineral_name'] = line
+                            print(f"   Found mineral: {line}")
+                
+                # Look for AMCSD ID
+                if '_database_code_amcsd' in line:
+                    try:
+                        data['amcsd_id'] = line.split()[-1]
+                        print(f"   AMCSD ID: {data['amcsd_id']}")
+                    except:
+                        pass
+                
+                # Look for cell parameters
+                if 'CELL PARAMETERS:' in line:
+                    try:
+                        parts = line.split(':')[1].split()
+                        if len(parts) >= 6:
+                            data['cell_a'] = float(parts[0])
+                            data['cell_b'] = float(parts[1])
+                            data['cell_c'] = float(parts[2])
+                    except:
+                        pass
+                
+                # Look for data section header
+                if '2-THETA' in line and 'INTENSITY' in line and 'D-SPACING' in line:
+                    in_data_section = True
+                    print(f"   Found data header")
+                    continue
+                
+                # Parse diffraction data after header is found
+                if in_data_section:
+                    if not line.startswith('=') and not line.startswith('_') and line:
+                        # Skip header and info lines
+                        if 'XPOW' in line or 'Copyright' in line or 'American Mineralogist' in line:
+                            continue
+                        if 'Locality' in line or 'CELL PARAMETERS' in line or '2-THETA' in line:
+                            continue
+                        if 'H   K   L' in line or 'Multiplicity' in line:
+                            continue
+                            
+                        try:
+                            parts = line.split()
+                            if len(parts) >= 3:
+                                # Parse: 2-theta, intensity, d-spacing, h, k, l, multiplicity
+                                two_theta = float(parts[0])
+                                intensity = float(parts[1])
+                                d_spacing = float(parts[2])
+                                
+                                data['two_theta'].append(two_theta)
+                                data['intensities'].append(intensity)
+                                data['d_spacings'].append(d_spacing)
+                                data_line_count += 1
+                                
+                        except (ValueError, IndexError):
+                            # Not a data line, continue
+                            continue
+            
+            # Validate
+            if not data['two_theta']:
+                print("No diffraction data found in AMCSD DIF format")
+                return None
+            
+            print(f"   ✅ Parsed {len(data['two_theta'])} reflections for {data['mineral_name']}")
+            return data
+            
+        except Exception as e:
+            print(f"Error parsing AMCSD DIF format: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
     def get_database_stats(self) -> Dict:
         """Get database statistics"""
         conn = sqlite3.connect(self.db_path)
@@ -904,11 +1447,19 @@ class LocalCIFDatabase:
             cursor = conn.cursor()
             
             # Always look for Cu Kα pattern (our reference wavelength)
+            # Prefer AMCSD_DIF over other calculation methods
             reference_wavelength = 1.5406
             cursor.execute('''
                 SELECT two_theta, intensities, d_spacings FROM diffraction_patterns
                 WHERE mineral_id = ? AND wavelength = ?
-                ORDER BY max_two_theta DESC, min_d_spacing ASC
+                ORDER BY 
+                    CASE calculation_method 
+                        WHEN 'AMCSD_DIF' THEN 1
+                        WHEN 'pymatgen' THEN 2
+                        ELSE 3
+                    END,
+                    max_two_theta DESC, 
+                    min_d_spacing ASC
                 LIMIT 1
             ''', (mineral_id, reference_wavelength))
             
@@ -918,10 +1469,16 @@ class LocalCIFDatabase:
             if result:
                 two_theta_json, intensities_json, d_spacings_json = result
                 
-                # Load the reference data
-                ref_two_theta = np.array(json.loads(two_theta_json))
-                intensities = np.array(json.loads(intensities_json))
-                d_spacings = np.array(json.loads(d_spacings_json))
+                # Load the reference data - handle both JSON and comma-separated formats
+                try:
+                    ref_two_theta = np.array(json.loads(two_theta_json))
+                    intensities = np.array(json.loads(intensities_json))
+                    d_spacings = np.array(json.loads(d_spacings_json))
+                except (json.JSONDecodeError, ValueError):
+                    # Fallback to comma-separated format
+                    ref_two_theta = np.array([float(x) for x in two_theta_json.split(',')])
+                    intensities = np.array([float(x) for x in intensities_json.split(',')])
+                    d_spacings = np.array([float(x) for x in d_spacings_json.split(',')])
                 
                 # Convert to target wavelength using Bragg's law if needed
                 if abs(wavelength - reference_wavelength) > 1e-6:  # Different wavelength

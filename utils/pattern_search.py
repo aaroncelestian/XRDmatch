@@ -11,6 +11,7 @@ from scipy import signal
 from scipy.stats import pearsonr
 from scipy.interpolate import interp1d
 from utils.local_database import LocalCIFDatabase
+from utils.ima_mineral_database import get_ima_database
 import time
 
 class PatternSearchEngine:
@@ -22,6 +23,7 @@ class PatternSearchEngine:
     def __init__(self, db_path: str = None):
         """Initialize the pattern search engine"""
         self.local_db = LocalCIFDatabase(db_path)
+        self.ima_db = get_ima_database()
         
     def search_by_peaks(self, experimental_peaks: Dict, 
                        tolerance: float = 0.2, 
@@ -93,7 +95,8 @@ class PatternSearchEngine:
                 )
                 
                 if match_result['num_matches'] >= min_matches:
-                    results.append({
+                    # Enhance with IMA database info
+                    result = {
                         'mineral_id': mineral_id,
                         'mineral_name': mineral_name,
                         'chemical_formula': formula,
@@ -104,7 +107,18 @@ class PatternSearchEngine:
                         'coverage': match_result['coverage'],
                         'matched_peaks': match_result['matched_peaks'],
                         'search_method': 'peak_based'
-                    })
+                    }
+                    
+                    # Cross-reference with IMA database for authoritative info
+                    ima_info = self.ima_db.get_mineral_info(mineral_name)
+                    if ima_info:
+                        result['ima_chemistry'] = ima_info.get('chemistry', formula)
+                        result['ima_space_group'] = ima_info.get('space_group', space_group)
+                        result['ima_verified'] = True
+                    else:
+                        result['ima_verified'] = False
+                    
+                    results.append(result)
                 
                 processed += 1
                 if processed % 100 == 0:
@@ -199,7 +213,8 @@ class PatternSearchEngine:
                 )
                 
                 if correlation_result['correlation'] >= min_correlation:
-                    results.append({
+                    # Enhance with IMA database info
+                    result = {
                         'mineral_id': mineral_id,
                         'mineral_name': mineral_name,
                         'chemical_formula': formula,
@@ -209,7 +224,18 @@ class PatternSearchEngine:
                         'overlap_fraction': correlation_result['overlap_fraction'],
                         'rms_error': correlation_result['rms_error'],
                         'search_method': 'correlation_based'
-                    })
+                    }
+                    
+                    # Cross-reference with IMA database for authoritative info
+                    ima_info = self.ima_db.get_mineral_info(mineral_name)
+                    if ima_info:
+                        result['ima_chemistry'] = ima_info.get('chemistry', formula)
+                        result['ima_space_group'] = ima_info.get('space_group', space_group)
+                        result['ima_verified'] = True
+                    else:
+                        result['ima_verified'] = False
+                    
+                    results.append(result)
                 
                 processed += 1
                 if processed % 100 == 0:
