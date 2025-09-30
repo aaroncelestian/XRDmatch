@@ -233,6 +233,9 @@ class PatternSearchTab(QWidget):
         self.index_status_label = QLabel("Index Status: Not Built")
         fast_layout.addRow("Status:", self.index_status_label)
         
+        # Check if index is already loaded
+        self.update_index_status()
+        
         # Build index button
         index_button_layout = QHBoxLayout()
         self.build_index_btn = QPushButton("Build Search Index")
@@ -675,19 +678,16 @@ class PatternSearchTab(QWidget):
             )
             
             if success:
+                # Update the status display
+                self.update_index_status()
+                
+                # Get stats for the message
                 stats = self.fast_search_engine.get_search_statistics()
-                self.index_status_label.setText(f"Ready: {stats['database_size']} patterns")
-                self.benchmark_btn.setEnabled(True)
-                
-                # Update performance info
-                build_time = stats['index_build_time_s']
-                self.performance_label.setText(f"Index built in {build_time:.2f}s")
-                
                 QMessageBox.information(self, "Index Built", 
                     f"Search index built successfully!\n\n"
                     f"Database size: {stats['database_size']} patterns\n"
                     f"Grid points: {stats['grid_points']}\n"
-                    f"Build time: {build_time:.2f}s\n"
+                    f"Build time: {stats['index_build_time_s']:.2f}s\n"
                     f"Memory usage: {stats['matrix_size_mb']:.1f} MB")
             else:
                 self.index_status_label.setText("Build failed")
@@ -873,3 +873,26 @@ class PatternSearchTab(QWidget):
                     
                 if hasattr(self.fast_search_engine, 'update_refined_phase'):
                     self.fast_search_engine.update_refined_phase(phase_id, refined_peaks, refinement_quality)
+    
+    def update_index_status(self):
+        """Update the index status display"""
+        try:
+            if self.fast_search_engine.search_index is not None:
+                stats = self.fast_search_engine.get_search_statistics()
+                self.index_status_label.setText(f"Ready: {stats['database_size']} patterns")
+                self.benchmark_btn.setEnabled(True)
+                self.build_index_btn.setText("Rebuild Index")
+                
+                # Update performance info if available
+                if stats.get('index_build_time_s', 0) > 0:
+                    build_time = stats['index_build_time_s']
+                    self.performance_label.setText(f"Index loaded ({build_time:.2f}s build time)")
+            else:
+                self.index_status_label.setText("Index Status: Not Built")
+                self.benchmark_btn.setEnabled(False)
+                self.build_index_btn.setText("Build Search Index")
+                self.performance_label.setText("Performance: Not tested")
+                
+        except Exception as e:
+            print(f"Error updating index status: {e}")
+            self.index_status_label.setText("Index Status: Error")

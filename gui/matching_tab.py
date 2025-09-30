@@ -275,7 +275,7 @@ class PhaseMatchingThread(QThread):
             }
     
     def convert_dif_to_wavelength(self, dif_data, target_wavelength):
-        """Convert DIF data from Cu Kα to target wavelength"""
+        """Convert DIF data from Cu Kα to target wavelength with intensity correction"""
         try:
             # DIF files are typically calculated for Cu Kα (1.5406 Å)
             dif_wavelength = 1.5406
@@ -284,13 +284,26 @@ class PhaseMatchingThread(QThread):
             d_spacings = dif_data['d_spacing']
             intensities = dif_data['intensity']
             
+            # Calculate original 2θ values for Cu Kα (for LP factor correction)
+            original_two_theta = []
+            for d in d_spacings:
+                if d > 0:
+                    sin_theta = dif_wavelength / (2 * d)
+                    if sin_theta <= 1.0:
+                        theta_rad = np.arcsin(sin_theta)
+                        original_two_theta.append(2 * np.degrees(theta_rad))
+                    else:
+                        original_two_theta.append(0)
+                else:
+                    original_two_theta.append(0)
+            
             # Calculate new 2θ values for the target wavelength using Bragg's law
             # λ = 2d sin(θ) → θ = arcsin(λ / 2d)
             new_two_theta = []
             valid_d_spacings = []
             valid_intensities = []
             
-            for d, intensity in zip(d_spacings, intensities):
+            for d, intensity, orig_2theta in zip(d_spacings, intensities, original_two_theta):
                 if d > 0:
                     sin_theta = target_wavelength / (2 * d)
                     if sin_theta <= 1.0:  # Valid reflection
@@ -300,18 +313,31 @@ class PhaseMatchingThread(QThread):
                         # Only include peaks in reasonable 2θ range (adjust for short wavelengths)
                         min_2theta = 1.0 if target_wavelength < 1.0 else 5.0
                         if min_2theta <= two_theta_deg <= 90:
+                            # Correct intensity for Lorentz-polarization factor change
+                            # LP(θ) = (1 + cos²(2θ)) / (sin²(θ) × cos(θ))
+                            corrected_intensity = self._apply_lp_correction(
+                                intensity, orig_2theta, two_theta_deg
+                            )
+                            
                             new_two_theta.append(two_theta_deg)
                             valid_d_spacings.append(d)
-                            valid_intensities.append(intensity)
+                            valid_intensities.append(corrected_intensity)
             
             print(f"Converted {len(valid_d_spacings)} peaks from λ={dif_wavelength:.4f}Å to λ={target_wavelength:.4f}Å")
             if len(valid_d_spacings) > 0:
                 print(f"2θ range after conversion: {np.min(new_two_theta):.2f}° to {np.max(new_two_theta):.2f}°")
                 print(f"d-spacing range: {np.min(valid_d_spacings):.3f}Å to {np.max(valid_d_spacings):.3f}Å")
             
+            # Renormalize intensities to 0-100 scale
+            if len(valid_intensities) > 0:
+                valid_intensities = np.array(valid_intensities)
+                max_intensity = np.max(valid_intensities)
+                if max_intensity > 0:
+                    valid_intensities = 100.0 * valid_intensities / max_intensity
+            
             return {
                 'd_spacing': np.array(valid_d_spacings),
-                'intensity': np.array(valid_intensities),
+                'intensity': valid_intensities,
                 'two_theta': np.array(new_two_theta)
             }
             
@@ -322,6 +348,47 @@ class PhaseMatchingThread(QThread):
                 'intensity': np.array([]),
                 'two_theta': np.array([])
             }
+    
+    def _apply_lp_correction(self, intensity, original_2theta, new_2theta):
+        """
+        Apply Lorentz-polarization correction when converting between wavelengths
+        
+        The LP factor is: LP(θ) = (1 + cos²(2θ)) / (sin²(θ) × cos(θ))
+        
+        When converting wavelengths, we need to:
+        1. Remove the original LP factor
+        2. Apply the new LP factor
+        """
+        try:
+            # Convert to radians
+            orig_theta_rad = np.radians(original_2theta / 2)
+            new_theta_rad = np.radians(new_2theta / 2)
+            
+            # Calculate original LP factor
+            if orig_theta_rad > 0 and np.sin(orig_theta_rad) > 0:
+                orig_lp = ((1 + np.cos(2 * orig_theta_rad)**2) / 
+                          (np.sin(orig_theta_rad)**2 * np.cos(orig_theta_rad)))
+            else:
+                orig_lp = 1.0
+            
+            # Calculate new LP factor
+            if new_theta_rad > 0 and np.sin(new_theta_rad) > 0:
+                new_lp = ((1 + np.cos(2 * new_theta_rad)**2) / 
+                         (np.sin(new_theta_rad)**2 * np.cos(new_theta_rad)))
+            else:
+                new_lp = 1.0
+            
+            # Correct intensity: remove old LP, apply new LP
+            if orig_lp > 0:
+                corrected_intensity = intensity * (new_lp / orig_lp)
+            else:
+                corrected_intensity = intensity
+            
+            return corrected_intensity
+            
+        except (ValueError, ZeroDivisionError):
+            # If correction fails, return original intensity
+            return intensity
     
     def _calculate_pattern_correlation(self, exp_two_theta, exp_intensity, 
                                      theo_two_theta, theo_intensity):
@@ -1695,3 +1762,21 @@ class MatchingTab(QWidget):
         # Clear multi-phase analyzer refined cache for completely new analysis
         if hasattr(self, 'multi_phase_analyzer'):
             self.multi_phase_analyzer.clear_refined_cache()
+            
+    def get_selected_phases(self):
+        """Get selected phases from the results table for export/visualization"""
+        selected_phases = []
+        
+        # Get checked items from results table
+        for row in range(self.results_table.rowCount()):
+            checkbox_item = self.results_table.item(row, 0)
+            if checkbox_item and checkbox_item.checkState() == Qt.Checked:
+                # Get the corresponding phase from matching results
+                if row < len(self.matching_results):
+                    selected_phases.append(self.matching_results[row])
+        
+        # If no phases are selected, return all matching results
+        if not selected_phases and self.matching_results:
+            selected_phases = self.matching_results
+            
+        return selected_phases

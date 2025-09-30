@@ -788,8 +788,8 @@ class CIFParser:
             
             # Calculate structure factors for all reflections
             if atoms:
-                print("Calculating structure factors from atomic positions...")
-                structure_factors = self._calculate_structure_factors_improved(atoms, hkl_list)
+                print("Calculating structure factors with ANGLE-DEPENDENT scattering factors...")
+                structure_factors = self._calculate_structure_factors_improved(atoms, hkl_list, two_theta_list, wavelength)
             else:
                 print("No atomic positions found, using geometric structure factors...")
                 structure_factors = self._calculate_geometric_structure_factors(hkl_list, a, b, c, alpha, beta, gamma)
@@ -880,12 +880,15 @@ class CIFParser:
         
         return 1.0 / np.sqrt(d_inv_sq)
     
-    def _calculate_structure_factors_improved(self, atoms: List[Dict], hkl_list: List[Tuple[int, int, int]]) -> List[float]:
+    def _calculate_structure_factors_improved(self, atoms: List[Dict], hkl_list: List[Tuple[int, int, int]], 
+                                            two_theta_list: List[float] = None, wavelength: float = 1.5406) -> List[float]:
         """
-        Calculate improved structure factors using atomic positions and proper scattering factors
+        Calculate improved structure factors using atomic positions and ANGLE-DEPENDENT scattering factors
+        
+        This fixes the issue where constant scattering factors made high-angle peaks too strong.
         """
-        # Enhanced atomic scattering factors (approximate values for common elements)
-        scattering_factors = {
+        # Base atomic scattering factors (f0 at zero angle)
+        f0_values = {
             'H': 1.0, 'He': 2.0, 'Li': 3.0, 'Be': 4.0, 'B': 5.0, 'C': 6.0, 'N': 7.0, 'O': 8.0, 'F': 9.0, 'Ne': 10.0,
             'Na': 11.0, 'Mg': 12.0, 'Al': 13.0, 'Si': 14.0, 'P': 15.0, 'S': 16.0, 'Cl': 17.0, 'Ar': 18.0, 'K': 19.0, 'Ca': 20.0,
             'Sc': 21.0, 'Ti': 22.0, 'V': 23.0, 'Cr': 24.0, 'Mn': 25.0, 'Fe': 26.0, 'Co': 27.0, 'Ni': 28.0, 'Cu': 29.0, 'Zn': 30.0,
@@ -894,9 +897,28 @@ class CIFParser:
             'Sb': 51.0, 'Te': 52.0, 'I': 53.0, 'Xe': 54.0, 'Cs': 55.0, 'Ba': 56.0, 'La': 57.0, 'Ce': 58.0, 'Pr': 59.0, 'Nd': 60.0
         }
         
+        # Typical B-factors (thermal parameters) for different elements
+        # Higher B = more thermal motion = faster decay of scattering factor
+        b_factors = {
+            'H': 2.0, 'He': 1.5, 'Li': 1.5, 'Be': 1.0, 'B': 1.0, 'C': 1.0, 'N': 1.0, 'O': 1.0, 'F': 1.0, 'Ne': 1.0,
+            'Na': 1.5, 'Mg': 1.0, 'Al': 1.0, 'Si': 0.8, 'P': 0.8, 'S': 0.8, 'Cl': 1.0, 'Ar': 1.0, 'K': 1.5, 'Ca': 1.0,
+            'Sc': 0.8, 'Ti': 0.8, 'V': 0.8, 'Cr': 0.8, 'Mn': 0.8, 'Fe': 0.8, 'Co': 0.8, 'Ni': 0.8, 'Cu': 0.8, 'Zn': 0.8,
+            'Ga': 0.8, 'Ge': 0.8, 'As': 0.8, 'Se': 0.8, 'Br': 1.0, 'Kr': 1.0, 'Rb': 1.5, 'Sr': 1.0, 'Y': 0.8, 'Zr': 0.8,
+            'Nb': 0.8, 'Mo': 0.8, 'Tc': 0.8, 'Ru': 0.8, 'Rh': 0.8, 'Pd': 0.8, 'Ag': 0.8, 'Cd': 0.8, 'In': 0.8, 'Sn': 0.8,
+            'Sb': 0.8, 'Te': 0.8, 'I': 1.0, 'Xe': 1.0, 'Cs': 1.5, 'Ba': 1.0, 'La': 0.8, 'Ce': 0.8, 'Pr': 0.8, 'Nd': 0.8
+        }
+        
         structure_factors = []
         
-        for h, k, l in hkl_list:
+        for idx, (h, k, l) in enumerate(hkl_list):
+            # Calculate sin(theta)/lambda for this reflection
+            if two_theta_list and idx < len(two_theta_list):
+                two_theta = two_theta_list[idx]
+                sin_theta_over_lambda = np.sin(np.radians(two_theta / 2)) / wavelength
+            else:
+                # Fallback if no 2theta provided
+                sin_theta_over_lambda = 0.0
+            
             F_real = 0.0
             F_imag = 0.0
             
@@ -917,8 +939,13 @@ class CIFParser:
                 else:
                     element = 'C'  # Default fallback
                 
-                # Get atomic scattering factor
-                f = scattering_factors.get(element, 6.0)  # Default to carbon
+                # Get base scattering factor and B-factor
+                f0 = f0_values.get(element, 6.0)
+                B = b_factors.get(element, 1.0)
+                
+                # Apply angle-dependent scattering factor with thermal motion
+                # f(θ) = f0 × exp(-B × [sin(θ)/λ]²)
+                f = f0 * np.exp(-B * sin_theta_over_lambda**2)
                 
                 # Calculate phase
                 phase = 2 * np.pi * (h * x + k * y + l * z)

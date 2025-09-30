@@ -14,6 +14,7 @@ from .database_tab import DatabaseTab
 from .local_database_tab import LocalDatabaseTab
 from .pattern_search_tab import PatternSearchTab
 from .matching_tab import MatchingTab
+from .visualization_tab import VisualizationTab
 from .settings_tab import SettingsTab
 
 class XRDMainWindow(QMainWindow):
@@ -48,6 +49,7 @@ class XRDMainWindow(QMainWindow):
         self.local_database_tab = LocalDatabaseTab()
         self.pattern_search_tab = PatternSearchTab()
         self.matching_tab = MatchingTab()
+        self.visualization_tab = VisualizationTab()
         self.settings_tab = SettingsTab()
         
         # Add tabs to widget
@@ -57,6 +59,7 @@ class XRDMainWindow(QMainWindow):
         self.tab_widget.addTab(self.local_database_tab, "Local Database")
         self.tab_widget.addTab(self.pattern_search_tab, "Pattern Search")
         self.tab_widget.addTab(self.matching_tab, "Phase Matching")
+        self.tab_widget.addTab(self.visualization_tab, "Visualization & Export")
         self.tab_widget.addTab(self.settings_tab, "Settings")
         
         # Connect signals - order matters: reset first, then set new data
@@ -80,6 +83,10 @@ class XRDMainWindow(QMainWindow):
         # Connect Le Bail refinement components
         # Share the multi-phase analyzer between tabs for refined phase caching
         self.pattern_search_tab.set_multi_phase_analyzer(self.matching_tab.multi_phase_analyzer)
+        self.visualization_tab.set_multi_phase_analyzer(self.matching_tab.multi_phase_analyzer)
+        
+        # Connect visualization tab import button to matching tab data
+        self.visualization_tab.import_btn.clicked.connect(self.import_to_visualization)
         
     def setup_menus(self):
         """Setup application menus"""
@@ -172,6 +179,38 @@ class XRDMainWindow(QMainWindow):
             self.matching_tab.save_results(file_path)
             self.status_bar.showMessage(f"Results saved: {file_path}")
             
+    def import_to_visualization(self):
+        """Import data from matching tab to visualization tab"""
+        # Get experimental pattern and matched phases from matching tab
+        experimental_pattern = self.matching_tab.experimental_pattern
+        
+        if not experimental_pattern:
+            QMessageBox.warning(
+                self,
+                "No Data",
+                "Please load a pattern and perform phase matching first."
+            )
+            return
+        
+        # Get selected phases from matching tab
+        matched_phases = self.matching_tab.get_selected_phases()
+        
+        if not matched_phases:
+            QMessageBox.warning(
+                self,
+                "No Phases",
+                "Please select phases in the Phase Matching tab first."
+            )
+            return
+        
+        # Import to visualization tab
+        self.visualization_tab.set_data(experimental_pattern, matched_phases)
+        
+        # Switch to visualization tab
+        self.tab_widget.setCurrentWidget(self.visualization_tab)
+        
+        self.status_bar.showMessage(f"Imported {len(matched_phases)} phase(s) to visualization")
+        
     def show_about(self):
         """Show about dialog"""
         QMessageBox.about(
@@ -185,6 +224,8 @@ class XRDMainWindow(QMainWindow):
             <li>Search AMCSD crystal structure database</li>
             <li>Multiple wavelength support</li>
             <li>Automated phase matching</li>
+            <li>Le Bail refinement</li>
+            <li>Advanced visualization and export</li>
             </ul>
-            <p>Built with PyQt6 and scientific Python libraries</p>"""
+            <p>Built with PyQt5 and scientific Python libraries</p>"""
         )

@@ -32,6 +32,9 @@ class FastPatternSearchEngine:
         self.last_search_time = 0
         self.index_build_time = 0
         
+        # Auto-load existing PKL cache if available
+        self._auto_load_cache()
+        
     def build_search_index(self, grid_resolution: float = 0.02, 
                           two_theta_range: Tuple[float, float] = (5.0, 90.0),
                           force_rebuild: bool = False,
@@ -525,4 +528,26 @@ class FastPatternSearchEngine:
             
         except Exception as e:
             print(f"❌ PKL cache load failed: {e}")
+            return False
+    
+    def _auto_load_cache(self, grid_resolution: float = 0.02, 
+                        two_theta_range: Tuple[float, float] = (5.0, 90.0)) -> bool:
+        """
+        Automatically load PKL cache if it exists during initialization
+        
+        This ensures the search index persists between searches without rebuilding
+        """
+        try:
+            # Try to load the default PKL cache
+            cache_file = f"data/xrd_search_index_{grid_resolution:.3f}_{two_theta_range[0]:.0f}_{two_theta_range[1]:.0f}.pkl"
+            
+            if self._load_pkl_cache(cache_file):
+                print("🚀 Search index auto-loaded from cache on startup")
+                return True
+            else:
+                # No cache file exists yet - this is normal for first run
+                return False
+                
+        except Exception as e:
+            # Silently fail - this is expected if no cache exists yet
             return False

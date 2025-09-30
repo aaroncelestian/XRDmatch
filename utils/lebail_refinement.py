@@ -92,13 +92,13 @@ class LeBailRefinement:
         
         return unit_cell
         
-    def refine_phases(self, max_iterations: int = 50, 
-                     convergence_threshold: float = 1e-6) -> Dict:
+    def refine_phases(self, max_iterations: int = 20, 
+                     convergence_threshold: float = 1e-5) -> Dict:
         """
         Perform Le Bail refinement on all phases
         
         Args:
-            max_iterations: Maximum number of refinement cycles
+            max_iterations: Maximum number of refinement cycles (reduced for performance)
             convergence_threshold: Convergence criterion for R-factors
             
         Returns:
@@ -171,6 +171,12 @@ class LeBailRefinement:
         # Create parameter vector for optimization
         param_vector, param_bounds, param_names = self._create_parameter_vector(params)
         
+        # Pre-calculate other phases pattern (doesn't change during this phase's optimization)
+        other_pattern = np.zeros_like(self.experimental_data['two_theta'])
+        for i, other_phase in enumerate(self.phases):
+            if i != phase_idx:
+                other_pattern += self._calculate_phase_pattern(i, other_phase['parameters'])
+        
         # Define objective function
         def objective(x):
             # Update parameters
@@ -178,12 +184,6 @@ class LeBailRefinement:
             
             # Calculate pattern for this phase
             phase_pattern = self._calculate_phase_pattern(phase_idx, temp_params)
-            
-            # Calculate other phases with current parameters
-            other_pattern = np.zeros_like(self.experimental_data['two_theta'])
-            for i, other_phase in enumerate(self.phases):
-                if i != phase_idx:
-                    other_pattern += self._calculate_phase_pattern(i, other_phase['parameters'])
                     
             # Total calculated pattern
             total_pattern = phase_pattern + other_pattern
@@ -199,7 +199,7 @@ class LeBailRefinement:
                 param_vector,
                 bounds=param_bounds,
                 method='L-BFGS-B',
-                options={'maxiter': 100}
+                options={'maxiter': 50, 'ftol': 1e-6, 'gtol': 1e-5}
             )
             
             if result.success:
@@ -330,20 +330,30 @@ class LeBailRefinement:
         
     def _pseudo_voigt_profile(self, x: np.ndarray, center: float, fwhm: float, 
                             intensity: float, eta: float) -> np.ndarray:
-        """Generate pseudo-Voigt peak profile"""
+        """Generate pseudo-Voigt peak profile (optimized)"""
         if fwhm <= 0 or intensity <= 0:
             return np.zeros_like(x)
-            
+        
+        # Only calculate profile within ±5*FWHM of peak center (optimization)
+        cutoff = 5 * fwhm
+        mask = np.abs(x - center) <= cutoff
+        
+        if not np.any(mask):
+            return np.zeros_like(x)
+        
+        profile = np.zeros_like(x)
+        x_local = x[mask]
+        
         # Gaussian component
         sigma_g = fwhm / (2 * np.sqrt(2 * np.log(2)))
-        gaussian = np.exp(-0.5 * ((x - center) / sigma_g) ** 2)
+        gaussian = np.exp(-0.5 * ((x_local - center) / sigma_g) ** 2)
         
         # Lorentzian component  
         gamma_l = fwhm / 2
-        lorentzian = 1 / (1 + ((x - center) / gamma_l) ** 2)
+        lorentzian = 1 / (1 + ((x_local - center) / gamma_l) ** 2)
         
         # Pseudo-Voigt mixing
-        profile = intensity * ((1 - eta) * gaussian + eta * lorentzian)
+        profile[mask] = intensity * ((1 - eta) * gaussian + eta * lorentzian)
         
         return profile
         

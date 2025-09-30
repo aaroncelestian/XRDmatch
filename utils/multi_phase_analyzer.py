@@ -74,7 +74,12 @@ class MultiPhaseAnalyzer:
                 print(f"No suitable phase found (best score: {best_score:.3f})")
                 break
                 
-            print(f"Best phase: {best_phase['phase'].get('mineral', 'Unknown')} (score: {best_score:.3f}, scaling: {best_scaling:.3f})")
+            # Get phase name for logging
+            if 'phase' in best_phase:
+                phase_name = best_phase['phase'].get('mineral', 'Unknown')
+            else:
+                phase_name = best_phase.get('mineral', 'Unknown')
+            print(f"Best phase: {phase_name} (score: {best_score:.3f}, scaling: {best_scaling:.3f})")
             
             # Generate theoretical pattern for best phase
             theoretical_pattern = self._generate_theoretical_pattern(
@@ -91,8 +96,14 @@ class MultiPhaseAnalyzer:
             )
             
             # Store identified phase with optimization results
+            # Handle different phase data structures
+            if 'phase' in best_phase:
+                phase_data = best_phase['phase']
+            else:
+                phase_data = best_phase
+                
             phase_result = {
-                'phase': best_phase['phase'],
+                'phase': phase_data,
                 'theoretical_peaks': best_phase.get('theoretical_peaks'),
                 'match_score': best_score,
                 'optimized_scaling': optimized_scaling,
@@ -109,7 +120,19 @@ class MultiPhaseAnalyzer:
             residue_history.append(current_residue.copy())
             
             # Remove this phase from candidates to avoid re-identification
-            candidate_phases = [p for p in candidate_phases if p['phase'].get('id') != best_phase['phase'].get('id')]
+            # Handle different phase data structures for ID comparison
+            if 'phase' in best_phase:
+                best_phase_id = best_phase['phase'].get('id')
+            else:
+                best_phase_id = best_phase.get('id')
+                
+            def get_phase_id(p):
+                if 'phase' in p:
+                    return p['phase'].get('id')
+                else:
+                    return p.get('id')
+                    
+            candidate_phases = [p for p in candidate_phases if get_phase_id(p) != best_phase_id]
             
             print(f"Phase subtracted. New residue max: {np.max(current_residue):.0f}")
             
@@ -346,13 +369,17 @@ class MultiPhaseAnalyzer:
         return "\n".join(report)
         
     def perform_lebail_refinement(self, experimental_data: Dict, 
-                                identified_phases: List[Dict]) -> Dict:
+                                  identified_phases: List[Dict],
+                                  max_iterations: int = 15,
+                                  convergence_threshold: float = 1e-5) -> Dict:
         """
         Perform Le Bail refinement on identified phases
         
         Args:
             experimental_data: Experimental diffraction data
             identified_phases: List of identified phases from sequential analysis
+            max_iterations: Maximum number of refinement iterations (default: 15)
+            convergence_threshold: Convergence threshold for refinement (default: 1e-5)
             
         Returns:
             Dictionary with refinement results
@@ -395,10 +422,10 @@ class MultiPhaseAnalyzer:
                 
                 self.lebail_engine.add_phase(phase_data, initial_params)
                 
-            # Perform refinement
+            # Perform refinement (reduced iterations for performance)
             refinement_results = self.lebail_engine.refine_phases(
-                max_iterations=30,
-                convergence_threshold=1e-5
+                max_iterations=max_iterations,
+                convergence_threshold=convergence_threshold
             )
             
             # Generate report
@@ -409,7 +436,12 @@ class MultiPhaseAnalyzer:
             
             # Cache refined phases for ultra-fast searching
             for refined_phase in refined_phases:
-                phase_id = refined_phase['phase'].get('id')
+                # Handle different phase data structures
+                if 'phase' in refined_phase:
+                    phase_id = refined_phase['phase'].get('id')
+                else:
+                    phase_id = refined_phase.get('id')
+                    
                 if phase_id:
                     self.refined_phases_cache[phase_id] = refined_phase
                     
@@ -455,7 +487,13 @@ class MultiPhaseAnalyzer:
         updated_phases = []
         
         for phase in candidate_phases:
-            phase_id = phase['phase'].get('id')
+            # Handle different phase data structures
+            if 'phase' in phase:
+                # Database search format: {'phase': {'id': ...}, ...}
+                phase_id = phase['phase'].get('id')
+            else:
+                # Pattern search format: {'id': ..., ...}
+                phase_id = phase.get('id')
             
             # Check if we have refined parameters for this phase
             if phase_id in self.refined_phases_cache:
@@ -468,7 +506,13 @@ class MultiPhaseAnalyzer:
                 updated_phase['search_priority'] = refined_phase['search_priority']
                 updated_phase['refined'] = True
                 
-                print(f"Using refined parameters for {phase['phase'].get('mineral', 'Unknown')}")
+                # Get phase name for logging
+                if 'phase' in phase:
+                    phase_name = phase['phase'].get('mineral', 'Unknown')
+                else:
+                    phase_name = phase.get('mineral', 'Unknown')
+                    
+                print(f"Using refined parameters for {phase_name}")
                 updated_phases.append(updated_phase)
             else:
                 # Use original phase data
