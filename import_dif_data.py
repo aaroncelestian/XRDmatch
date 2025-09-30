@@ -52,24 +52,24 @@ def parse_dif_file(filepath):
         
         amcsd_id = amcsd_match.group(1).zfill(7)  # Pad to 7 digits
         
-        # Extract mineral name - try multiple strategies
+        # Extract mineral name - NEW STRATEGY based on DIF format
+        # The mineral name comes on the first non-empty line of the section
+        # (which is right after _END_ from the previous section)
         lines = section.split('\n')
         mineral_name = None
         possible_names = []
         
-        # Strategy 1: Look for _chemical_name_mineral tag (most reliable)
+        # Strategy 1: First non-empty line is the mineral name
+        for line in lines[:5]:  # Check first 5 lines
+            line = line.strip()
+            if line and not line.startswith('='):
+                possible_names.append(line)
+                break  # Take the FIRST non-empty line
+        
+        # Strategy 2: Look for _chemical_name_mineral tag (backup)
         mineral_tag_match = re.search(r'_chemical_name_mineral\s+["\']?([^"\'\n]+)["\']?', section)
         if mineral_tag_match:
-            possible_names.append(mineral_tag_match.group(1).strip())
-        
-        # Strategy 2: Collect first few non-empty lines (may include both mineral and author)
-        for line in lines[:10]:  # Check first 10 lines
-            line = line.strip()
-            if line and not line.startswith('=') and not line.startswith('_') and len(line) < 100:
-                # Skip obvious non-mineral lines
-                if not any(x in line.lower() for x in ['copyright', 'reference', 'locality', 'american', 
-                                                         'mineralogist', 'database', 'code']):
-                    possible_names.append(line)
+            possible_names.insert(0, mineral_tag_match.group(1).strip())  # Prioritize this
         
         # Strategy 3: Validate against IMA database
         original_name = None
@@ -252,7 +252,16 @@ def import_to_database(minerals):
 
 def main():
     """Main import function"""
-    dif_file = 'data/difdata.txt'
+    # Try both possible filenames
+    import os
+    if os.path.exists('data/difdata.dif'):
+        dif_file = 'data/difdata.dif'
+    elif os.path.exists('data/difdata.txt'):
+        dif_file = 'data/difdata.txt'
+    else:
+        print("❌ Error: Could not find DIF file!")
+        print("   Looking for: data/difdata.dif or data/difdata.txt")
+        return
     
     print("Starting DIF data import...")
     print(f"Reading from: {dif_file}\n")

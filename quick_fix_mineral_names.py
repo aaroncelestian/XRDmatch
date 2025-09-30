@@ -38,9 +38,21 @@ def quick_fix_names():
     print("Validating and correcting names...")
     print("-"*70)
     
-    for mineral_id, mineral_name in minerals:
+    for idx, (mineral_id, mineral_name) in enumerate(minerals):
+        # Progress indicator
+        if (idx + 1) % 500 == 0:
+            print(f"  Progress: {idx+1}/{len(minerals)} ({100*(idx+1)/len(minerals):.1f}%)")
         # Skip empty names
         if not mineral_name or len(mineral_name) < 2:
+            continue
+        
+        # Skip obvious author names (contain initials or common patterns)
+        if any(pattern in mineral_name for pattern in [' A,', ' B,', ' C,', ' D,', ' E,', ' F,', ' G,', ' H,', 
+                                                         ' I,', ' J,', ' K,', ' L,', ' M,', ' N,', ' O,', ' P,',
+                                                         ' Q,', ' R,', ' S,', ' T,', ' U,', ' V,', ' W,', ' X,',
+                                                         ' Y,', ' Z,']):
+            suspicious.append((mineral_name, 1, "Author name pattern"))
+            not_found += 1
             continue
         
         # Check if it's already correct (exact match)
@@ -50,7 +62,7 @@ def quick_fix_names():
             exact_matches += 1
             continue
         
-        # Try fuzzy match to find correct name
+        # Try fuzzy match to find correct name (only for reasonable candidates)
         fuzzy_result = ima_db.fuzzy_match_mineral(mineral_name, threshold=0.80)
         if fuzzy_result:
             correct_name, score, ima_info = fuzzy_result
