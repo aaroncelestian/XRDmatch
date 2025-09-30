@@ -1122,6 +1122,20 @@ class LocalCIFDatabase:
                             data['cell_a'] = float(parts[0])
                             data['cell_b'] = float(parts[1])
                             data['cell_c'] = float(parts[2])
+                            data['cell_alpha'] = float(parts[3])
+                            data['cell_beta'] = float(parts[4])
+                            data['cell_gamma'] = float(parts[5])
+                    except:
+                        pass
+                
+                # Look for space group
+                if 'SPACE GROUP:' in line:
+                    try:
+                        # Extract space group after 'SPACE GROUP:'
+                        space_group = line.split('SPACE GROUP:')[1].strip()
+                        # Remove any trailing whitespace or comments
+                        data['space_group'] = space_group.split()[0] if space_group else 'Unknown'
+                        print(f"   Space Group: {data['space_group']}")
                     except:
                         pass
                 
@@ -1440,34 +1454,50 @@ class LocalCIFDatabase:
             min_d_spacing: Minimum d-spacing (not used for retrieval, kept for compatibility)
             
         Returns:
-            Dictionary with 'two_theta', 'intensity', 'd_spacing' arrays converted to target wavelength or None
+            Dictionary with 'two_theta', 'intensity', 'd_spacing' arrays and unit cell parameters or None
         """
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
             
-            # Always look for Cu Kα pattern (our reference wavelength)
-            # Prefer AMCSD_DIF over other calculation methods
-            reference_wavelength = 1.5406
+            # First get mineral metadata including unit cell parameters
             cursor.execute('''
-                SELECT two_theta, intensities, d_spacings FROM diffraction_patterns
-                WHERE mineral_id = ? AND wavelength = ?
+                SELECT mineral_name, chemical_formula, space_group,
+                       cell_a, cell_b, cell_c, cell_alpha, cell_beta, cell_gamma
+                FROM minerals
+                WHERE id = ?
+            ''', (mineral_id,))
+            
+            mineral_data = cursor.fetchone()
+            if not mineral_data:
+                conn.close()
+                return None
+            
+            mineral_name, formula, space_group, cell_a, cell_b, cell_c, cell_alpha, cell_beta, cell_gamma = mineral_data
+            
+            # Look for Cu Kα pattern (our reference wavelength)
+            # Try both common Cu Kα wavelengths and prefer AMCSD_DIF over other calculation methods
+            # First try exact match for 1.541838 (AMCSD standard), then 1.5406 (Cu Kα1)
+            cursor.execute('''
+                SELECT two_theta, intensities, d_spacings, wavelength FROM diffraction_patterns
+                WHERE mineral_id = ? AND (wavelength BETWEEN 1.5400 AND 1.5420)
                 ORDER BY 
                     CASE calculation_method 
                         WHEN 'AMCSD_DIF' THEN 1
                         WHEN 'pymatgen' THEN 2
                         ELSE 3
                     END,
-                    max_two_theta DESC, 
-                    min_d_spacing ASC
+                    wavelength DESC,
+                    COALESCE(max_two_theta, 90.0) DESC, 
+                    COALESCE(min_d_spacing, 0.5) ASC
                 LIMIT 1
-            ''', (mineral_id, reference_wavelength))
+            ''', (mineral_id,))
             
             result = cursor.fetchone()
             conn.close()
             
             if result:
-                two_theta_json, intensities_json, d_spacings_json = result
+                two_theta_json, intensities_json, d_spacings_json, reference_wavelength = result
                 
                 # Load the reference data - handle both JSON and comma-separated formats
                 try:
@@ -1508,14 +1538,32 @@ class LocalCIFDatabase:
                     return {
                         'two_theta': np.array(new_two_theta),
                         'intensity': np.array(valid_intensities),
-                        'd_spacing': np.array(valid_d_spacings)
+                        'd_spacing': np.array(valid_d_spacings),
+                        'mineral_name': mineral_name,
+                        'chemical_formula': formula,
+                        'space_group': space_group,
+                        'cell_a': cell_a,
+                        'cell_b': cell_b,
+                        'cell_c': cell_c,
+                        'cell_alpha': cell_alpha,
+                        'cell_beta': cell_beta,
+                        'cell_gamma': cell_gamma
                     }
                 else:
                     # Same wavelength, return as-is
                     return {
                         'two_theta': ref_two_theta,
                         'intensity': intensities,
-                        'd_spacing': d_spacings
+                        'd_spacing': d_spacings,
+                        'mineral_name': mineral_name,
+                        'chemical_formula': formula,
+                        'space_group': space_group,
+                        'cell_a': cell_a,
+                        'cell_b': cell_b,
+                        'cell_c': cell_c,
+                        'cell_alpha': cell_alpha,
+                        'cell_beta': cell_beta,
+                        'cell_gamma': cell_gamma
                     }
             
             return None

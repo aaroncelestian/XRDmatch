@@ -217,6 +217,14 @@ class PhaseMatchingThread(QThread):
                 
                 if pre_calculated:
                     print(f"✅ Using pre-calculated diffraction pattern ({len(pre_calculated['two_theta'])} peaks)")
+                    # Update phase dictionary with unit cell parameters from database
+                    if 'cell_a' in pre_calculated:
+                        phase['cell_a'] = pre_calculated['cell_a']
+                        phase['cell_b'] = pre_calculated['cell_b']
+                        phase['cell_c'] = pre_calculated['cell_c']
+                        phase['cell_alpha'] = pre_calculated['cell_alpha']
+                        phase['cell_beta'] = pre_calculated['cell_beta']
+                        phase['cell_gamma'] = pre_calculated['cell_gamma']
                     return pre_calculated
                 else:
                     print("No pre-calculated pattern found, calculating from CIF...")

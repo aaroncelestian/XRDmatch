@@ -177,8 +177,16 @@ class XRDMainWindow(QMainWindow):
             
     def import_to_visualization(self):
         """Import data from matching tab to visualization tab"""
-        # Get experimental pattern and matched phases from matching tab
-        experimental_pattern = self.matching_tab.experimental_pattern
+        # Get experimental pattern - prefer processed data from processing tab if available
+        experimental_pattern = None
+        
+        # Check if we have processed data from the processing tab
+        if self.processing_tab.processed_pattern_data is not None:
+            experimental_pattern = self.processing_tab.processed_pattern_data
+            print("Using processed pattern from Data Processing tab")
+        elif self.matching_tab.experimental_pattern is not None:
+            experimental_pattern = self.matching_tab.experimental_pattern
+            print("Using original pattern from Pattern Data tab")
         
         if not experimental_pattern:
             QMessageBox.warning(
@@ -205,7 +213,9 @@ class XRDMainWindow(QMainWindow):
         # Switch to visualization tab
         self.tab_widget.setCurrentWidget(self.visualization_tab)
         
-        self.status_bar.showMessage(f"Imported {len(matched_phases)} phase(s) to visualization")
+        # Update status message to indicate which data was used
+        data_source = "processed" if self.processing_tab.processed_pattern_data is not None else "original"
+        self.status_bar.showMessage(f"Imported {len(matched_phases)} phase(s) to visualization ({data_source} data)")
         
     def show_about(self):
         """Show about dialog"""

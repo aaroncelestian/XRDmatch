@@ -7,14 +7,13 @@ import numpy as np
 from scipy.optimize import minimize, differential_evolution
 from scipy.interpolate import interp1d
 from scipy.special import wofz
-from typing import Dict, List, Tuple, Optional, Union
+from typing import Dict, List, Tuple, Optional
 import copy
 import warnings
 warnings.filterwarnings('ignore')
 
 class LeBailRefinement:
-    """
-    Le Bail refinement engine for optimizing phase fits in XRD patterns
+    """Le Bail refinement engine for multi-phase XRD analysis
     
     Features:
     - Profile function refinement (pseudo-Voigt, Pearson VII)
@@ -24,21 +23,38 @@ class LeBailRefinement:
     - Goodness-of-fit statistics (R-factors, chi-squared)
     """
     
+    # Class variable for real-time plotting callback
+    plot_callback = None
+    
     def __init__(self):
         self.experimental_data = None
         self.phases = []
         self.refined_parameters = {}
         self.refinement_history = []
         self.r_factors = {}
+        self.two_theta_range = None  # Optional 2-theta range (min, max)
         
     def set_experimental_data(self, two_theta: np.ndarray, intensity: np.ndarray, 
-                            errors: Optional[np.ndarray] = None):
-        """Set experimental diffraction data"""
+                            errors: Optional[np.ndarray] = None,
+                            two_theta_range: Optional[Tuple[float, float]] = None):
+        """Set experimental diffraction data
+        
+        Args:
+            two_theta: 2-theta values in degrees
+            intensity: Intensity values
+            errors: Optional error values (defaults to sqrt(intensity))
+            two_theta_range: Optional (min, max) 2-theta range to limit refinement
+        """
         self.experimental_data = {
             'two_theta': np.array(two_theta),
             'intensity': np.array(intensity),
             'errors': np.array(errors) if errors is not None else np.sqrt(np.maximum(intensity, 1))
         }
+        self.two_theta_range = two_theta_range
+        
+        # Apply 2-theta range filter if specified
+        if self.two_theta_range is not None:
+            self._apply_two_theta_filter()
         
     def add_phase(self, phase_data: Dict, initial_parameters: Optional[Dict] = None):
         """
@@ -62,11 +78,20 @@ class LeBailRefinement:
             'unit_cell': self._extract_unit_cell(phase_data),
             'refine_cell': True,
             'refine_profile': True,
-            'refine_scale': True
+            'refine_scale': True,
+            'refine_intensities': False  # Pawley-style intensity refinement
         }
         
         if initial_parameters:
             default_params.update(initial_parameters)
+        
+        # Initialize individual peak intensity multipliers for Pawley refinement
+        n_peaks = len(phase_data['theoretical_peaks'].get('two_theta', []))
+        if default_params.get('refine_intensities', False):
+            # Start all intensity multipliers at 1.0
+            default_params['peak_intensity_multipliers'] = np.ones(n_peaks)
+        else:
+            default_params['peak_intensity_multipliers'] = None
             
         phase = {
             'data': phase_data,
@@ -75,47 +100,154 @@ class LeBailRefinement:
         }
         
         self.phases.append(phase)
+    
+    def _apply_two_theta_filter(self):
+        """Apply 2-theta range filter to experimental data"""
+        if self.two_theta_range is None:
+            return
+        
+        # Store original data if not already stored (to prevent double-filtering)
+        if not hasattr(self, '_original_experimental_data'):
+            self._original_experimental_data = {
+                'two_theta': self.experimental_data['two_theta'].copy(),
+                'intensity': self.experimental_data['intensity'].copy(),
+                'errors': self.experimental_data['errors'].copy()
+            }
+            
+        min_2theta, max_2theta = self.two_theta_range
+        two_theta = self._original_experimental_data['two_theta']
+        
+        # Create mask for the specified range
+        mask = (two_theta >= min_2theta) & (two_theta <= max_2theta)
+        
+        # Filter all data arrays from original data
+        self.experimental_data['two_theta'] = two_theta[mask]
+        self.experimental_data['intensity'] = self._original_experimental_data['intensity'][mask]
+        self.experimental_data['errors'] = self._original_experimental_data['errors'][mask]
+        
+        print(f"Applied 2-theta range filter: {min_2theta:.2f}° - {max_2theta:.2f}°")
+        print(f"Data points: {len(two_theta)} → {len(self.experimental_data['two_theta'])}")
         
     def _extract_unit_cell(self, phase_data: Dict) -> Dict:
         """Extract unit cell parameters from phase data"""
         phase_info = phase_data.get('phase', {})
         
-        # Try to get unit cell from phase data
+        # Try to get unit cell from phase data with proper defaults
         unit_cell = {
-            'a': phase_info.get('cell_a', 10.0),
-            'b': phase_info.get('cell_b', 10.0), 
-            'c': phase_info.get('cell_c', 10.0),
-            'alpha': phase_info.get('cell_alpha', 90.0),
-            'beta': phase_info.get('cell_beta', 90.0),
-            'gamma': phase_info.get('cell_gamma', 90.0)
+            'a': phase_info.get('cell_a', 10.0) if phase_info.get('cell_a') else 10.0,
+            'b': phase_info.get('cell_b', 10.0) if phase_info.get('cell_b') else 10.0, 
+            'c': phase_info.get('cell_c', 10.0) if phase_info.get('cell_c') else 10.0,
+            'alpha': phase_info.get('cell_alpha', 90.0) if phase_info.get('cell_alpha') else 90.0,
+            'beta': phase_info.get('cell_beta', 90.0) if phase_info.get('cell_beta') else 90.0,
+            'gamma': phase_info.get('cell_gamma', 90.0) if phase_info.get('cell_gamma') else 90.0
         }
         
         return unit_cell
         
     def refine_phases(self, max_iterations: int = 20, 
-                     convergence_threshold: float = 1e-5) -> Dict:
+                     convergence_threshold: float = 1e-5,
+                     two_theta_range: Optional[Tuple[float, float]] = None,
+                     staged_refinement: bool = True) -> Dict:
         """
         Perform Le Bail refinement on all phases
         
         Args:
             max_iterations: Maximum number of refinement cycles (reduced for performance)
             convergence_threshold: Convergence criterion for R-factors
+            two_theta_range: Optional (min, max) 2-theta range to limit refinement
+            staged_refinement: Use staged refinement (unit cell first, then profile)
             
         Returns:
             Dictionary with refinement results
         """
+        # Update 2-theta range if provided
+        if two_theta_range is not None and two_theta_range != self.two_theta_range:
+            self.two_theta_range = two_theta_range
+            self._apply_two_theta_filter()
         if not self.experimental_data or not self.phases:
             raise ValueError("Must set experimental data and add phases before refinement")
             
         print(f"Starting Le Bail refinement with {len(self.phases)} phases")
         print(f"Experimental data: {len(self.experimental_data['two_theta'])} points")
         
+        # Check for Pawley mode and warn if too many peaks
+        total_pawley_params = 0
+        for phase in self.phases:
+            if phase['parameters'].get('refine_intensities', False):
+                n_peaks = len(phase['theoretical_peaks'].get('two_theta', []))
+                total_pawley_params += n_peaks
+        
+        if total_pawley_params > 0:
+            print(f"⚠️  Pawley mode enabled: refining {total_pawley_params} individual peak intensities")
+            if total_pawley_params > 100:
+                print(f"⚠️  WARNING: {total_pawley_params} intensity parameters may cause slow/unstable refinement")
+                print(f"   Consider using 2θ range to reduce number of peaks, or disable Pawley mode")
+        
+        if staged_refinement:
+            print("Using staged refinement: unit cell → profile parameters")
+            if total_pawley_params > 0:
+                print("  Stage 1: Pawley intensities disabled (too many parameters)")
+                print("  Stage 2: Pawley intensities enabled")
+        
         # Initialize refinement
         self.refinement_history = []
         previous_rwp = float('inf')
+        rwp_change = float('inf')  # Initialize to avoid reference error
         
-        for iteration in range(max_iterations):
-            print(f"\n=== Le Bail Iteration {iteration + 1} ===")
+        # STAGE 1: Refine unit cell and zero shift only (if staged refinement)
+        if staged_refinement:
+            print("\n=== STAGE 1: Unit Cell & Zero Shift Refinement ===")
+            # Temporarily disable profile refinement AND Pawley intensities in stage 1
+            # (too many parameters otherwise)
+            saved_intensity_settings = []
+            for phase in self.phases:
+                phase['parameters']['refine_profile'] = False
+                # Save and disable Pawley refinement for stage 1
+                saved_intensity_settings.append(phase['parameters'].get('refine_intensities', False))
+                phase['parameters']['refine_intensities'] = False
+            
+            # Run first stage (about 1/3 of iterations)
+            stage1_iterations = max(3, max_iterations // 3)
+            for iteration in range(stage1_iterations):
+                print(f"\nStage 1 - Iteration {iteration + 1}/{stage1_iterations}")
+                
+                for phase_idx, phase in enumerate(self.phases):
+                    phase_name = phase['data']['phase'].get('mineral', f'Phase_{phase_idx}')
+                    self._refine_single_phase(phase_idx)
+                
+                calculated_pattern = self._calculate_total_pattern()
+                r_factors = self._calculate_r_factors(calculated_pattern)
+                print(f"R-factors: Rp={r_factors['Rp']:.3f}, Rwp={r_factors['Rwp']:.3f}")
+                
+                iteration_result = {
+                    'iteration': iteration + 1,
+                    'stage': 1,
+                    'r_factors': r_factors.copy(),
+                    'parameters': copy.deepcopy([p['parameters'] for p in self.phases]),
+                    'calculated_pattern': calculated_pattern.copy()
+                }
+                self.refinement_history.append(iteration_result)
+            
+            # STAGE 2: Enable profile refinement and restore Pawley settings
+            print("\n=== STAGE 2: Profile Parameter Refinement (Constrained) ===")
+            for idx, phase in enumerate(self.phases):
+                phase['parameters']['refine_profile'] = True
+                # Restore Pawley intensity refinement setting
+                if idx < len(saved_intensity_settings):
+                    phase['parameters']['refine_intensities'] = saved_intensity_settings[idx]
+            
+            # Adjust remaining iterations
+            remaining_iterations = max_iterations - stage1_iterations
+            start_iteration = stage1_iterations
+        else:
+            remaining_iterations = max_iterations
+            start_iteration = 0
+        
+        # Main refinement loop (Stage 2 if staged, or full refinement if not)
+        for iteration in range(remaining_iterations):
+            actual_iteration = start_iteration + iteration + 1
+            stage_label = "Stage 2 - " if staged_refinement else ""
+            print(f"\n=== {stage_label}Le Bail Iteration {actual_iteration} ===")
             
             # Refine each phase sequentially
             for phase_idx, phase in enumerate(self.phases):
@@ -129,17 +261,36 @@ class LeBailRefinement:
             calculated_pattern = self._calculate_total_pattern()
             r_factors = self._calculate_r_factors(calculated_pattern)
             
+            # Calculate per-phase contributions and R-factors
+            phase_contributions = self._calculate_phase_contributions()
+            
             print(f"R-factors: Rp={r_factors['Rp']:.3f}, Rwp={r_factors['Rwp']:.3f}, "
                   f"GoF={r_factors['GoF']:.3f}")
             
+            # Print per-phase information
+            for phase_idx, phase in enumerate(self.phases):
+                phase_name = phase['data']['phase'].get('mineral', f'Phase_{phase_idx}')
+                scale = phase['parameters']['scale_factor']
+                phase_rwp = phase_contributions[phase_idx]['rwp']
+                contribution = phase_contributions[phase_idx]['contribution_percent']
+                print(f"  {phase_name}: Scale={scale:.3f}, Rwp={phase_rwp:.2f}%, Contribution={contribution:.1f}%")
+            
             # Store iteration results
             iteration_result = {
-                'iteration': iteration + 1,
+                'iteration': actual_iteration,
+                'stage': 2 if staged_refinement else 0,
                 'r_factors': r_factors.copy(),
                 'parameters': copy.deepcopy([p['parameters'] for p in self.phases]),
                 'calculated_pattern': calculated_pattern.copy()
             }
             self.refinement_history.append(iteration_result)
+            
+            # Real-time plotting callback
+            if self.plot_callback is not None:
+                try:
+                    self.plot_callback(iteration_result, self.experimental_data)
+                except Exception as e:
+                    print(f"Warning: Plot callback failed: {e}")
             
             # Check convergence
             rwp_change = abs(previous_rwp - r_factors['Rwp'])
@@ -156,7 +307,10 @@ class LeBailRefinement:
             'final_r_factors': self.refinement_history[-1]['r_factors'],
             'refined_phases': copy.deepcopy(self.phases),
             'calculated_pattern': self.refinement_history[-1]['calculated_pattern'],
-            'refinement_history': self.refinement_history
+            'refinement_history': self.refinement_history,
+            # Include the actual 2-theta and intensity arrays used in refinement
+            'two_theta': self.experimental_data['two_theta'].copy(),
+            'experimental_intensity': self.experimental_data['intensity'].copy()
         }
         
         self.r_factors = final_results['final_r_factors']
@@ -219,13 +373,14 @@ class LeBailRefinement:
         param_bounds = []
         param_names = []
         
-        # Scale factor
+        # Scale factor (use max_scale_bound if provided)
         if params.get('refine_scale', True):
             param_vector.append(params['scale_factor'])
-            param_bounds.append((0.01, 10.0))
+            max_scale = params.get('max_scale_bound', 10.0)
+            param_bounds.append((0.01, max_scale))
             param_names.append('scale_factor')
             
-        # Profile parameters
+        # Profile parameters (with tighter constraints to prevent excessive broadening)
         if params.get('refine_profile', True):
             param_vector.extend([
                 params['u_param'],
@@ -233,17 +388,18 @@ class LeBailRefinement:
                 params['w_param'],
                 params['eta_param']
             ])
+            # Tighter bounds to prevent peaks from broadening too much
             param_bounds.extend([
-                (0.0, 1.0),      # U
-                (-0.1, 0.1),     # V
-                (0.001, 1.0),    # W
-                (0.0, 1.0)       # eta
+                (0.0, 0.05),     # U - further reduced to 0.05
+                (-0.005, 0.005), # V - further reduced to ±0.005
+                (0.001, 0.05),   # W - further reduced to 0.05
+                (0.0, 1.0)       # eta - keep full range for Voigt mixing
             ])
             param_names.extend(['u_param', 'v_param', 'w_param', 'eta_param'])
             
-        # Zero shift
+        # Zero shift (tighter bounds to prevent excessive shifts)
         param_vector.append(params['zero_shift'])
-        param_bounds.append((-0.5, 0.5))
+        param_bounds.append((-0.1, 0.1))  # Reduced from ±0.5 to ±0.1 degrees
         param_names.append('zero_shift')
         
         # Unit cell parameters
@@ -263,6 +419,16 @@ class LeBailRefinement:
                 (c * 0.95, c * 1.05)
             ])
             param_names.extend(['cell_a', 'cell_b', 'cell_c'])
+        
+        # Individual peak intensity multipliers (Pawley refinement)
+        if params.get('refine_intensities', False) and params.get('peak_intensity_multipliers') is not None:
+            multipliers = params['peak_intensity_multipliers']
+            param_vector.extend(multipliers)
+            # Allow intensities to vary from 0.1x to 10x the theoretical value
+            # This handles preferred orientation
+            for i in range(len(multipliers)):
+                param_bounds.append((0.1, 10.0))
+                param_names.append(f'intensity_mult_{i}')
             
         return np.array(param_vector), param_bounds, param_names
         
@@ -270,14 +436,22 @@ class LeBailRefinement:
                             original_params: Dict) -> Dict:
         """Convert parameter vector back to parameter dictionary"""
         params = {}
+        intensity_multipliers = []
         
         for i, name in enumerate(names):
             if name.startswith('cell_'):
                 if 'unit_cell' not in params:
                     params['unit_cell'] = original_params['unit_cell'].copy()
                 params['unit_cell'][name[5:]] = vector[i]  # Remove 'cell_' prefix
+            elif name.startswith('intensity_mult_'):
+                # Collect intensity multipliers
+                intensity_multipliers.append(vector[i])
             else:
                 params[name] = vector[i]
+        
+        # Store intensity multipliers as array if any were found
+        if intensity_multipliers:
+            params['peak_intensity_multipliers'] = np.array(intensity_multipliers)
                 
         return params
         
@@ -300,10 +474,19 @@ class LeBailRefinement:
         scale_factor = parameters.get('scale_factor', 1.0)
         eta = parameters.get('eta_param', 0.5)
         
-        for pos, intensity, width in zip(shifted_positions, theo_peaks['intensity'], peak_widths):
+        # Get intensity multipliers if using Pawley refinement
+        intensity_multipliers = parameters.get('peak_intensity_multipliers')
+        
+        for idx, (pos, intensity, width) in enumerate(zip(shifted_positions, theo_peaks['intensity'], peak_widths)):
             if width > 0 and intensity > 0:
+                # Apply individual intensity multiplier if Pawley mode
+                if intensity_multipliers is not None and idx < len(intensity_multipliers):
+                    effective_intensity = intensity * scale_factor * intensity_multipliers[idx]
+                else:
+                    effective_intensity = intensity * scale_factor
+                
                 peak_profile = self._pseudo_voigt_profile(
-                    self.experimental_data['two_theta'], pos, width, intensity * scale_factor, eta
+                    self.experimental_data['two_theta'], pos, width, effective_intensity, eta
                 )
                 pattern += peak_profile
                 
@@ -385,6 +568,37 @@ class LeBailRefinement:
             
         return total_pattern
         
+    def _calculate_phase_contributions(self) -> List[Dict]:
+        """Calculate per-phase contributions and R-factors"""
+        contributions = []
+        obs = self.experimental_data['intensity']
+        errors = self.experimental_data['errors']
+        total_pattern = self._calculate_total_pattern()
+        
+        for phase_idx in range(len(self.phases)):
+            # Calculate this phase's pattern
+            phase_pattern = self._calculate_phase_pattern(phase_idx, self.phases[phase_idx]['parameters'])
+            
+            # Calculate contribution as fraction of total calculated intensity
+            total_intensity = np.sum(total_pattern)
+            phase_intensity = np.sum(phase_pattern)
+            contribution_percent = (phase_intensity / total_intensity * 100) if total_intensity > 0 else 0
+            
+            # Calculate Rwp for this phase alone vs experimental
+            residual = (obs - phase_pattern) / errors
+            rwp_num = np.sum(residual ** 2)
+            rwp_den = np.sum((obs / errors) ** 2)
+            phase_rwp = np.sqrt(rwp_num / rwp_den) * 100 if rwp_den > 0 else float('inf')
+            
+            contributions.append({
+                'phase_idx': phase_idx,
+                'contribution_percent': contribution_percent,
+                'rwp': phase_rwp,
+                'scale_factor': self.phases[phase_idx]['parameters']['scale_factor']
+            })
+        
+        return contributions
+    
     def _calculate_r_factors(self, calculated_pattern: np.ndarray) -> Dict[str, float]:
         """Calculate crystallographic R-factors"""
         obs = self.experimental_data['intensity']
@@ -506,6 +720,14 @@ class LeBailRefinement:
                 report.append(f"    a = {cell['a']:.4f} Å")
                 report.append(f"    b = {cell['b']:.4f} Å") 
                 report.append(f"    c = {cell['c']:.4f} Å")
+                report.append(f"    α = {cell['alpha']:.3f}°")
+                report.append(f"    β = {cell['beta']:.3f}°")
+                report.append(f"    γ = {cell['gamma']:.3f}°")
+            
+            # Show space group if available
+            space_group = phase['data']['phase'].get('space_group', 'Unknown')
+            if space_group and space_group != 'Unknown':
+                report.append(f"  Space group: {space_group}")
             report.append("")
             
         # Quality assessment

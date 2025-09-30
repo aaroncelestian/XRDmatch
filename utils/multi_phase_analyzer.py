@@ -371,7 +371,9 @@ class MultiPhaseAnalyzer:
     def perform_lebail_refinement(self, experimental_data: Dict, 
                                   identified_phases: List[Dict],
                                   max_iterations: int = 15,
-                                  convergence_threshold: float = 1e-5) -> Dict:
+                                  convergence_threshold: float = 1e-4,
+                                  two_theta_range: Optional[Tuple[float, float]] = None,
+                                  refinement_params: Optional[Dict] = None) -> Dict:
         """
         Perform Le Bail refinement on identified phases
         
@@ -380,6 +382,7 @@ class MultiPhaseAnalyzer:
             identified_phases: List of identified phases from sequential analysis
             max_iterations: Maximum number of refinement iterations (default: 15)
             convergence_threshold: Convergence threshold for refinement (default: 1e-5)
+            two_theta_range: Optional (min, max) 2-theta range to limit refinement
             
         Returns:
             Dictionary with refinement results
@@ -394,6 +397,8 @@ class MultiPhaseAnalyzer:
                 # Estimate errors as sqrt(intensity) for Poisson statistics
                 errors = np.sqrt(np.maximum(experimental_data['intensity'], 1))
                 
+            # Set experimental data WITHOUT range filtering
+            # The range will be applied in refine_phases() to avoid double-filtering
             self.lebail_engine.set_experimental_data(
                 experimental_data['two_theta'],
                 experimental_data['intensity'],
@@ -408,16 +413,36 @@ class MultiPhaseAnalyzer:
                 }
                 
                 # Set initial parameters based on sequential analysis results
+                # Use user-provided parameters if available, otherwise use defaults
+                if refinement_params:
+                    u_param = refinement_params.get('initial_u', 0.005)
+                    v_param = refinement_params.get('initial_v', 0.0)
+                    w_param = refinement_params.get('initial_w', 0.005)
+                    eta_param = refinement_params.get('initial_eta', 0.5)
+                    refine_cell = refinement_params.get('refine_cell', True)
+                    refine_profile = refinement_params.get('refine_profile', True)
+                    refine_intensities = refinement_params.get('refine_intensities', False)
+                else:
+                    u_param = 0.005
+                    v_param = 0.0
+                    w_param = 0.005
+                    eta_param = 0.5
+                    refine_cell = True
+                    refine_profile = True
+                    refine_intensities = False
+                
                 initial_params = {
                     'scale_factor': phase_result.get('optimized_scaling', 1.0),
-                    'u_param': 0.01,
-                    'v_param': -0.001,
-                    'w_param': 0.01,
-                    'eta_param': 0.5,
+                    'u_param': u_param,
+                    'v_param': v_param,
+                    'w_param': w_param,
+                    'eta_param': eta_param,
                     'zero_shift': 0.0,
-                    'refine_cell': True,
-                    'refine_profile': True,
-                    'refine_scale': True
+                    'refine_cell': refine_cell,
+                    'refine_profile': refine_profile,
+                    'refine_scale': True,
+                    'refine_intensities': refine_intensities,
+                    'max_scale_bound': refinement_params.get('max_scale', 10.0) if refinement_params else 10.0
                 }
                 
                 self.lebail_engine.add_phase(phase_data, initial_params)
@@ -425,7 +450,8 @@ class MultiPhaseAnalyzer:
             # Perform refinement (reduced iterations for performance)
             refinement_results = self.lebail_engine.refine_phases(
                 max_iterations=max_iterations,
-                convergence_threshold=convergence_threshold
+                convergence_threshold=convergence_threshold,
+                two_theta_range=two_theta_range
             )
             
             # Generate report

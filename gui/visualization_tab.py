@@ -91,6 +91,87 @@ class VisualizationTab(QWidget):
         settings_layout.addWidget(self.max_iter_spin)
         lebail_layout.addLayout(settings_layout)
         
+        # Initial FWHM setting
+        fwhm_layout = QHBoxLayout()
+        fwhm_layout.addWidget(QLabel("Initial FWHM:"))
+        self.initial_fwhm_spin = QDoubleSpinBox()
+        self.initial_fwhm_spin.setRange(0.01, 1.0)
+        self.initial_fwhm_spin.setValue(0.1)
+        self.initial_fwhm_spin.setSingleStep(0.01)
+        self.initial_fwhm_spin.setSuffix("°")
+        self.initial_fwhm_spin.setToolTip("Starting peak width (FWHM) in degrees. Smaller = narrower peaks.")
+        fwhm_layout.addWidget(self.initial_fwhm_spin)
+        lebail_layout.addLayout(fwhm_layout)
+        
+        # Scale factor bounds
+        scale_layout = QHBoxLayout()
+        scale_layout.addWidget(QLabel("Max Scale:"))
+        self.max_scale_spin = QDoubleSpinBox()
+        self.max_scale_spin.setRange(1.0, 1000.0)
+        self.max_scale_spin.setValue(100.0)
+        self.max_scale_spin.setSingleStep(10.0)
+        self.max_scale_spin.setToolTip("Maximum scale factor - higher allows peaks to be taller")
+        scale_layout.addWidget(self.max_scale_spin)
+        lebail_layout.addLayout(scale_layout)
+        
+        # Profile shape parameter
+        eta_layout = QHBoxLayout()
+        eta_layout.addWidget(QLabel("Peak Shape (η):"))
+        self.eta_spin = QDoubleSpinBox()
+        self.eta_spin.setRange(0.0, 1.0)
+        self.eta_spin.setValue(0.5)
+        self.eta_spin.setSingleStep(0.1)
+        self.eta_spin.setToolTip("0=Gaussian, 1=Lorentzian, 0.5=50/50 mix")
+        eta_layout.addWidget(self.eta_spin)
+        lebail_layout.addLayout(eta_layout)
+        
+        # Refinement options
+        self.refine_cell_check = QCheckBox("Refine Unit Cell")
+        self.refine_cell_check.setChecked(True)
+        self.refine_cell_check.setToolTip("Allow unit cell parameters to refine")
+        lebail_layout.addWidget(self.refine_cell_check)
+        
+        self.refine_profile_check = QCheckBox("Refine Peak Profile")
+        self.refine_profile_check.setChecked(True)
+        self.refine_profile_check.setToolTip("Allow peak width parameters to refine")
+        lebail_layout.addWidget(self.refine_profile_check)
+        
+        self.refine_intensities_check = QCheckBox("Refine Peak Intensities (Pawley)")
+        self.refine_intensities_check.setChecked(False)
+        self.refine_intensities_check.setToolTip("Allow individual peak intensities to refine freely.\nUse for preferred orientation or texture.\nWarning: Less stable than Le Bail.")
+        lebail_layout.addWidget(self.refine_intensities_check)
+        
+        # 2-theta range settings
+        range_label = QLabel("2θ Range (optional):")
+        lebail_layout.addWidget(range_label)
+        
+        range_layout = QHBoxLayout()
+        self.use_range_check = QCheckBox("Limit range")
+        self.use_range_check.setChecked(False)
+        self.use_range_check.stateChanged.connect(self._toggle_range_inputs)
+        range_layout.addWidget(self.use_range_check)
+        lebail_layout.addLayout(range_layout)
+        
+        range_inputs_layout = QHBoxLayout()
+        range_inputs_layout.addWidget(QLabel("Min:"))
+        self.min_2theta_spin = QDoubleSpinBox()
+        self.min_2theta_spin.setRange(0.0, 180.0)
+        self.min_2theta_spin.setValue(10.0)
+        self.min_2theta_spin.setSingleStep(1.0)
+        self.min_2theta_spin.setSuffix("°")
+        self.min_2theta_spin.setEnabled(False)
+        range_inputs_layout.addWidget(self.min_2theta_spin)
+        
+        range_inputs_layout.addWidget(QLabel("Max:"))
+        self.max_2theta_spin = QDoubleSpinBox()
+        self.max_2theta_spin.setRange(0.0, 180.0)
+        self.max_2theta_spin.setValue(90.0)
+        self.max_2theta_spin.setSingleStep(1.0)
+        self.max_2theta_spin.setSuffix("°")
+        self.max_2theta_spin.setEnabled(False)
+        range_inputs_layout.addWidget(self.max_2theta_spin)
+        lebail_layout.addLayout(range_inputs_layout)
+        
         self.lebail_progress = QProgressBar()
         self.lebail_progress.setVisible(False)
         lebail_layout.addWidget(self.lebail_progress)
@@ -266,6 +347,12 @@ class VisualizationTab(QWidget):
         splitter.setStretchFactor(1, 1)
         
         main_layout.addWidget(splitter)
+    
+    def _toggle_range_inputs(self):
+        """Enable/disable 2-theta range input fields"""
+        enabled = self.use_range_check.isChecked()
+        self.min_2theta_spin.setEnabled(enabled)
+        self.max_2theta_spin.setEnabled(enabled)
         
     def set_multi_phase_analyzer(self, analyzer):
         """Set the multi-phase analyzer for Le Bail refinement"""
@@ -361,13 +448,68 @@ class VisualizationTab(QWidget):
                 'errors': self.experimental_pattern.get('intensity_error')
             }
             
+            # Get 2-theta range if specified
+            two_theta_range = None
+            if self.use_range_check.isChecked():
+                min_2theta = self.min_2theta_spin.value()
+                max_2theta = self.max_2theta_spin.value()
+                
+                # Validate range
+                if min_2theta >= max_2theta:
+                    QMessageBox.warning(self, "Invalid Range", 
+                                      "Minimum 2θ must be less than maximum 2θ.")
+                    return
+                    
+                two_theta_range = (min_2theta, max_2theta)
+                print(f"Using 2θ range: {min_2theta}° - {max_2theta}°")
+            
+            # Set up real-time plotting callback
+            from utils.lebail_refinement import LeBailRefinement
+            LeBailRefinement.plot_callback = self._realtime_plot_callback
+            
+            # Get user-defined refinement parameters
+            initial_fwhm = self.initial_fwhm_spin.value()
+            max_scale = self.max_scale_spin.value()
+            initial_eta = self.eta_spin.value()
+            refine_cell = self.refine_cell_check.isChecked()
+            refine_profile = self.refine_profile_check.isChecked()
+            refine_intensities = self.refine_intensities_check.isChecked()
+            
+            # Calculate initial U, V, W from FWHM
+            # FWHM² ≈ U·tan²θ + V·tanθ + W, at low angles W dominates
+            initial_w = (initial_fwhm ** 2)
+            initial_u = initial_w * 0.1  # U is typically smaller
+            initial_v = 0.0  # V is often near zero
+            
+            print(f"Initial parameters: FWHM={initial_fwhm:.3f}°, W={initial_w:.6f}, U={initial_u:.6f}")
+            print(f"Max scale factor: {max_scale}, η={initial_eta:.2f}")
+            print(f"Refine cell: {refine_cell}, Refine profile: {refine_profile}")
+            print(f"Refine intensities (Pawley): {refine_intensities}")
+            
+            # Prepare refinement parameters
+            refinement_params = {
+                'initial_u': initial_u,
+                'initial_v': initial_v,
+                'initial_w': initial_w,
+                'initial_eta': initial_eta,
+                'max_scale': max_scale,
+                'refine_cell': refine_cell,
+                'refine_profile': refine_profile,
+                'refine_intensities': refine_intensities
+            }
+            
             # Run refinement
             max_iter = self.max_iter_spin.value()
             self.lebail_results = self.multi_phase_analyzer.perform_lebail_refinement(
                 experimental_data, 
                 self.matched_phases,
-                max_iterations=max_iter
+                max_iterations=max_iter,
+                two_theta_range=two_theta_range,
+                refinement_params=refinement_params
             )
+            
+            # Clear callback after refinement
+            LeBailRefinement.plot_callback = None
             
             if self.lebail_results['success']:
                 self.lebail_status.setText("✓ Refinement completed successfully!")
@@ -452,15 +594,28 @@ class VisualizationTab(QWidget):
             refinement_data = self.lebail_results['refinement_results']
             calculated_pattern = refinement_data['calculated_pattern']
             
-            ax.plot(two_theta, calculated_pattern,
+            # Use the 2-theta array from refinement (may be filtered)
+            refined_two_theta = refinement_data.get('two_theta', two_theta)
+            refined_intensity = refinement_data.get('experimental_intensity', intensity)
+            
+            # Plot refined experimental data (may be filtered range)
+            if len(refined_two_theta) != len(two_theta):
+                ax.plot(refined_two_theta, refined_intensity,
+                       color=self.plot_settings['exp_color'],
+                       linewidth=self.plot_settings['exp_linewidth'],
+                       label='Experimental (refined range)',
+                       alpha=0.8,
+                       linestyle='--')
+            
+            ax.plot(refined_two_theta, calculated_pattern,
                    color=self.plot_settings['calc_color'],
                    linewidth=self.plot_settings['calc_linewidth'],
                    label='Calculated (Le Bail)',
                    alpha=0.8)
             
             # Plot difference
-            difference = intensity - calculated_pattern
-            ax.plot(two_theta, difference,
+            difference = refined_intensity - calculated_pattern
+            ax.plot(refined_two_theta, difference,
                    color=self.plot_settings['diff_color'],
                    linewidth=self.plot_settings['diff_linewidth'],
                    label='Difference',
@@ -561,6 +716,47 @@ class VisualizationTab(QWidget):
     def update_setting(self, key: str, value):
         """Update a plot setting"""
         self.plot_settings[key] = value
+    
+    def _realtime_plot_callback(self, iteration_result, experimental_data):
+        """Callback for real-time plotting during refinement"""
+        from PyQt5.QtWidgets import QApplication
+        
+        # Update plot every iteration
+        two_theta = experimental_data['two_theta']
+        intensity = experimental_data['intensity']
+        calculated = iteration_result['calculated_pattern']
+        r_factors = iteration_result['r_factors']
+        
+        # Clear and redraw
+        self.figure.clear()
+        ax = self.figure.add_subplot(111)
+        
+        # Plot experimental
+        ax.plot(two_theta, intensity, 'b-', label='Experimental', alpha=0.7, linewidth=1.5)
+        
+        # Plot calculated
+        ax.plot(two_theta, calculated, 'r-', label='Calculated', alpha=0.7, linewidth=1.5)
+        
+        # Plot difference
+        difference = intensity - calculated
+        ax.plot(two_theta, difference, 'g-', label='Difference', alpha=0.5, linewidth=1.0)
+        
+        # Add iteration info
+        iteration = iteration_result['iteration']
+        stage = iteration_result.get('stage', 0)
+        stage_label = f"Stage {stage} - " if stage > 0 else ""
+        title = f"{stage_label}Iteration {iteration}: Rwp={r_factors['Rwp']:.2f}%, GoF={r_factors.get('GoF', 0):.2f}"
+        ax.set_title(title)
+        ax.set_xlabel('2θ (degrees)')
+        ax.set_ylabel('Intensity (a.u.)')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        self.figure.tight_layout()
+        self.canvas.draw()
+        
+        # Process events to update GUI
+        QApplication.processEvents()
         
     def export_plot(self, format: str):
         """Export the current plot"""

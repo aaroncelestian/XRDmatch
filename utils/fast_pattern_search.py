@@ -84,14 +84,33 @@ class FastPatternSearchEngine:
         conn = sqlite3.connect(self.local_db.db_path)
         cursor = conn.cursor()
         
+        # First, check what wavelengths are available in the database
+        cursor.execute('''
+            SELECT wavelength, COUNT(*) as cnt 
+            FROM diffraction_patterns 
+            GROUP BY wavelength 
+            ORDER BY cnt DESC 
+            LIMIT 1
+        ''')
+        wavelength_row = cursor.fetchone()
+        
+        if not wavelength_row:
+            print("❌ No diffraction patterns found in database")
+            conn.close()
+            return False
+        
+        primary_wavelength = wavelength_row[0]
+        print(f"   Using wavelength: {primary_wavelength} Å ({wavelength_row[1]} patterns)")
+        
         cursor.execute('''
             SELECT m.id, m.mineral_name, m.chemical_formula, m.space_group,
+                   m.cell_a, m.cell_b, m.cell_c, m.cell_alpha, m.cell_beta, m.cell_gamma,
                    dp.two_theta, dp.intensities, dp.d_spacings
             FROM minerals m
             JOIN diffraction_patterns dp ON m.id = dp.mineral_id
-            WHERE dp.wavelength = 1.5406
+            WHERE dp.wavelength = ?
             ORDER BY m.id
-        ''')
+        ''', (primary_wavelength,))
         
         rows = cursor.fetchall()
         num_minerals = len(rows)
@@ -109,7 +128,7 @@ class FastPatternSearchEngine:
         
         # Process each mineral
         for i, row in enumerate(rows):
-            mineral_id, mineral_name, formula, space_group, two_theta_json, intensities_json, d_spacings_json = row
+            mineral_id, mineral_name, formula, space_group, cell_a, cell_b, cell_c, cell_alpha, cell_beta, cell_gamma, two_theta_json, intensities_json, d_spacings_json = row
             
             try:
                 # Parse pattern data - handle both JSON and comma-separated formats
@@ -134,12 +153,18 @@ class FastPatternSearchEngine:
                 # Store in matrix
                 self.pattern_matrix[i, :] = continuous_pattern
                 
-                # Store metadata
+                # Store metadata including unit cell parameters
                 self.mineral_metadata.append({
                     'id': mineral_id,
                     'name': mineral_name,
                     'formula': formula,
                     'space_group': space_group,
+                    'cell_a': cell_a,
+                    'cell_b': cell_b,
+                    'cell_c': cell_c,
+                    'cell_alpha': cell_alpha,
+                    'cell_beta': cell_beta,
+                    'cell_gamma': cell_gamma,
                     'pattern_norm': pattern_norm
                 })
                 
@@ -155,6 +180,12 @@ class FastPatternSearchEngine:
                     'name': mineral_name,
                     'formula': formula,
                     'space_group': space_group,
+                    'cell_a': cell_a,
+                    'cell_b': cell_b,
+                    'cell_c': cell_c,
+                    'cell_alpha': cell_alpha,
+                    'cell_beta': cell_beta,
+                    'cell_gamma': cell_gamma,
                     'pattern_norm': 0
                 })
         
@@ -260,6 +291,12 @@ class FastPatternSearchEngine:
                 'mineral_name': metadata['name'],
                 'chemical_formula': metadata['formula'],
                 'space_group': metadata['space_group'],
+                'cell_a': metadata.get('cell_a'),
+                'cell_b': metadata.get('cell_b'),
+                'cell_c': metadata.get('cell_c'),
+                'cell_alpha': metadata.get('cell_alpha'),
+                'cell_beta': metadata.get('cell_beta'),
+                'cell_gamma': metadata.get('cell_gamma'),
                 'correlation': float(correlation),
                 'r_squared': float(correlation ** 2),
                 'search_method': 'ultra_fast_correlation'

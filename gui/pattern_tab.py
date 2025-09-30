@@ -85,7 +85,7 @@ class PatternTab(QWidget):
             "Fe Kα1 (1.9373)",
             "Cr Kα1 (2.2897)",
             "Mo Kα1 (0.7107)",
-            "Synchrotron (0.24105)",
+            "17 BM (0.24105)",
             "Custom"
         ])
         self.wavelength_combo.currentTextChanged.connect(self.wavelength_changed)

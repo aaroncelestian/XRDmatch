@@ -64,6 +64,7 @@ class PatternSearchEngine:
         
         cursor.execute('''
             SELECT DISTINCT m.id, m.mineral_name, m.chemical_formula, m.space_group,
+                   m.cell_a, m.cell_b, m.cell_c, m.cell_alpha, m.cell_beta, m.cell_gamma,
                    dp.two_theta, dp.intensities, dp.d_spacings
             FROM minerals m
             JOIN diffraction_patterns dp ON m.id = dp.mineral_id
@@ -75,7 +76,7 @@ class PatternSearchEngine:
         processed = 0
         
         for row in cursor.fetchall():
-            mineral_id, mineral_name, formula, space_group, two_theta_json, intensities_json, d_spacings_json = row
+            mineral_id, mineral_name, formula, space_group, cell_a, cell_b, cell_c, cell_alpha, cell_beta, cell_gamma, two_theta_json, intensities_json, d_spacings_json = row
             
             try:
                 # Parse JSON data
@@ -101,6 +102,12 @@ class PatternSearchEngine:
                         'mineral_name': mineral_name,
                         'chemical_formula': formula,
                         'space_group': space_group,
+                        'cell_a': cell_a,
+                        'cell_b': cell_b,
+                        'cell_c': cell_c,
+                        'cell_alpha': cell_alpha,
+                        'cell_beta': cell_beta,
+                        'cell_gamma': cell_gamma,
                         'match_score': match_result['match_score'],
                         'intensity_score': match_result['intensity_score'],
                         'num_matches': match_result['num_matches'],
@@ -183,6 +190,7 @@ class PatternSearchEngine:
         
         cursor.execute('''
             SELECT DISTINCT m.id, m.mineral_name, m.chemical_formula, m.space_group,
+                   m.cell_a, m.cell_b, m.cell_c, m.cell_alpha, m.cell_beta, m.cell_gamma,
                    dp.two_theta, dp.intensities, dp.d_spacings
             FROM minerals m
             JOIN diffraction_patterns dp ON m.id = dp.mineral_id
@@ -193,7 +201,7 @@ class PatternSearchEngine:
         processed = 0
         
         for row in cursor.fetchall():
-            mineral_id, mineral_name, formula, space_group, two_theta_json, intensities_json, d_spacings_json = row
+            mineral_id, mineral_name, formula, space_group, cell_a, cell_b, cell_c, cell_alpha, cell_beta, cell_gamma, two_theta_json, intensities_json, d_spacings_json = row
             
             try:
                 # Parse theoretical pattern
@@ -219,6 +227,12 @@ class PatternSearchEngine:
                         'mineral_name': mineral_name,
                         'chemical_formula': formula,
                         'space_group': space_group,
+                        'cell_a': cell_a,
+                        'cell_b': cell_b,
+                        'cell_c': cell_c,
+                        'cell_alpha': cell_alpha,
+                        'cell_beta': cell_beta,
+                        'cell_gamma': cell_gamma,
                         'correlation': correlation_result['correlation'],
                         'r_squared': correlation_result['r_squared'],
                         'overlap_fraction': correlation_result['overlap_fraction'],

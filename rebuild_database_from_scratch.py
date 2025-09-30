@@ -49,6 +49,15 @@ def create_new_database():
             mineral_name TEXT NOT NULL,
             chemical_formula TEXT,
             space_group TEXT,
+            crystal_system TEXT,
+            cell_a REAL,
+            cell_b REAL,
+            cell_c REAL,
+            cell_alpha REAL,
+            cell_beta REAL,
+            cell_gamma REAL,
+            cell_volume REAL,
+            density REAL,
             amcsd_id TEXT UNIQUE,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
@@ -63,10 +72,12 @@ def create_new_database():
             two_theta TEXT NOT NULL,
             intensities TEXT NOT NULL,
             d_spacings TEXT NOT NULL,
+            max_two_theta REAL DEFAULT 90.0,
+            min_d_spacing REAL DEFAULT 0.5,
             calculation_method TEXT DEFAULT 'AMCSD_DIF',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (mineral_id) REFERENCES minerals (id),
-            UNIQUE (mineral_id, wavelength)
+            UNIQUE (mineral_id, wavelength, max_two_theta, min_d_spacing)
         )
     ''')
     
@@ -130,7 +141,19 @@ def parse_dif_file(filepath):
         space_group = None
         sg_match = re.search(r'SPACE GROUP:\s+(.+)', section)
         if sg_match:
-            space_group = sg_match.group(1).strip()
+            space_group = sg_match.group(1).strip().split()[0]  # Take first word only
+        
+        # Extract unit cell parameters
+        cell_a, cell_b, cell_c = None, None, None
+        cell_alpha, cell_beta, cell_gamma = None, None, None
+        cell_match = re.search(r'CELL PARAMETERS:\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)', section)
+        if cell_match:
+            cell_a = float(cell_match.group(1))
+            cell_b = float(cell_match.group(2))
+            cell_c = float(cell_match.group(3))
+            cell_alpha = float(cell_match.group(4))
+            cell_beta = float(cell_match.group(5))
+            cell_gamma = float(cell_match.group(6))
         
         # Extract wavelength
         wavelength = 1.5406
@@ -167,6 +190,12 @@ def parse_dif_file(filepath):
             'mineral_name': mineral_name,
             'amcsd_id': amcsd_id,
             'space_group': space_group,
+            'cell_a': cell_a,
+            'cell_b': cell_b,
+            'cell_c': cell_c,
+            'cell_alpha': cell_alpha,
+            'cell_beta': cell_beta,
+            'cell_gamma': cell_gamma,
             'wavelength': wavelength,
             'two_theta': np.array(two_theta),
             'intensities': np.array(intensities),
@@ -199,11 +228,15 @@ def import_to_database(minerals):
         if existing:
             mineral_id = existing[0]
         else:
-            # Insert mineral
+            # Insert mineral with unit cell parameters
             cursor.execute('''
-                INSERT INTO minerals (mineral_name, chemical_formula, space_group, amcsd_id)
-                VALUES (?, NULL, ?, ?)
-            ''', (mineral_data['mineral_name'], mineral_data['space_group'], mineral_data['amcsd_id']))
+                INSERT INTO minerals (mineral_name, chemical_formula, space_group, 
+                                    cell_a, cell_b, cell_c, cell_alpha, cell_beta, cell_gamma, amcsd_id)
+                VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (mineral_data['mineral_name'], mineral_data.get('space_group'), 
+                  mineral_data.get('cell_a'), mineral_data.get('cell_b'), mineral_data.get('cell_c'),
+                  mineral_data.get('cell_alpha'), mineral_data.get('cell_beta'), mineral_data.get('cell_gamma'),
+                  mineral_data['amcsd_id']))
             
             mineral_id = cursor.lastrowid
         
@@ -269,7 +302,7 @@ def main():
     create_new_database()
     
     # Step 3: Parse DIF file
-    minerals = parse_dif_file('data/difdata.txt')
+    minerals = parse_dif_file('data/difdata.dif')
     
     if not minerals:
         print("✗ No minerals parsed!")
