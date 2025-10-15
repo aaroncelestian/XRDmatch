@@ -42,13 +42,34 @@ class LeBailRefinement:
         Args:
             two_theta: 2-theta values in degrees
             intensity: Intensity values
+                      IMPORTANT: Should be background-subtracted intensity
+                      Background subtraction must be performed before Le Bail refinement
+                      to avoid fitting the background as part of the diffraction pattern
             errors: Optional error values (defaults to sqrt(intensity))
             two_theta_range: Optional (min, max) 2-theta range to limit refinement
         """
+        # Normalize intensity to 0-100 scale for better numerical stability
+        intensity = np.array(intensity)
+        max_intensity = np.max(intensity)
+        
+        if max_intensity > 0:
+            normalized_intensity = (intensity / max_intensity) * 100.0
+            print(f"Normalized experimental intensity: {max_intensity:.0f} → 100.0")
+        else:
+            normalized_intensity = intensity
+        
+        # Scale errors proportionally
+        if errors is not None:
+            errors = np.array(errors)
+            normalized_errors = (errors / max_intensity) * 100.0 if max_intensity > 0 else errors
+        else:
+            normalized_errors = np.sqrt(np.maximum(normalized_intensity, 1))
+        
         self.experimental_data = {
             'two_theta': np.array(two_theta),
-            'intensity': np.array(intensity),
-            'errors': np.array(errors) if errors is not None else np.sqrt(np.maximum(intensity, 1))
+            'intensity': normalized_intensity,
+            'errors': normalized_errors,
+            'original_max_intensity': max_intensity  # Store for reference
         }
         self.two_theta_range = two_theta_range
         
@@ -66,10 +87,13 @@ class LeBailRefinement:
         """
         if 'theoretical_peaks' not in phase_data:
             raise ValueError("Phase data must include theoretical_peaks")
+        
+        # Estimate initial scale factor from intensity ratio
+        initial_scale = self._estimate_initial_scale(phase_data['theoretical_peaks'])
             
         # Default refinement parameters
         default_params = {
-            'scale_factor': 1.0,
+            'scale_factor': initial_scale,
             'u_param': 0.01,      # Peak width parameter U
             'v_param': -0.001,    # Peak width parameter V  
             'w_param': 0.01,      # Peak width parameter W
@@ -128,6 +152,59 @@ class LeBailRefinement:
         print(f"Applied 2-theta range filter: {min_2theta:.2f}° - {max_2theta:.2f}°")
         print(f"Data points: {len(two_theta)} → {len(self.experimental_data['two_theta'])}")
         
+    def _estimate_initial_scale(self, theoretical_peaks: Dict) -> float:
+        """
+        Estimate initial scale factor by comparing experimental and theoretical intensities
+        
+        Both experimental and theoretical are now normalized to 0-100 scale, so the
+        initial scale should be close to 1.0, but we still estimate it for better convergence.
+        
+        Args:
+            theoretical_peaks: Dictionary with 'two_theta' and 'intensity' arrays
+            
+        Returns:
+            Estimated scale factor
+        """
+        if not self.experimental_data:
+            return 1.0
+            
+        exp_two_theta = self.experimental_data['two_theta']
+        exp_intensity = self.experimental_data['intensity']
+        theo_two_theta = np.array(theoretical_peaks.get('two_theta', []))
+        theo_intensity = np.array(theoretical_peaks.get('intensity', []))
+        
+        if len(theo_two_theta) == 0 or len(exp_two_theta) == 0:
+            return 1.0
+        
+        # Find overlapping 2θ range
+        exp_min, exp_max = np.min(exp_two_theta), np.max(exp_two_theta)
+        theo_min, theo_max = np.min(theo_two_theta), np.max(theo_two_theta)
+        overlap_min = max(exp_min, theo_min)
+        overlap_max = min(exp_max, theo_max)
+        
+        if overlap_min >= overlap_max:
+            return 1.0
+        
+        # Get max intensities in overlapping region
+        exp_mask = (exp_two_theta >= overlap_min) & (exp_two_theta <= overlap_max)
+        theo_mask = (theo_two_theta >= overlap_min) & (theo_two_theta <= overlap_max)
+        
+        if not np.any(exp_mask) or not np.any(theo_mask):
+            return 1.0
+        
+        exp_max_intensity = np.max(exp_intensity[exp_mask])
+        theo_max_intensity = np.max(theo_intensity[theo_mask])
+        
+        if theo_max_intensity > 0:
+            # Both are normalized to 0-100, so scale should be close to 1.0
+            # Target 80% of experimental max for initial estimate
+            initial_scale = (exp_max_intensity * 0.8) / theo_max_intensity
+            print(f"Estimated initial scale factor: {initial_scale:.3f}")
+            print(f"  (Normalized exp max: {exp_max_intensity:.1f}, theo max: {theo_max_intensity:.1f})")
+            return initial_scale
+        
+        return 1.0
+    
     def _extract_unit_cell(self, phase_data: Dict) -> Dict:
         """Extract unit cell parameters from phase data"""
         phase_info = phase_data.get('phase', {})
@@ -348,6 +425,10 @@ class LeBailRefinement:
             
         # Optimize parameters
         try:
+            # Print initial objective value
+            initial_obj = objective(param_vector)
+            print(f"  Initial objective: {initial_obj:.2e}")
+            
             result = minimize(
                 objective,
                 param_vector,
@@ -359,6 +440,15 @@ class LeBailRefinement:
             if result.success:
                 # Update phase parameters
                 optimized_params = self._vector_to_parameters(result.x, param_names, params)
+                
+                # Check if scale factor collapsed
+                if 'scale_factor' in optimized_params:
+                    final_scale = optimized_params['scale_factor']
+                    initial_scale = params['scale_factor']
+                    if final_scale < initial_scale * 0.2:
+                        print(f"  ⚠️  WARNING: Scale collapsed from {initial_scale:.3f} to {final_scale:.3f}")
+                        print(f"     This usually means wrong phase or FWHM mismatch")
+                
                 phase['parameters'].update(optimized_params)
                 
                 # Update theoretical peaks with new parameters
@@ -374,11 +464,26 @@ class LeBailRefinement:
         param_names = []
         
         # Scale factor (use max_scale_bound if provided)
-        if params.get('refine_scale', True):
-            param_vector.append(params['scale_factor'])
+        # In Le Bail mode with intensity extraction, scale factor is not needed
+        # Only refine scale in Pawley mode
+        is_pawley = params.get('refine_intensities', False)
+        
+        if params.get('refine_scale', True) and is_pawley:
+            initial_scale = params['scale_factor']
+            param_vector.append(initial_scale)
             max_scale = params.get('max_scale_bound', 10.0)
-            param_bounds.append((0.01, max_scale))
+            
+            # With normalized data (0-100), scale should be close to 1.0
+            # Set bounds relative to initial estimate to prevent collapse
+            min_scale = max(0.01, initial_scale * 0.1)  # At least 10% of initial
+            max_scale_adjusted = min(max_scale, initial_scale * 10.0)  # At most 10x initial
+            
+            param_bounds.append((min_scale, max_scale_adjusted))
             param_names.append('scale_factor')
+            print(f"  Scale bounds: {min_scale:.3f} - {max_scale_adjusted:.3f} (initial: {initial_scale:.3f})")
+        elif params.get('refine_scale', True):
+            # Le Bail mode: scale factor fixed at 1.0 (not refined)
+            print(f"  Scale factor: 1.0 (fixed, using observed intensities)")
             
         # Profile parameters (with tighter constraints to prevent excessive broadening)
         if params.get('refine_profile', True):
@@ -456,7 +561,7 @@ class LeBailRefinement:
         return params
         
     def _calculate_phase_pattern(self, phase_idx: int, parameters: Dict) -> np.ndarray:
-        """Calculate diffraction pattern for a single phase"""
+        """Calculate diffraction pattern for a single phase using Le Bail intensity extraction"""
         phase = self.phases[phase_idx]
         theo_peaks = phase['theoretical_peaks']
         
@@ -476,14 +581,22 @@ class LeBailRefinement:
         
         # Get intensity multipliers if using Pawley refinement
         intensity_multipliers = parameters.get('peak_intensity_multipliers')
+        is_pawley = intensity_multipliers is not None
+        
+        # For Le Bail: extract intensities using proper partitioning
+        if not is_pawley:
+            extracted_intensities = self._extract_lebail_intensities(
+                shifted_positions, peak_widths, eta, parameters
+            )
         
         for idx, (pos, intensity, width) in enumerate(zip(shifted_positions, theo_peaks['intensity'], peak_widths)):
             if width > 0 and intensity > 0:
-                # Apply individual intensity multiplier if Pawley mode
-                if intensity_multipliers is not None and idx < len(intensity_multipliers):
+                if is_pawley:
+                    # Pawley mode: free intensity parameters
                     effective_intensity = intensity * scale_factor * intensity_multipliers[idx]
                 else:
-                    effective_intensity = intensity * scale_factor
+                    # Le Bail mode: use extracted intensities
+                    effective_intensity = extracted_intensities[idx]
                 
                 peak_profile = self._pseudo_voigt_profile(
                     self.experimental_data['two_theta'], pos, width, effective_intensity, eta
@@ -491,6 +604,52 @@ class LeBailRefinement:
                 pattern += peak_profile
                 
         return pattern
+    
+    def _extract_lebail_intensities(self, positions: np.ndarray, widths: np.ndarray, 
+                                     eta: float, parameters: Dict) -> np.ndarray:
+        """
+        Fast intensity extraction for Le Bail refinement
+        
+        Uses a simplified approach: extract peak height from observed data
+        with background subtraction from neighboring peaks.
+        Much faster than full partitioning, works well in practice.
+        """
+        exp_2theta = self.experimental_data['two_theta']
+        exp_intensity = self.experimental_data['intensity']
+        n_peaks = len(positions)
+        
+        # Initialize extracted intensities
+        extracted_intensities = np.zeros(n_peaks)
+        
+        # For each peak, extract intensity from observed pattern
+        for idx, (pos, width) in enumerate(zip(positions, widths)):
+            if width <= 0:
+                continue
+            
+            # Find closest experimental point
+            closest_idx = np.argmin(np.abs(exp_2theta - pos))
+            
+            # Define a narrow window around peak (±1 FWHM for peak height)
+            step = np.mean(np.diff(exp_2theta))
+            window_half = max(1, int(width / step))
+            start_idx = max(0, closest_idx - window_half)
+            end_idx = min(len(exp_intensity), closest_idx + window_half + 1)
+            
+            if start_idx >= end_idx:
+                continue
+            
+            # Extract maximum intensity in window (peak height)
+            # This is the observed intensity for this peak
+            peak_intensity = np.max(exp_intensity[start_idx:end_idx])
+            
+            # Simple background estimate from edges of window
+            if start_idx > 0 and end_idx < len(exp_intensity):
+                background = (exp_intensity[start_idx] + exp_intensity[end_idx-1]) / 2
+                peak_intensity = max(0, peak_intensity - background)
+            
+            extracted_intensities[idx] = peak_intensity
+        
+        return extracted_intensities
         
     def _calculate_peak_widths(self, two_theta: np.ndarray, parameters: Dict) -> np.ndarray:
         """Calculate peak widths using Caglioti function: FWHM² = U*tan²θ + V*tanθ + W"""

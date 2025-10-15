@@ -69,14 +69,8 @@ class PatternTab(QWidget):
         self.load_btn.clicked.connect(self.load_pattern_dialog)
         layout.addWidget(self.load_btn)
         
-        self.file_label = QLabel("No file loaded - Drag & drop files here!")
-        self.file_label.setStyleSheet("QLabel { color: #666; font-style: italic; }")
-        layout.addWidget(self.file_label)
-        
-        layout.addStretch()
-        
-        # Wavelength controls
-        layout.addWidget(QLabel("Wavelength (Å):"))
+        # Wavelength controls - placed immediately after Load button for visibility
+        layout.addWidget(QLabel("  λ:"))
         self.wavelength_combo = QComboBox()
         self.wavelength_combo.addItems([
             "Cu Kα1 (1.5406)",
@@ -89,6 +83,7 @@ class PatternTab(QWidget):
             "Custom"
         ])
         self.wavelength_combo.currentTextChanged.connect(self.wavelength_changed)
+        self.wavelength_combo.setToolTip("Select X-ray wavelength - IMPORTANT: Must match your experimental data!")
         layout.addWidget(self.wavelength_combo)
         
         self.custom_wavelength = QDoubleSpinBox()
@@ -97,8 +92,15 @@ class PatternTab(QWidget):
         self.custom_wavelength.setValue(1.5406)
         self.custom_wavelength.setVisible(False)
         self.custom_wavelength.valueChanged.connect(self.custom_wavelength_changed)
+        self.custom_wavelength.setToolTip("Enter custom wavelength in Ångströms")
         layout.addWidget(self.custom_wavelength)
         
+        # File status label
+        self.file_label = QLabel("No file loaded - Drag & drop files here!")
+        self.file_label.setStyleSheet("QLabel { color: #666; font-style: italic; }")
+        layout.addWidget(self.file_label)
+        
+        layout.addStretch()
         
         return group
         
@@ -200,7 +202,7 @@ class PatternTab(QWidget):
             self,
             "Load Diffraction Pattern",
             "",
-            "Data files (*.xy *.xye *.xml *.txt *.dat *.csv);;All files (*.*)"
+            "Data files (*.xy *.xye *.chi *.xml *.txt *.dat *.csv);;All files (*.*)"
         )
         
         if file_path:
@@ -291,7 +293,7 @@ class PatternTab(QWidget):
             for url in event.mimeData().urls():
                 if url.isLocalFile():
                     file_path = url.toLocalFile()
-                    if any(file_path.lower().endswith(ext) for ext in ['.xy', '.xye', '.txt', '.dat', '.csv']):
+                    if any(file_path.lower().endswith(ext) for ext in ['.xy', '.xye', '.chi', '.txt', '.dat', '.csv']):
                         event.acceptProposedAction()
                         return
         event.ignore()
@@ -302,7 +304,7 @@ class PatternTab(QWidget):
             for url in event.mimeData().urls():
                 if url.isLocalFile():
                     file_path = url.toLocalFile()
-                    if any(file_path.lower().endswith(ext) for ext in ['.xy', '.xye', '.xml', '.txt', '.dat', '.csv']):
+                    if any(file_path.lower().endswith(ext) for ext in ['.xy', '.xye', '.chi', '.xml', '.txt', '.dat', '.csv']):
                         self.load_pattern(file_path)
                         event.acceptProposedAction()
                         return

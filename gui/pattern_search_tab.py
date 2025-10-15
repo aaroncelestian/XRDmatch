@@ -69,7 +69,8 @@ class PatternSearchTab(QWidget):
     
     def __init__(self):
         super().__init__()
-        self.experimental_pattern = None
+        self.experimental_pattern = None  # Original pattern
+        self.processed_pattern = None  # Background-subtracted pattern
         self.experimental_peaks = None
         self.search_engine = PatternSearchEngine()
         self.fast_search_engine = FastPatternSearchEngine()
@@ -240,8 +241,25 @@ class PatternSearchTab(QWidget):
         return group
     
     def set_experimental_pattern(self, pattern_data):
-        """Set the experimental pattern data"""
-        self.experimental_pattern = pattern_data
+        """Set the experimental pattern data
+        
+        This method receives pattern data from the Pattern Data tab or Processing tab.
+        If called from Processing tab, it contains background-subtracted data.
+        IMPORTANT: Background-subtracted data should be used for pattern searching
+        to improve match quality by removing background contributions.
+        """
+        # Store as processed pattern if it looks like processed data
+        # (will be called from processing_tab.pattern_processed signal)
+        # Otherwise store as experimental pattern
+        if hasattr(self, 'processed_pattern') and self.experimental_pattern is not None:
+            # This is likely processed data coming after original data
+            self.processed_pattern = pattern_data
+            print("Pattern Search: Updated with processed (background-subtracted) pattern")
+        else:
+            # First pattern loaded (original)
+            self.experimental_pattern = pattern_data
+            print("Pattern Search: Updated with experimental pattern")
+        
         self.update_search_availability()
         self.plot_experimental_pattern()
         
@@ -252,7 +270,9 @@ class PatternSearchTab(QWidget):
         
     def update_search_availability(self):
         """Update whether search can be performed"""
-        has_pattern = self.experimental_pattern is not None
+        # Prefer processed pattern, fall back to experimental
+        has_pattern = (self.processed_pattern is not None or 
+                      self.experimental_pattern is not None)
         
         # Ultra-fast search only needs full pattern
         can_search = has_pattern
@@ -269,10 +289,14 @@ class PatternSearchTab(QWidget):
         """Plot the experimental pattern"""
         self.ax.clear()
         
-        if self.experimental_pattern:
-            self.ax.plot(self.experimental_pattern['two_theta'], 
-                        self.experimental_pattern['intensity'],
-                        'b-', linewidth=1, label='Experimental')
+        # Use processed pattern if available, otherwise use experimental
+        pattern_to_plot = self.processed_pattern or self.experimental_pattern
+        
+        if pattern_to_plot:
+            label = 'Experimental (BG-subtracted)' if self.processed_pattern else 'Experimental'
+            self.ax.plot(pattern_to_plot['two_theta'], 
+                        pattern_to_plot['intensity'],
+                        'b-', linewidth=1, label=label)
             
             # Plot peaks if available
             if self.experimental_peaks:
@@ -394,11 +418,13 @@ class PatternSearchTab(QWidget):
             # Clear and replot experimental pattern
             self.ax.clear()
             
-            # Plot experimental pattern
-            if self.experimental_pattern:
-                self.ax.plot(self.experimental_pattern['two_theta'], 
-                            self.experimental_pattern['intensity'],
-                            'b-', linewidth=1.5, label='Experimental', alpha=0.8)
+            # Plot experimental pattern (prefer processed)
+            pattern_to_plot = self.processed_pattern or self.experimental_pattern
+            if pattern_to_plot:
+                label = 'Experimental (BG-subtracted)' if self.processed_pattern else 'Experimental'
+                self.ax.plot(pattern_to_plot['two_theta'], 
+                            pattern_to_plot['intensity'],
+                            'b-', linewidth=1.5, label=label, alpha=0.8)
                 
                 # Plot experimental peaks if available
                 if self.experimental_peaks:
@@ -409,7 +435,8 @@ class PatternSearchTab(QWidget):
             
             # Get theoretical pattern from database
             mineral_id = result['mineral_id']
-            exp_wavelength = self.experimental_pattern.get('wavelength', 1.5406) if self.experimental_pattern else 1.5406
+            pattern_to_use = self.processed_pattern or self.experimental_pattern
+            exp_wavelength = pattern_to_use.get('wavelength', 1.5406) if pattern_to_use else 1.5406
             
             # Get theoretical pattern
             from utils.local_database import LocalCIFDatabase
@@ -418,8 +445,9 @@ class PatternSearchTab(QWidget):
             
             if theoretical_pattern and len(theoretical_pattern['two_theta']) > 0:
                 # Scale theoretical pattern to match experimental intensity range
-                if self.experimental_pattern:
-                    exp_max = max(self.experimental_pattern['intensity'])
+                pattern_to_use = self.processed_pattern or self.experimental_pattern
+                if pattern_to_use:
+                    exp_max = max(pattern_to_use['intensity'])
                     theo_max = max(theoretical_pattern['intensity'])
                     scale_factor = exp_max * 0.8 / theo_max  # Scale to 80% of experimental max
                     scaled_intensity = [i * scale_factor for i in theoretical_pattern['intensity']]
@@ -443,9 +471,10 @@ class PatternSearchTab(QWidget):
             self.ax.legend()
             
             # Set reasonable axis limits
-            if self.experimental_pattern:
-                self.ax.set_xlim(min(self.experimental_pattern['two_theta']), 
-                               max(self.experimental_pattern['two_theta']))
+            pattern_to_use = self.processed_pattern or self.experimental_pattern
+            if pattern_to_use:
+                self.ax.set_xlim(min(pattern_to_use['two_theta']), 
+                               max(pattern_to_use['two_theta']))
             
             self.canvas.draw()
             
@@ -513,17 +542,6 @@ class PatternSearchTab(QWidget):
         
         # Clear results table
         self.results_table.setRowCount(0)
-        
-        # Reset progress bar
-        self.progress_bar.setVisible(False)
-        self.progress_bar.setValue(0)
-        
-        # Enable search button if conditions are met
-        self.update_search_availability()
-        
-        # Clear plot except for experimental pattern (which will be updated)
-        # The experimental pattern will be updated via set_experimental_pattern
-        
         print("Pattern search tab reset for new pattern")
     
     def build_search_index(self):
@@ -569,7 +587,8 @@ class PatternSearchTab(QWidget):
     
     def benchmark_search(self):
         """Benchmark the ultra-fast search performance"""
-        if not self.experimental_pattern:
+        pattern_to_use = self.processed_pattern or self.experimental_pattern
+        if not pattern_to_use:
             QMessageBox.warning(self, "No Pattern", 
                               "Load an experimental pattern first to benchmark search speed.")
             return
@@ -580,7 +599,7 @@ class PatternSearchTab(QWidget):
             
             # Run benchmark
             benchmark_results = self.fast_search_engine.benchmark_search_speed(
-                self.experimental_pattern, num_iterations=5
+                pattern_to_use, num_iterations=5
             )
             
             # Update performance display
@@ -607,8 +626,14 @@ class PatternSearchTab(QWidget):
             self.benchmark_btn.setText("Benchmark")
     
     def start_ultra_fast_search(self):
-        """Start ultra-fast correlation search"""
-        if not self.experimental_pattern:
+        """Start ultra-fast correlation search
+        
+        IMPORTANT: Uses background-subtracted pattern data when available
+        for improved matching accuracy.
+        """
+        # Use processed pattern if available, otherwise use experimental
+        pattern_to_use = self.processed_pattern or self.experimental_pattern
+        if not pattern_to_use:
             QMessageBox.warning(self, "No Pattern Data", 
                               "Full pattern data is required for ultra-fast search.")
             return
@@ -636,9 +661,9 @@ class PatternSearchTab(QWidget):
             min_correlation = self.fast_min_correlation_spin.value()
             max_results = self.fast_max_results_spin.value()
             
-            # Perform ultra-fast search
+            # Perform ultra-fast search using processed pattern if available
             results = self.fast_search_engine.ultra_fast_correlation_search(
-                self.experimental_pattern,
+                pattern_to_use,
                 min_correlation=min_correlation,
                 max_results=max_results
             )

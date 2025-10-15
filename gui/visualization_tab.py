@@ -86,18 +86,21 @@ class VisualizationTab(QWidget):
         settings_layout = QHBoxLayout()
         settings_layout.addWidget(QLabel("Max Iterations:"))
         self.max_iter_spin = QSpinBox()
-        self.max_iter_spin.setRange(5, 50)
-        self.max_iter_spin.setValue(15)
+        self.max_iter_spin.setRange(3, 50)
+        self.max_iter_spin.setValue(10)  # Reduced from 15 for faster refinement
+        self.max_iter_spin.setToolTip("Fewer iterations = faster refinement. 10 is usually sufficient.")
         settings_layout.addWidget(self.max_iter_spin)
         lebail_layout.addLayout(settings_layout)
         
         # Initial FWHM setting
         fwhm_layout = QHBoxLayout()
-        fwhm_layout.addWidget(QLabel("Initial FWHM:"))
+        fwhm_layout.addWidget(QLabel("Initial FWHM (°):"))
         self.initial_fwhm_spin = QDoubleSpinBox()
-        self.initial_fwhm_spin.setRange(0.01, 1.0)
+        self.initial_fwhm_spin.setRange(0.005, 1.0)
         self.initial_fwhm_spin.setValue(0.1)
-        self.initial_fwhm_spin.setSingleStep(0.01)
+        self.initial_fwhm_spin.setSingleStep(0.005)
+        self.initial_fwhm_spin.setDecimals(3)
+        self.initial_fwhm_spin.setToolTip("Peak width estimate. Synchrotron: 0.01-0.02°, Lab XRD: 0.08-0.15°")
         self.initial_fwhm_spin.setSuffix("°")
         self.initial_fwhm_spin.setToolTip("Starting peak width (FWHM) in degrees. Smaller = narrower peaks.")
         fwhm_layout.addWidget(self.initial_fwhm_spin)
@@ -136,9 +139,10 @@ class VisualizationTab(QWidget):
         self.refine_profile_check.setToolTip("Allow peak width parameters to refine")
         lebail_layout.addWidget(self.refine_profile_check)
         
-        self.refine_intensities_check = QCheckBox("Refine Peak Intensities (Pawley)")
+        self.refine_intensities_check = QCheckBox("Refine Peak Intensities (Pawley) - SLOW!")
         self.refine_intensities_check.setChecked(False)
-        self.refine_intensities_check.setToolTip("Allow individual peak intensities to refine freely.\nUse for preferred orientation or texture.\nWarning: Less stable than Le Bail.")
+        self.refine_intensities_check.setToolTip("⚠️ WARNING: Very slow and often unstable!\nOnly use for preferred orientation/texture.\nLeave unchecked for normal Le Bail refinement.")
+        self.refine_intensities_check.setStyleSheet("QCheckBox { color: #c60; }")
         lebail_layout.addWidget(self.refine_intensities_check)
         
         # 2-theta range settings
@@ -363,21 +367,36 @@ class VisualizationTab(QWidget):
         # This will be connected by the main window
         pass
         
-    def set_data(self, experimental_pattern: Dict, matched_phases: List[Dict]):
+    def set_data(self, experimental_pattern, matched_phases):
         """Set experimental pattern and matched phases"""
         self.experimental_pattern = experimental_pattern
         self.matched_phases = matched_phases
         
+        # Auto-adjust FWHM based on wavelength
+        wavelength = experimental_pattern.get('wavelength', 1.5406)
+        if wavelength < 0.5:  # Synchrotron
+            suggested_fwhm = 0.015
+            print(f"Synchrotron data detected (λ={wavelength:.5f} Å)")
+            print(f"  → Setting initial FWHM to {suggested_fwhm}° (typical for synchrotron)")
+        elif wavelength < 1.0:  # Mo or other short wavelength
+            suggested_fwhm = 0.05
+            print(f"Short wavelength detected (λ={wavelength:.4f} Å)")
+            print(f"  → Setting initial FWHM to {suggested_fwhm}°")
+        else:  # Lab XRD (Cu, Co, etc.)
+            suggested_fwhm = 0.1
+            print(f"Lab XRD detected (λ={wavelength:.4f} Å)")
+            print(f"  → Setting initial FWHM to {suggested_fwhm}°")
+        
+        self.initial_fwhm_spin.setValue(suggested_fwhm)
+        
+        # Enable refinement button
+        self.lebail_btn.setEnabled(True)
+        
         # Update status
-        n_phases = len(matched_phases)
-        self.data_status.setText(f"Loaded: {n_phases} phase(s)")
+        num_phases = len(matched_phases)
+        self.data_status.setText(f"Loaded: {num_phases} phase(s) from matching")
         
-        # Enable Le Bail button if we have data
-        self.lebail_btn.setEnabled(n_phases > 0)
-        
-        # Update phase table
-        self.update_phase_table()
-        
+        # Update plot
         # Create initial plot
         self.update_plot()
         
@@ -441,6 +460,8 @@ class VisualizationTab(QWidget):
             self.lebail_status.setText("Running Le Bail refinement...")
             
             # Prepare experimental data
+            # IMPORTANT: Use background-subtracted data for Le Bail refinement
+            # Background should be removed before refinement to avoid fitting the background
             experimental_data = {
                 'two_theta': self.experimental_pattern['two_theta'],
                 'intensity': self.experimental_pattern['intensity'],
@@ -467,6 +488,17 @@ class VisualizationTab(QWidget):
             from utils.lebail_refinement import LeBailRefinement
             LeBailRefinement.plot_callback = self._realtime_plot_callback
             
+            # Auto-adjust FWHM based on wavelength if still at default
+            wavelength = experimental_data.get('wavelength', 1.5406)
+            current_fwhm = self.initial_fwhm_spin.value()
+            
+            # If FWHM is at default 0.1° but wavelength suggests otherwise, auto-adjust
+            if abs(current_fwhm - 0.1) < 0.001:  # Still at default
+                if wavelength < 0.5:  # Synchrotron
+                    suggested_fwhm = 0.015
+                    self.initial_fwhm_spin.setValue(suggested_fwhm)
+                    print(f"⚠️  Auto-adjusted FWHM: 0.100° → {suggested_fwhm}° (synchrotron data)")
+            
             # Get user-defined refinement parameters
             initial_fwhm = self.initial_fwhm_spin.value()
             max_scale = self.max_scale_spin.value()
@@ -474,6 +506,11 @@ class VisualizationTab(QWidget):
             refine_cell = self.refine_cell_check.isChecked()
             refine_profile = self.refine_profile_check.isChecked()
             refine_intensities = self.refine_intensities_check.isChecked()
+            
+            # Warn if Pawley is enabled
+            if refine_intensities:
+                print("⚠️  WARNING: Pawley refinement enabled - this may be slow and unstable!")
+                print("   Consider disabling 'Refine Peak Intensities' for faster, more stable refinement")
             
             # Calculate initial U, V, W from FWHM
             # FWHM² ≈ U·tan²θ + V·tanθ + W, at low angles W dominates
@@ -512,9 +549,37 @@ class VisualizationTab(QWidget):
             LeBailRefinement.plot_callback = None
             
             if self.lebail_results['success']:
-                self.lebail_status.setText("✓ Refinement completed successfully!")
+                # Check if refinement quality is acceptable
+                r_factors = self.lebail_results.get('r_factors', {})
+                rwp = r_factors.get('Rwp', 999)
+                
+                print(f"\n=== Refinement Complete ===")
+                print(f"Final Rwp: {rwp:.2f}%")
+                print(f"Refinement results keys: {self.lebail_results.keys()}")
+                
+                # Check refinement data
+                refinement_data = self.lebail_results.get('refinement_results', {})
+                calc_pattern = refinement_data.get('calculated_pattern', None)
+                if calc_pattern is not None:
+                    print(f"Calculated pattern: {len(calc_pattern)} points, range {np.min(calc_pattern):.2f} - {np.max(calc_pattern):.2f}")
+                else:
+                    print("⚠️  No calculated pattern in results!")
+                
+                if rwp > 50:
+                    print(f"⚠️  WARNING: Very poor fit (Rwp={rwp:.1f}%)")
+                    print(f"   This usually means:")
+                    print(f"   - Wrong phase identified")
+                    print(f"   - FWHM too large/small (current: {self.initial_fwhm_spin.value():.3f}°)")
+                    print(f"   - Wavelength mismatch")
+                    print(f"   - Try adjusting FWHM or checking phase identity")
+                
+                self.lebail_status.setText(f"✓ Refinement complete (Rwp={rwp:.2f}%)")
                 self.display_lebail_results()
+                
+                # Force update plot with final results
+                print("Updating final plot...")
                 self.update_plot()
+                print("Plot update complete")
             else:
                 error_msg = self.lebail_results.get('error', 'Unknown error')
                 self.lebail_status.setText(f"✗ Refinement failed: {error_msg}")
@@ -579,43 +644,33 @@ class VisualizationTab(QWidget):
         """Create standard overlay plot"""
         ax = self.figure.add_subplot(111)
         
-        two_theta = self.experimental_pattern['two_theta']
-        intensity = self.experimental_pattern['intensity']
-        
-        # Plot experimental data
-        ax.plot(two_theta, intensity, 
-               color=self.plot_settings['exp_color'],
-               linewidth=self.plot_settings['exp_linewidth'],
-               label='Experimental',
-               alpha=0.8)
-        
-        # Plot Le Bail refined pattern if available
+        # If we have refinement results, use the normalized data from refinement
+        # Otherwise use original experimental data
         if self.lebail_results and self.lebail_results['success']:
             refinement_data = self.lebail_results['refinement_results']
+            
+            # Use normalized data from refinement (both exp and calc are on same scale)
+            two_theta = refinement_data.get('two_theta', self.experimental_pattern['two_theta'])
+            intensity = refinement_data.get('experimental_intensity', self.experimental_pattern['intensity'])
             calculated_pattern = refinement_data['calculated_pattern']
             
-            # Use the 2-theta array from refinement (may be filtered)
-            refined_two_theta = refinement_data.get('two_theta', two_theta)
-            refined_intensity = refinement_data.get('experimental_intensity', intensity)
+            # Plot experimental data (normalized)
+            ax.plot(two_theta, intensity, 
+                   color=self.plot_settings['exp_color'],
+                   linewidth=self.plot_settings['exp_linewidth'],
+                   label='Experimental',
+                   alpha=0.8)
             
-            # Plot refined experimental data (may be filtered range)
-            if len(refined_two_theta) != len(two_theta):
-                ax.plot(refined_two_theta, refined_intensity,
-                       color=self.plot_settings['exp_color'],
-                       linewidth=self.plot_settings['exp_linewidth'],
-                       label='Experimental (refined range)',
-                       alpha=0.8,
-                       linestyle='--')
-            
-            ax.plot(refined_two_theta, calculated_pattern,
+            # Plot calculated pattern (normalized, same scale as experimental)
+            ax.plot(two_theta, calculated_pattern,
                    color=self.plot_settings['calc_color'],
                    linewidth=self.plot_settings['calc_linewidth'],
                    label='Calculated (Le Bail)',
                    alpha=0.8)
             
             # Plot difference
-            difference = refined_intensity - calculated_pattern
-            ax.plot(refined_two_theta, difference,
+            difference = intensity - calculated_pattern
+            ax.plot(two_theta, difference,
                    color=self.plot_settings['diff_color'],
                    linewidth=self.plot_settings['diff_linewidth'],
                    label='Difference',
@@ -626,6 +681,17 @@ class VisualizationTab(QWidget):
             title = f"{self.plot_settings['title']} (Rwp = {r_factors['Rwp']:.2f}%, GoF = {r_factors['GoF']:.2f})"
             ax.set_title(title)
         else:
+            # No refinement results, plot original experimental data
+            two_theta = self.experimental_pattern['two_theta']
+            intensity = self.experimental_pattern['intensity']
+            
+            # Plot experimental data
+            ax.plot(two_theta, intensity, 
+                   color=self.plot_settings['exp_color'],
+                   linewidth=self.plot_settings['exp_linewidth'],
+                   label='Experimental',
+                   alpha=0.8)
+            
             ax.set_title(self.plot_settings['title'])
         
         ax.set_xlabel(self.plot_settings['xlabel'])

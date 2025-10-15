@@ -681,7 +681,7 @@ class ProcessingTab(QWidget):
             self,
             "Load Sample Holder Pattern",
             "",
-            "XRD files (*.xy *.xye *.txt *.dat *.csv *.xml);;All files (*.*)"
+            "XRD files (*.xy *.xye *.chi *.txt *.dat *.csv *.xml);;All files (*.*)"
         )
         
         if file_path:
@@ -1468,7 +1468,7 @@ class ProcessingTab(QWidget):
             self,
             "Export Processed Pattern",
             "",
-            "XY files (*.xy);;XYE files (*.xye);;Text files (*.txt);;All files (*.*)"
+            "XY files (*.xy);;XYE files (*.xye);;CHI files (*.chi);;Text files (*.txt);;All files (*.*)"
         )
         
         if file_path:

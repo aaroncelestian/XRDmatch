@@ -32,6 +32,8 @@ class MultiPhaseAnalyzer:
         
         Args:
             experimental_data: Dict with 'two_theta', 'intensity', 'wavelength'
+                              IMPORTANT: Should use background-subtracted intensity data
+                              Background subtraction must be performed before phase matching
             candidate_phases: List of phase dictionaries from matching
             max_phases: Maximum number of phases to identify
             residue_threshold: Stop when residue intensity drops below this fraction
@@ -378,7 +380,10 @@ class MultiPhaseAnalyzer:
         Perform Le Bail refinement on identified phases
         
         Args:
-            experimental_data: Experimental diffraction data
+            experimental_data: Experimental diffraction data with 'two_theta', 'intensity', 'wavelength'
+                              IMPORTANT: Must use background-subtracted intensity data
+                              Background subtraction should be performed before refinement to avoid
+                              fitting the background as part of the diffraction pattern
             identified_phases: List of identified phases from sequential analysis
             max_iterations: Maximum number of refinement iterations (default: 15)
             convergence_threshold: Convergence threshold for refinement (default: 1e-5)

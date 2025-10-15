@@ -64,10 +64,17 @@ class PhaseMatchingThread(QThread):
         exp_dspacings = self.experimental_peaks['d_spacing']
         exp_intensities = self.experimental_peaks['intensity']
         
+        phase_name = phase.get('mineral', 'Unknown')
+        print(f"\n--- Matching {phase_name} ---")
+        print(f"Experimental peaks: {len(exp_two_theta)} peaks")
+        print(f"Exp 2θ range: {np.min(exp_two_theta):.2f}° - {np.max(exp_two_theta):.2f}°")
+        print(f"Tolerance: {self.tolerance}°")
+        
         # Generate theoretical pattern for this phase
         theoretical_peaks = self.generate_theoretical_pattern(phase)
         
         if not theoretical_peaks:
+            print(f"  ⚠️  No theoretical peaks generated!")
             return {
                 'phase': phase,
                 'matches': [],
@@ -75,20 +82,33 @@ class PhaseMatchingThread(QThread):
                 'coverage': 0.0,
                 'intensity_weighted_score': 0.0
             }
+        
+        theo_two_theta = theoretical_peaks['two_theta']
+        theo_dspacings = theoretical_peaks['d_spacing']
+        theo_intensities = theoretical_peaks['intensity']
+        
+        print(f"Theoretical peaks: {len(theo_two_theta)} peaks")
+        print(f"Theo 2θ range: {np.min(theo_two_theta):.2f}° - {np.max(theo_two_theta):.2f}°")
+        
+        # Check for overlap
+        exp_min, exp_max = np.min(exp_two_theta), np.max(exp_two_theta)
+        theo_min, theo_max = np.min(theo_two_theta), np.max(theo_two_theta)
+        overlap = not (theo_max < exp_min or theo_min > exp_max)
+        print(f"2θ ranges overlap: {overlap}")
+        
+        if not overlap:
+            print(f"  ⚠️  WARNING: No overlap between experimental and theoretical 2θ ranges!")
+            print(f"  This usually indicates a wavelength mismatch.")
             
         # Normalize intensities for comparison
         max_exp_int = np.max(exp_intensities) if len(exp_intensities) > 0 else 1
-        max_theo_int = np.max(theoretical_peaks['intensity']) if len(theoretical_peaks['intensity']) > 0 else 1
+        max_theo_int = np.max(theo_intensities) if len(theo_intensities) > 0 else 1
         
         # Find matches with intensity consideration using 2θ tolerance
         matches = []
         matched_exp_peaks = set()
         total_intensity_weight = 0
         matched_intensity_weight = 0
-        
-        theo_two_theta = theoretical_peaks['two_theta']
-        theo_dspacings = theoretical_peaks['d_spacing']
-        theo_intensities = theoretical_peaks['intensity']
         
         for i, (theo_2theta, theo_d, theo_int) in enumerate(zip(theo_two_theta, theo_dspacings, theo_intensities)):
             # Normalize theoretical intensity (0-100 scale)
@@ -119,6 +139,13 @@ class PhaseMatchingThread(QThread):
                 })
                 matched_exp_peaks.add(min_idx)
                 matched_intensity_weight += norm_theo_int
+        
+        print(f"Found {len(matches)} matches within tolerance")
+        if len(matches) == 0:
+            print(f"  ⚠️  No peaks matched! Check:")
+            print(f"     - Tolerance ({self.tolerance}°) may be too small")
+            print(f"     - Wavelength mismatch between exp and theo patterns")
+            print(f"     - Peak detection may have missed peaks")
                 
         # MULTI-MATCH REQUIREMENT SCORING SYSTEM
         # Requires multiple good matches to score well - prevents single spurious matches
@@ -752,6 +779,12 @@ class MatchingTab(QWidget):
         
         layout.addStretch()
         
+        # Matching status label
+        self.matching_status_label = QLabel("Load pattern and detect peaks to enable matching")
+        self.matching_status_label.setWordWrap(True)
+        self.matching_status_label.setStyleSheet("QLabel { color: #666; font-style: italic; }")
+        layout.addWidget(self.matching_status_label)
+        
         # Action buttons
         self.match_btn = QPushButton("Start Matching")
         self.match_btn.clicked.connect(self.start_matching)
@@ -809,11 +842,31 @@ class MatchingTab(QWidget):
         group = QGroupBox("Matching Results")
         layout = QVBoxLayout(group)
         
+        # Selection controls
+        selection_layout = QHBoxLayout()
+        select_all_btn = QPushButton("Select All")
+        select_all_btn.clicked.connect(self.select_all_phases)
+        select_all_btn.setToolTip("Select all phases for refinement/export")
+        selection_layout.addWidget(select_all_btn)
+        
+        deselect_all_btn = QPushButton("Deselect All")
+        deselect_all_btn.clicked.connect(self.deselect_all_phases)
+        deselect_all_btn.setToolTip("Deselect all phases")
+        selection_layout.addWidget(deselect_all_btn)
+        
+        select_top_btn = QPushButton("Select Top 5")
+        select_top_btn.clicked.connect(lambda: self.select_top_n_phases(5))
+        select_top_btn.setToolTip("Select only the top 5 phases")
+        selection_layout.addWidget(select_top_btn)
+        
+        selection_layout.addStretch()
+        layout.addLayout(selection_layout)
+        
         # Results table
         self.results_table = QTableWidget()
-        self.results_table.setColumnCount(9)
+        self.results_table.setColumnCount(10)
         self.results_table.setHorizontalHeaderLabels([
-            'Phase', 'Peak Score', 'Corr. Score', 'Combined', 'Coverage', 'Matches', 'R²', 'Scale %', 'Show'
+            'Select', 'Phase', 'Peak Score', 'Corr. Score', 'Combined', 'Coverage', 'Matches', 'R²', 'Scale %', 'Show'
         ])
         self.results_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         layout.addWidget(self.results_table)
@@ -884,7 +937,18 @@ class MatchingTab(QWidget):
     def add_reference_phases(self, phases):
         """Add reference phases from database search"""
         self.reference_phases.extend(phases)
+        print(f"Added {len(phases)} reference phase(s). Total: {len(self.reference_phases)}")
         self.update_matching_availability()
+        
+        # Provide user feedback about matching readiness
+        if self.experimental_peaks is None:
+            print("⚠️  Cannot start matching: No experimental peaks detected")
+            print("   → Go to 'Data Processing' tab and click 'Find Peaks'")
+        elif self.experimental_pattern is None and self.processed_pattern is None:
+            print("⚠️  Cannot start matching: No experimental pattern loaded")
+            print("   → Go to 'Pattern Data' tab and load a pattern")
+        else:
+            print("✓ Ready to start phase matching!")
         
     def update_matching_availability(self):
         """Update whether matching can be performed"""
@@ -894,6 +958,23 @@ class MatchingTab(QWidget):
                     len(self.reference_phases) > 0 and 
                     has_pattern)
         self.match_btn.setEnabled(can_match)
+        
+        # Update status label with helpful information
+        if can_match:
+            self.matching_status_label.setText(f"✓ Ready! {len(self.reference_phases)} phase(s) loaded")
+            self.matching_status_label.setStyleSheet("QLabel { color: #0a0; font-weight: bold; }")
+        else:
+            missing = []
+            if not has_pattern:
+                missing.append("pattern data")
+            if self.experimental_peaks is None:
+                missing.append("peak detection")
+            if len(self.reference_phases) == 0:
+                missing.append("reference phases")
+            
+            status_text = f"⚠ Missing: {', '.join(missing)}"
+            self.matching_status_label.setText(status_text)
+            self.matching_status_label.setStyleSheet("QLabel { color: #c60; font-style: italic; }")
         
         # Multi-phase analysis requires matching results
         can_multi_phase = (can_match and 
@@ -932,6 +1013,9 @@ class MatchingTab(QWidget):
         self.progress_bar.setVisible(False)
         self.match_btn.setEnabled(True)
         
+        print(f"\n=== Matching Results ===")
+        print(f"Total phases matched: {len(results)}")
+        
         # Clear pattern caches when new results come in
         self.pattern_cache.clear()
         self.continuous_pattern_cache.clear()
@@ -939,6 +1023,16 @@ class MatchingTab(QWidget):
         # Check how many phases have theoretical data
         phases_with_data = sum(1 for r in results if len(r.get('theoretical_peaks', {}).get('d_spacing', [])) > 0)
         phases_without_data = len(results) - phases_with_data
+        
+        print(f"Phases with DIF data: {phases_with_data}")
+        print(f"Phases without DIF data: {phases_without_data}")
+        
+        # Print individual scores for debugging
+        for r in results:
+            phase_name = r['phase'].get('mineral', 'Unknown')
+            match_score = r['match_score']
+            num_matches = len(r['matches'])
+            print(f"  {phase_name}: score={match_score:.4f}, matches={num_matches}")
         
         if phases_without_data > 0:
             QMessageBox.information(self, "DIF Data Availability", 
@@ -951,6 +1045,20 @@ class MatchingTab(QWidget):
         min_score = self.min_score_spin.value()
         filtered_results = [r for r in results if r['match_score'] >= min_score]
         
+        print(f"Minimum score threshold: {min_score}")
+        print(f"Phases passing threshold: {len(filtered_results)}")
+        
+        if len(filtered_results) == 0 and len(results) > 0:
+            # All results were filtered out
+            best_score = max(r['match_score'] for r in results) if results else 0
+            QMessageBox.warning(self, "No Matches Above Threshold",
+                f"Phase matching completed but all {len(results)} phase(s) scored below the minimum threshold of {min_score}.\n\n"
+                f"Best score achieved: {best_score:.4f}\n\n"
+                f"Try:\n"
+                f"• Lowering the 'Min. match score' threshold\n"
+                f"• Increasing the '2θ tolerance'\n"
+                f"• Checking if the phase has DIF data available")
+        
         # Sort by combined score (descending), fallback to match score
         filtered_results.sort(key=lambda x: x.get('combined_score', x['match_score']), reverse=True)
         
@@ -960,53 +1068,60 @@ class MatchingTab(QWidget):
         for i, result in enumerate(filtered_results):
             phase = result['phase']
             
+            # Select checkbox (for refinement/export)
+            select_checkbox = QCheckBox()
+            select_checkbox.setChecked(i < 5)  # Select top 5 by default
+            select_checkbox.setToolTip("Include this phase in refinement and export")
+            self.results_table.setCellWidget(i, 0, select_checkbox)
+            
             # Phase name
             phase_name = phase.get('mineral', 'Unknown')
-            self.results_table.setItem(i, 0, QTableWidgetItem(phase_name))
+            self.results_table.setItem(i, 1, QTableWidgetItem(phase_name))
             
             # Peak-based score
             peak_score_item = QTableWidgetItem(f"{result['match_score']:.3f}")
-            self.results_table.setItem(i, 1, peak_score_item)
+            self.results_table.setItem(i, 2, peak_score_item)
             
             # Correlation score
             corr_score = result.get('correlation', 0)
             corr_score_item = QTableWidgetItem(f"{corr_score:.3f}")
-            self.results_table.setItem(i, 2, corr_score_item)
+            self.results_table.setItem(i, 3, corr_score_item)
             
             # Combined score
             combined_score = result.get('combined_score', result['match_score'])
             combined_score_item = QTableWidgetItem(f"{combined_score:.3f}")
-            self.results_table.setItem(i, 3, combined_score_item)
+            self.results_table.setItem(i, 4, combined_score_item)
             
             # Coverage
             coverage_item = QTableWidgetItem(f"{result['coverage']:.3f}")
-            self.results_table.setItem(i, 4, coverage_item)
+            self.results_table.setItem(i, 5, coverage_item)
             
             # Number of matches
             matches_item = QTableWidgetItem(str(len(result['matches'])))
-            self.results_table.setItem(i, 5, matches_item)
+            self.results_table.setItem(i, 6, matches_item)
             
             # R-squared
             r_squared = result.get('r_squared', 0)
             r_squared_item = QTableWidgetItem(f"{r_squared:.3f}")
-            self.results_table.setItem(i, 6, r_squared_item)
+            self.results_table.setItem(i, 7, r_squared_item)
             
             # Individual phase scaling control
             scale_spin = QDoubleSpinBox()
-            scale_spin.setRange(1, 500)
-            scale_spin.setDecimals(0)
-            scale_spin.setValue(80)  # Default scaling
-            scale_spin.setSingleStep(5)
+            scale_spin.setRange(1.0, 500.0)
+            scale_spin.setValue(80.0)
+            scale_spin.setDecimals(1)
+            scale_spin.setSingleStep(5.0)
             scale_spin.setSuffix("%")
             scale_spin.setToolTip(f"Individual scaling for {phase_name}")
             scale_spin.valueChanged.connect(self.update_plot)
-            self.results_table.setCellWidget(i, 7, scale_spin)
+            self.results_table.setCellWidget(i, 8, scale_spin)
             
-            # Show checkbox
+            # Show checkbox (for plot visibility)
             show_checkbox = QCheckBox()
             show_checkbox.setChecked(i < 3)  # Show top 3 by default
+            show_checkbox.setToolTip("Show this phase on the plot")
             show_checkbox.stateChanged.connect(self.update_plot)
-            self.results_table.setCellWidget(i, 8, show_checkbox)
+            self.results_table.setCellWidget(i, 9, show_checkbox)
             
         self.update_plot()
         
@@ -1025,6 +1140,8 @@ class MatchingTab(QWidget):
             return
             
         # Get experimental data for analysis
+        # IMPORTANT: Prefer processed (background-subtracted) pattern for phase matching
+        # Background subtraction should be performed in the Data Processing tab first
         pattern_to_use = self.processed_pattern or self.experimental_pattern
         if not pattern_to_use:
             QMessageBox.warning(self, "Multi-Phase Analysis", 
@@ -1226,7 +1343,7 @@ class MatchingTab(QWidget):
         
         # Update all individual phase scaling controls
         for i in range(self.results_table.rowCount()):
-            scale_widget = self.results_table.cellWidget(i, 7)  # Updated column index
+            scale_widget = self.results_table.cellWidget(i, 8)  # Updated column index
             if scale_widget and isinstance(scale_widget, QDoubleSpinBox):
                 scale_widget.setValue(global_scale)
         
@@ -1234,7 +1351,7 @@ class MatchingTab(QWidget):
         
     def get_phase_scaling(self, row_index):
         """Get the individual scaling factor for a specific phase"""
-        scale_widget = self.results_table.cellWidget(row_index, 7)  # Updated column index
+        scale_widget = self.results_table.cellWidget(row_index, 8)  # Updated column index
         if scale_widget and isinstance(scale_widget, QDoubleSpinBox):
             return scale_widget.value() / 100.0  # Convert percentage to decimal
         return 0.8  # Default 80% scaling
@@ -1344,7 +1461,7 @@ class MatchingTab(QWidget):
         filtered_results.sort(key=lambda x: x.get('combined_score', x['match_score']), reverse=True)
         
         for i in range(self.results_table.rowCount()):
-            checkbox = self.results_table.cellWidget(i, 8)  # Updated column index
+            checkbox = self.results_table.cellWidget(i, 9)  # Show checkbox column
             if checkbox and checkbox.isChecked():
                 # Use the filtered results to match the table display
                 result = filtered_results[i] if i < len(filtered_results) else None
@@ -1638,20 +1755,44 @@ class MatchingTab(QWidget):
         if hasattr(self, 'multi_phase_analyzer'):
             self.multi_phase_analyzer.clear_refined_cache()
             
+    def select_all_phases(self):
+        """Select all phases in the results table"""
+        for row in range(self.results_table.rowCount()):
+            select_checkbox = self.results_table.cellWidget(row, 0)
+            if select_checkbox and isinstance(select_checkbox, QCheckBox):
+                select_checkbox.setChecked(True)
+    
+    def deselect_all_phases(self):
+        """Deselect all phases in the results table"""
+        for row in range(self.results_table.rowCount()):
+            select_checkbox = self.results_table.cellWidget(row, 0)
+            if select_checkbox and isinstance(select_checkbox, QCheckBox):
+                select_checkbox.setChecked(False)
+    
+    def select_top_n_phases(self, n):
+        """Select only the top N phases"""
+        for row in range(self.results_table.rowCount()):
+            select_checkbox = self.results_table.cellWidget(row, 0)
+            if select_checkbox and isinstance(select_checkbox, QCheckBox):
+                select_checkbox.setChecked(row < n)
+    
     def get_selected_phases(self):
-        """Get selected phases from the results table for export/visualization"""
+        """Get selected phases from the results table for export/visualization/refinement"""
         selected_phases = []
         
-        # Get checked items from results table
-        for row in range(self.results_table.rowCount()):
-            checkbox_item = self.results_table.item(row, 0)
-            if checkbox_item and checkbox_item.checkState() == Qt.Checked:
-                # Get the corresponding phase from matching results
-                if row < len(self.matching_results):
-                    selected_phases.append(self.matching_results[row])
+        # Get minimum score filter
+        min_score = self.min_score_spin.value()
+        filtered_results = [r for r in self.matching_results if r['match_score'] >= min_score]
+        filtered_results.sort(key=lambda x: x.get('combined_score', x['match_score']), reverse=True)
         
-        # If no phases are selected, return all matching results
-        if not selected_phases and self.matching_results:
-            selected_phases = self.matching_results
-            
+        # Get checked items from results table (column 0 is the Select checkbox)
+        for row in range(self.results_table.rowCount()):
+            select_checkbox = self.results_table.cellWidget(row, 0)
+            if select_checkbox and isinstance(select_checkbox, QCheckBox) and select_checkbox.isChecked():
+                # Get the corresponding phase from filtered results
+                if row < len(filtered_results):
+                    selected_phases.append(filtered_results[row])
+        
+        # If no phases are selected, return empty list (don't auto-select all)
+        # This allows users to explicitly choose which phases to include
         return selected_phases
