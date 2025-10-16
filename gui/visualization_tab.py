@@ -514,11 +514,12 @@ class VisualizationTab(QWidget):
             
             # Calculate initial U, V, W from FWHM
             # FWHM² ≈ U·tan²θ + V·tanθ + W, at low angles W dominates
+            # For synchrotron data, FWHM is typically 0.01-0.02°
             initial_w = (initial_fwhm ** 2)
-            initial_u = initial_w * 0.1  # U is typically smaller
+            initial_u = initial_w * 0.05  # U is typically much smaller for synchrotron
             initial_v = 0.0  # V is often near zero
             
-            print(f"Initial parameters: FWHM={initial_fwhm:.3f}°, W={initial_w:.6f}, U={initial_u:.6f}")
+            print(f"Initial parameters: FWHM={initial_fwhm:.4f}°, W={initial_w:.8f}, U={initial_u:.8f}")
             print(f"Max scale factor: {max_scale}, η={initial_eta:.2f}")
             print(f"Refine cell: {refine_cell}, Refine profile: {refine_profile}")
             print(f"Refine intensities (Pawley): {refine_intensities}")

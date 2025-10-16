@@ -306,12 +306,14 @@ class LeBailRefinement:
                 self.refinement_history.append(iteration_result)
             
             # STAGE 2: Enable profile refinement and restore Pawley settings
-            print("\n=== STAGE 2: Profile Parameter Refinement (Constrained) ===")
+            print("\n=== STAGE 2: Profile Parameter Refinement ===")
+            print("Enabling profile parameter refinement (U, V, W, η)")
             for idx, phase in enumerate(self.phases):
                 phase['parameters']['refine_profile'] = True
                 # Restore Pawley intensity refinement setting
                 if idx < len(saved_intensity_settings):
                     phase['parameters']['refine_intensities'] = saved_intensity_settings[idx]
+                print(f"  Phase {idx}: refine_profile=True, refine_cell=True")
             
             # Adjust remaining iterations
             remaining_iterations = max_iterations - stage1_iterations
@@ -441,6 +443,24 @@ class LeBailRefinement:
                 # Update phase parameters
                 optimized_params = self._vector_to_parameters(result.x, param_names, params)
                 
+                # Show what changed
+                if 'u_param' in optimized_params:
+                    print(f"  Profile refined: U={optimized_params['u_param']:.6f}, V={optimized_params['v_param']:.6f}, W={optimized_params['w_param']:.6f}, η={optimized_params['eta_param']:.3f}")
+                    # Calculate FWHM at 5 degrees for reference
+                    import math
+                    theta_rad = math.radians(5.0 / 2)
+                    tan_theta = math.tan(theta_rad)
+                    fwhm_sq = optimized_params['u_param'] * tan_theta**2 + optimized_params['v_param'] * tan_theta + optimized_params['w_param']
+                    fwhm = math.sqrt(max(fwhm_sq, 0.00001))
+                    print(f"  → FWHM at 2θ=5°: {fwhm:.4f}°")
+                
+                if 'zero_shift' in optimized_params:
+                    print(f"  Zero shift: {optimized_params['zero_shift']:.4f}°")
+                
+                if 'cell_a' in optimized_params:
+                    cell = optimized_params['unit_cell']
+                    print(f"  Unit cell: a={cell['a']:.4f}, b={cell['b']:.4f}, c={cell['c']:.4f}")
+                
                 # Check if scale factor collapsed
                 if 'scale_factor' in optimized_params:
                     final_scale = optimized_params['scale_factor']
@@ -485,7 +505,7 @@ class LeBailRefinement:
             # Le Bail mode: scale factor fixed at 1.0 (not refined)
             print(f"  Scale factor: 1.0 (fixed, using observed intensities)")
             
-        # Profile parameters (with tighter constraints to prevent excessive broadening)
+        # Profile parameters
         if params.get('refine_profile', True):
             param_vector.extend([
                 params['u_param'],
@@ -493,14 +513,16 @@ class LeBailRefinement:
                 params['w_param'],
                 params['eta_param']
             ])
-            # Tighter bounds to prevent peaks from broadening too much
+            # Reasonable bounds for synchrotron data
+            # Allow enough flexibility to fit the actual peak shapes
             param_bounds.extend([
-                (0.0, 0.05),     # U - further reduced to 0.05
-                (-0.005, 0.005), # V - further reduced to ±0.005
-                (0.001, 0.05),   # W - further reduced to 0.05
-                (0.0, 1.0)       # eta - keep full range for Voigt mixing
+                (0.0, 0.05),      # U - can vary with sample
+                (-0.01, 0.01),    # V - usually small
+                (0.00001, 0.05),  # W - controls minimum FWHM, allow wider range
+                (0.0, 1.0)        # eta - full range for Voigt mixing
             ])
             param_names.extend(['u_param', 'v_param', 'w_param', 'eta_param'])
+            print(f"  Profile params: U={params['u_param']:.6f}, V={params['v_param']:.6f}, W={params['w_param']:.6f}, η={params['eta_param']:.3f}")
             
         # Zero shift (tighter bounds to prevent excessive shifts)
         param_vector.append(params['zero_shift'])
@@ -588,6 +610,11 @@ class LeBailRefinement:
             extracted_intensities = self._extract_lebail_intensities(
                 shifted_positions, peak_widths, eta, parameters
             )
+            # Debug: check extracted intensities
+            if np.sum(extracted_intensities) == 0:
+                print(f"  ⚠️  WARNING: All extracted intensities are zero!")
+                print(f"     Peak widths: min={np.min(peak_widths):.6f}, max={np.max(peak_widths):.6f}")
+                print(f"     Positions: min={np.min(shifted_positions):.2f}, max={np.max(shifted_positions):.2f}")
         
         for idx, (pos, intensity, width) in enumerate(zip(shifted_positions, theo_peaks['intensity'], peak_widths)):
             if width > 0 and intensity > 0:
@@ -608,46 +635,63 @@ class LeBailRefinement:
     def _extract_lebail_intensities(self, positions: np.ndarray, widths: np.ndarray, 
                                      eta: float, parameters: Dict) -> np.ndarray:
         """
-        Fast intensity extraction for Le Bail refinement
+        Le Bail intensity extraction using proper partitioning
         
-        Uses a simplified approach: extract peak height from observed data
-        with background subtraction from neighboring peaks.
-        Much faster than full partitioning, works well in practice.
+        For each peak, calculate its contribution to the observed pattern
+        by partitioning overlapping peaks based on their profile shapes.
+        This is the correct Le Bail method.
         """
         exp_2theta = self.experimental_data['two_theta']
         exp_intensity = self.experimental_data['intensity']
         n_peaks = len(positions)
         
-        # Initialize extracted intensities
+        # Initialize extracted intensities with a good first guess
+        # Use peak height at each position as starting point
         extracted_intensities = np.zeros(n_peaks)
-        
-        # For each peak, extract intensity from observed pattern
-        for idx, (pos, width) in enumerate(zip(positions, widths)):
-            if width <= 0:
-                continue
-            
+        for idx, pos in enumerate(positions):
             # Find closest experimental point
             closest_idx = np.argmin(np.abs(exp_2theta - pos))
+            if closest_idx < len(exp_intensity):
+                extracted_intensities[idx] = max(0, exp_intensity[closest_idx])
+        
+        # Pre-calculate profile shapes for all peaks (normalized to unit area)
+        # We'll scale these by the extracted intensities
+        profiles = []
+        for pos, width in zip(positions, widths):
+            if width > 0:
+                # Create normalized profile (unit intensity)
+                profile = self._pseudo_voigt_profile(exp_2theta, pos, width, 1.0, eta)
+                # Normalize to unit area
+                profile_sum = np.sum(profile)
+                if profile_sum > 0:
+                    profile = profile / profile_sum
+                profiles.append(profile)
+            else:
+                profiles.append(np.zeros_like(exp_2theta))
+        
+        # Iterative Le Bail extraction (3-5 iterations for convergence)
+        for iteration in range(5):
+            # Calculate total calculated pattern with current intensities
+            total_calc = np.zeros_like(exp_2theta)
+            for idx, profile in enumerate(profiles):
+                total_calc += extracted_intensities[idx] * profile
             
-            # Define a narrow window around peak (±1 FWHM for peak height)
-            step = np.mean(np.diff(exp_2theta))
-            window_half = max(1, int(width / step))
-            start_idx = max(0, closest_idx - window_half)
-            end_idx = min(len(exp_intensity), closest_idx + window_half + 1)
-            
-            if start_idx >= end_idx:
-                continue
-            
-            # Extract maximum intensity in window (peak height)
-            # This is the observed intensity for this peak
-            peak_intensity = np.max(exp_intensity[start_idx:end_idx])
-            
-            # Simple background estimate from edges of window
-            if start_idx > 0 and end_idx < len(exp_intensity):
-                background = (exp_intensity[start_idx] + exp_intensity[end_idx-1]) / 2
-                peak_intensity = max(0, peak_intensity - background)
-            
-            extracted_intensities[idx] = peak_intensity
+            # Extract intensities by partitioning
+            for idx, profile in enumerate(profiles):
+                if np.sum(profile) == 0:
+                    continue
+                
+                # Calculate this peak's fraction of the total at each point
+                # Avoid division by zero
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    fraction = np.where(total_calc > 0, 
+                                      extracted_intensities[idx] * profile / total_calc,
+                                      0.0)
+                    fraction = np.nan_to_num(fraction, 0.0)
+                
+                # Extract intensity: sum of (observed * fraction)
+                # This partitions the observed intensity among overlapping peaks
+                extracted_intensities[idx] = np.sum(exp_intensity * fraction)
         
         return extracted_intensities
         
