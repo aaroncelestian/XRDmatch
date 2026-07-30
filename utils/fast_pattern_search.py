@@ -105,6 +105,7 @@ class FastPatternSearchEngine:
         cursor.execute('''
             SELECT m.id, m.mineral_name, m.chemical_formula, m.space_group,
                    m.cell_a, m.cell_b, m.cell_c, m.cell_alpha, m.cell_beta, m.cell_gamma,
+                   m.rir,
                    dp.two_theta, dp.intensities, dp.d_spacings
             FROM minerals m
             JOIN diffraction_patterns dp ON m.id = dp.mineral_id
@@ -128,7 +129,9 @@ class FastPatternSearchEngine:
         
         # Process each mineral
         for i, row in enumerate(rows):
-            mineral_id, mineral_name, formula, space_group, cell_a, cell_b, cell_c, cell_alpha, cell_beta, cell_gamma, two_theta_json, intensities_json, d_spacings_json = row
+            (mineral_id, mineral_name, formula, space_group, cell_a, cell_b, cell_c,
+             cell_alpha, cell_beta, cell_gamma, rir, two_theta_json, intensities_json,
+             d_spacings_json) = row
             
             try:
                 # Parse pattern data - handle both JSON and comma-separated formats
@@ -165,6 +168,7 @@ class FastPatternSearchEngine:
                     'cell_alpha': cell_alpha,
                     'cell_beta': cell_beta,
                     'cell_gamma': cell_gamma,
+                    'rir': rir,
                     'pattern_norm': pattern_norm
                 })
                 
@@ -186,6 +190,7 @@ class FastPatternSearchEngine:
                     'cell_alpha': cell_alpha,
                     'cell_beta': cell_beta,
                     'cell_gamma': cell_gamma,
+                    'rir': rir,
                     'pattern_norm': 0
                 })
         
@@ -297,6 +302,7 @@ class FastPatternSearchEngine:
                 'cell_alpha': metadata.get('cell_alpha'),
                 'cell_beta': metadata.get('cell_beta'),
                 'cell_gamma': metadata.get('cell_gamma'),
+                'rir': metadata.get('rir'),
                 'correlation': float(correlation),
                 'r_squared': float(correlation ** 2),
                 'search_method': 'ultra_fast_correlation'

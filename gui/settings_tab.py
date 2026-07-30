@@ -5,29 +5,36 @@ Settings tab for application configuration
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
                              QLabel, QLineEdit, QSpinBox, QDoubleSpinBox,
                              QComboBox, QCheckBox, QPushButton, QFileDialog,
-                             QTextEdit, QTabWidget, QFormLayout)
-from PyQt5.QtCore import Qt, pyqtSignal
+                             QTextEdit, QTabWidget, QFormLayout, QMessageBox)
+from PyQt5.QtCore import pyqtSignal
 import json
 import os
 
+from .theme import get_current_mode, LIGHT, DARK
+
+
 class SettingsTab(QWidget):
     """Tab for application settings and configuration"""
-    
+
     settings_changed = pyqtSignal(dict)
-    
+    theme_changed = pyqtSignal(str)
+
     def __init__(self):
         super().__init__()
         self.settings = self.load_default_settings()
+        self._syncing_theme = False
         self.init_ui()
-        
+
     def init_ui(self):
         """Initialize the user interface"""
         layout = QVBoxLayout(self)
-        
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
         # Create tab widget for different setting categories
         self.tab_widget = QTabWidget()
         layout.addWidget(self.tab_widget)
-        
+
         # Create setting tabs
         self.create_general_tab()
         self.create_wavelength_tab()
@@ -37,19 +44,20 @@ class SettingsTab(QWidget):
         
         # Action buttons
         button_layout = QHBoxLayout()
-        
+
         self.save_btn = QPushButton("Save Settings")
+        self.save_btn.setObjectName("primaryButton")
         self.save_btn.clicked.connect(self.save_settings)
         button_layout.addWidget(self.save_btn)
-        
+
         self.load_btn = QPushButton("Load Settings")
         self.load_btn.clicked.connect(self.load_settings)
         button_layout.addWidget(self.load_btn)
-        
+
         self.reset_btn = QPushButton("Reset to Defaults")
         self.reset_btn.clicked.connect(self.reset_to_defaults)
         button_layout.addWidget(self.reset_btn)
-        
+
         button_layout.addStretch()
         layout.addLayout(button_layout)
         
@@ -258,54 +266,71 @@ class SettingsTab(QWidget):
         """Create display settings tab"""
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        
+
+        # Theme
+        theme_group = QGroupBox("Appearance")
+        theme_layout = QFormLayout(theme_group)
+
+        self.color_scheme = QComboBox()
+        self.color_scheme.addItems(["Light", "Dark"])
+        current = get_current_mode()
+        self.color_scheme.setCurrentText("Dark" if current == DARK else "Light")
+        self.color_scheme.currentTextChanged.connect(self._on_theme_combo_changed)
+        theme_layout.addRow("Theme:", self.color_scheme)
+
+        layout.addWidget(theme_group)
+
         # Plot settings
         plot_group = QGroupBox("Plot Settings")
         plot_layout = QFormLayout(plot_group)
-        
+
         self.plot_dpi = QSpinBox()
         self.plot_dpi.setRange(50, 300)
         self.plot_dpi.setValue(self.settings['display']['plot_dpi'])
         plot_layout.addRow("Plot DPI:", self.plot_dpi)
-        
+
         self.line_width = QDoubleSpinBox()
         self.line_width.setRange(0.5, 5.0)
         self.line_width.setDecimals(1)
         self.line_width.setValue(self.settings['display']['line_width'])
         plot_layout.addRow("Line Width:", self.line_width)
-        
+
         self.marker_size = QSpinBox()
         self.marker_size.setRange(2, 20)
         self.marker_size.setValue(self.settings['display']['marker_size'])
         plot_layout.addRow("Marker Size:", self.marker_size)
-        
-        layout.addWidget(plot_group)
-        
-        # Color scheme
-        color_group = QGroupBox("Color Scheme")
-        color_layout = QFormLayout(color_group)
-        
-        self.color_scheme = QComboBox()
-        self.color_scheme.addItems(["Default", "Dark", "Colorblind-friendly", "High-contrast"])
-        color_layout.addRow("Color Scheme:", self.color_scheme)
-        
+
         self.show_grid = QCheckBox("Show grid")
         self.show_grid.setChecked(self.settings['display']['show_grid'])
-        color_layout.addRow(self.show_grid)
-        
+        plot_layout.addRow(self.show_grid)
+
         self.show_legend = QCheckBox("Show legend")
         self.show_legend.setChecked(self.settings['display']['show_legend'])
-        color_layout.addRow(self.show_legend)
-        
+        plot_layout.addRow(self.show_legend)
+
         self.show_error_bars = QCheckBox("Show error bars (XYE files)")
         self.show_error_bars.setChecked(self.settings['display']['show_error_bars'])
-        color_layout.addRow(self.show_error_bars)
-        
-        layout.addWidget(color_group)
+        plot_layout.addRow(self.show_error_bars)
+
+        layout.addWidget(plot_group)
         layout.addStretch()
-        
+
         self.tab_widget.addTab(tab, "Display")
-        
+
+    def _on_theme_combo_changed(self, text: str):
+        if self._syncing_theme:
+            return
+        mode = DARK if text == "Dark" else LIGHT
+        self.theme_changed.emit(mode)
+
+    def sync_theme_combo(self, mode: str):
+        """Update theme combo without re-emitting (e.g. from toolbar toggle)."""
+        self._syncing_theme = True
+        try:
+            self.color_scheme.setCurrentText("Dark" if mode == DARK else "Light")
+        finally:
+            self._syncing_theme = False
+
     def load_default_settings(self):
         """Load default settings"""
         return {
@@ -338,7 +363,7 @@ class SettingsTab(QWidget):
                 'plot_dpi': 100,
                 'line_width': 1.0,
                 'marker_size': 6,
-                'color_scheme': 'Default',
+                'color_scheme': 'Light',
                 'show_grid': True,
                 'show_legend': True,
                 'show_error_bars': True
@@ -414,10 +439,11 @@ class SettingsTab(QWidget):
                     json.dump(settings, f, indent=2)
                 self.settings = settings
                 self.settings_changed.emit(settings)
+                scheme = settings['display'].get('color_scheme', 'Light')
+                self.theme_changed.emit(DARK if scheme == 'Dark' else LIGHT)
             except Exception as e:
-                from PyQt6.QtWidgets import QMessageBox
                 QMessageBox.critical(self, "Error", f"Could not save settings:\n{str(e)}")
-                
+
     def load_settings(self):
         """Load settings from file"""
         file_path, _ = QFileDialog.getOpenFileName(
@@ -431,10 +457,12 @@ class SettingsTab(QWidget):
                 self.apply_settings(settings)
                 self.settings = settings
                 self.settings_changed.emit(settings)
+                scheme = settings.get('display', {}).get('color_scheme', 'Light')
+                if scheme in ('Dark', 'Light'):
+                    self.theme_changed.emit(DARK if scheme == 'Dark' else LIGHT)
             except Exception as e:
-                from PyQt6.QtWidgets import QMessageBox
                 QMessageBox.critical(self, "Error", f"Could not load settings:\n{str(e)}")
-                
+
     def apply_settings(self, settings):
         """Apply settings to UI"""
         # General settings
@@ -470,10 +498,14 @@ class SettingsTab(QWidget):
         self.plot_dpi.setValue(display.get('plot_dpi', 100))
         self.line_width.setValue(display.get('line_width', 1.0))
         self.marker_size.setValue(display.get('marker_size', 6))
+        scheme = display.get('color_scheme', 'Light')
+        if scheme not in ('Light', 'Dark'):
+            scheme = 'Dark' if str(scheme).lower() == 'dark' else 'Light'
+        self.sync_theme_combo(DARK if scheme == 'Dark' else LIGHT)
         self.show_grid.setChecked(display.get('show_grid', True))
         self.show_legend.setChecked(display.get('show_legend', True))
         self.show_error_bars.setChecked(display.get('show_error_bars', True))
-        
+
     def reset_to_defaults(self):
         """Reset all settings to defaults"""
         defaults = self.load_default_settings()

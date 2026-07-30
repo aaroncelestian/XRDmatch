@@ -5,11 +5,10 @@ A GUI application for X-ray diffraction phase matching using AMCSD database
 """
 
 import sys
-import os
-from PyQt5.QtWidgets import QApplication, QMainWindow
-from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QIcon
+from PyQt5.QtWidgets import QApplication
 from gui.main_window import XRDMainWindow
+from gui.theme import apply_theme
+
 
 def main():
     """Main entry point for the XRD Phase Matching application"""
@@ -17,15 +16,15 @@ def main():
     app.setApplicationName("XRD Phase Matcher")
     app.setApplicationVersion("1.0.0")
     app.setOrganizationName("XRD Tools")
-    
-    # Set application style
+
     app.setStyle('Fusion')
-    
-    # Create and show main window
+    apply_theme(app)  # Light / Dark from QSettings
+
     window = XRDMainWindow()
     window.show()
-    
+
     sys.exit(app.exec())
+
 
 if __name__ == '__main__':
     main()

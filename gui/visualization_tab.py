@@ -4,19 +4,21 @@ Provides advanced plotting, customization, and Le Bail refinement visualization
 """
 
 import numpy as np
-from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, 
+from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
                              QPushButton, QLabel, QSpinBox, QDoubleSpinBox,
-                             QComboBox, QCheckBox, QColorDialog, QFileDialog,
+                             QCheckBox, QColorDialog, QFileDialog,
                              QMessageBox, QProgressBar, QTableWidget, QTableWidgetItem,
-                             QSplitter, QTextEdit, QTabWidget)
-from PyQt5.QtCore import Qt, pyqtSignal
+                             QSplitter, QTextEdit, QTabWidget, QFormLayout,
+                             QScrollArea)
+from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor
-import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
 from typing import Dict, List, Optional
-import json
+
+from matplotlib_config import apply_plot_style, get_plot_palette
+from gui.theme import get_current_mode
 
 
 class VisualizationTab(QWidget):
@@ -29,13 +31,14 @@ class VisualizationTab(QWidget):
         self.lebail_results = None
         self.multi_phase_analyzer = None
         
-        # Visualization settings
+        # Visualization settings — defaults follow active theme accents
+        palette = get_plot_palette(get_current_mode())
         self.plot_settings = {
-            'exp_color': '#1f77b4',
+            'exp_color': palette['exp_line'],
             'exp_linewidth': 1.5,
-            'calc_color': '#ff7f0e',
+            'calc_color': palette['calc_line'],
             'calc_linewidth': 1.5,
-            'diff_color': '#2ca02c',
+            'diff_color': palette['diff_line'],
             'diff_linewidth': 1.0,
             'phase_colors': {},
             'phase_linewidths': {},
@@ -53,305 +56,275 @@ class VisualizationTab(QWidget):
     def init_ui(self):
         """Initialize the user interface"""
         main_layout = QHBoxLayout(self)
-        
-        # Left panel - controls
+        main_layout.setContentsMargins(8, 8, 8, 8)
+
+        # Left panel - scrollable controls
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setMaximumWidth(380)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
-        left_panel.setMaximumWidth(400)
-        
-        # Data source group
+        left_layout.setContentsMargins(4, 4, 4, 4)
+        left_layout.setSpacing(8)
+
+        # Data source
         data_group = QGroupBox("Data Source")
         data_layout = QVBoxLayout(data_group)
-        
+
         self.import_btn = QPushButton("Import from Phase Matching")
+        self.import_btn.setObjectName("primaryButton")
         self.import_btn.clicked.connect(self.import_from_matching_tab)
         data_layout.addWidget(self.import_btn)
-        
+
         self.data_status = QLabel("No data loaded")
+        self.data_status.setObjectName("mutedLabel")
         self.data_status.setWordWrap(True)
         data_layout.addWidget(self.data_status)
-        
         left_layout.addWidget(data_group)
-        
-        # Le Bail refinement group
+
+        # Le Bail refinement
         lebail_group = QGroupBox("Le Bail Refinement")
-        lebail_layout = QVBoxLayout(lebail_group)
-        
+        lebail_layout = QFormLayout(lebail_group)
+
         self.lebail_btn = QPushButton("Run Le Bail Refinement")
+        self.lebail_btn.setObjectName("primaryButton")
         self.lebail_btn.clicked.connect(self.run_lebail_refinement)
         self.lebail_btn.setEnabled(False)
-        lebail_layout.addWidget(self.lebail_btn)
-        
-        # Refinement settings
-        settings_layout = QHBoxLayout()
-        settings_layout.addWidget(QLabel("Max Iterations:"))
+        lebail_layout.addRow(self.lebail_btn)
+
         self.max_iter_spin = QSpinBox()
         self.max_iter_spin.setRange(3, 50)
-        self.max_iter_spin.setValue(10)  # Reduced from 15 for faster refinement
-        self.max_iter_spin.setToolTip("Fewer iterations = faster refinement. 10 is usually sufficient.")
-        settings_layout.addWidget(self.max_iter_spin)
-        lebail_layout.addLayout(settings_layout)
-        
-        # Initial FWHM setting
-        fwhm_layout = QHBoxLayout()
-        fwhm_layout.addWidget(QLabel("Initial FWHM (°):"))
+        self.max_iter_spin.setValue(10)
+        self.max_iter_spin.setToolTip("Fewer iterations = faster refinement")
+        lebail_layout.addRow("Max Iterations:", self.max_iter_spin)
+
         self.initial_fwhm_spin = QDoubleSpinBox()
         self.initial_fwhm_spin.setRange(0.005, 1.0)
         self.initial_fwhm_spin.setValue(0.1)
         self.initial_fwhm_spin.setSingleStep(0.005)
         self.initial_fwhm_spin.setDecimals(3)
-        self.initial_fwhm_spin.setToolTip("Peak width estimate. Synchrotron: 0.01-0.02°, Lab XRD: 0.08-0.15°")
         self.initial_fwhm_spin.setSuffix("°")
-        self.initial_fwhm_spin.setToolTip("Starting peak width (FWHM) in degrees. Smaller = narrower peaks.")
-        fwhm_layout.addWidget(self.initial_fwhm_spin)
-        lebail_layout.addLayout(fwhm_layout)
-        
-        # Scale factor bounds
-        scale_layout = QHBoxLayout()
-        scale_layout.addWidget(QLabel("Max Scale:"))
+        self.initial_fwhm_spin.setToolTip("Synchrotron: 0.01-0.02°, Lab XRD: 0.08-0.15°")
+        lebail_layout.addRow("Initial FWHM:", self.initial_fwhm_spin)
+
         self.max_scale_spin = QDoubleSpinBox()
         self.max_scale_spin.setRange(1.0, 1000.0)
         self.max_scale_spin.setValue(100.0)
         self.max_scale_spin.setSingleStep(10.0)
-        self.max_scale_spin.setToolTip("Maximum scale factor - higher allows peaks to be taller")
-        scale_layout.addWidget(self.max_scale_spin)
-        lebail_layout.addLayout(scale_layout)
-        
-        # Profile shape parameter
-        eta_layout = QHBoxLayout()
-        eta_layout.addWidget(QLabel("Peak Shape (η):"))
+        lebail_layout.addRow("Max Scale:", self.max_scale_spin)
+
         self.eta_spin = QDoubleSpinBox()
         self.eta_spin.setRange(0.0, 1.0)
         self.eta_spin.setValue(0.5)
         self.eta_spin.setSingleStep(0.1)
         self.eta_spin.setToolTip("0=Gaussian, 1=Lorentzian, 0.5=50/50 mix")
-        eta_layout.addWidget(self.eta_spin)
-        lebail_layout.addLayout(eta_layout)
-        
-        # Refinement options
+        lebail_layout.addRow("Peak Shape (η):", self.eta_spin)
+
         self.refine_cell_check = QCheckBox("Refine Unit Cell")
         self.refine_cell_check.setChecked(True)
-        self.refine_cell_check.setToolTip("Allow unit cell parameters to refine")
-        lebail_layout.addWidget(self.refine_cell_check)
-        
+        lebail_layout.addRow(self.refine_cell_check)
+
         self.refine_profile_check = QCheckBox("Refine Peak Profile")
         self.refine_profile_check.setChecked(True)
-        self.refine_profile_check.setToolTip("Allow peak width parameters to refine")
-        lebail_layout.addWidget(self.refine_profile_check)
-        
-        self.refine_intensities_check = QCheckBox("Refine Peak Intensities (Pawley) - SLOW!")
+        lebail_layout.addRow(self.refine_profile_check)
+
+        self.refine_intensities_check = QCheckBox("Refine Peak Intensities (Pawley)")
         self.refine_intensities_check.setChecked(False)
-        self.refine_intensities_check.setToolTip("⚠️ WARNING: Very slow and often unstable!\nOnly use for preferred orientation/texture.\nLeave unchecked for normal Le Bail refinement.")
-        self.refine_intensities_check.setStyleSheet("QCheckBox { color: #c60; }")
-        lebail_layout.addWidget(self.refine_intensities_check)
-        
-        # 2-theta range settings
-        range_label = QLabel("2θ Range (optional):")
-        lebail_layout.addWidget(range_label)
-        
-        range_layout = QHBoxLayout()
-        self.use_range_check = QCheckBox("Limit range")
+        self.refine_intensities_check.setToolTip(
+            "Very slow and often unstable. Only use for preferred orientation/texture."
+        )
+        self.refine_intensities_check.setObjectName("statusWarnLabel")
+        lebail_layout.addRow(self.refine_intensities_check)
+
+        range_row = QHBoxLayout()
+        self.use_range_check = QCheckBox("Limit")
         self.use_range_check.setChecked(False)
         self.use_range_check.stateChanged.connect(self._toggle_range_inputs)
-        range_layout.addWidget(self.use_range_check)
-        lebail_layout.addLayout(range_layout)
-        
-        range_inputs_layout = QHBoxLayout()
-        range_inputs_layout.addWidget(QLabel("Min:"))
+        range_row.addWidget(self.use_range_check)
+
         self.min_2theta_spin = QDoubleSpinBox()
         self.min_2theta_spin.setRange(0.0, 180.0)
         self.min_2theta_spin.setValue(10.0)
-        self.min_2theta_spin.setSingleStep(1.0)
         self.min_2theta_spin.setSuffix("°")
         self.min_2theta_spin.setEnabled(False)
-        range_inputs_layout.addWidget(self.min_2theta_spin)
-        
-        range_inputs_layout.addWidget(QLabel("Max:"))
+        range_row.addWidget(self.min_2theta_spin)
+
         self.max_2theta_spin = QDoubleSpinBox()
         self.max_2theta_spin.setRange(0.0, 180.0)
         self.max_2theta_spin.setValue(90.0)
-        self.max_2theta_spin.setSingleStep(1.0)
         self.max_2theta_spin.setSuffix("°")
         self.max_2theta_spin.setEnabled(False)
-        range_inputs_layout.addWidget(self.max_2theta_spin)
-        lebail_layout.addLayout(range_inputs_layout)
-        
+        range_row.addWidget(self.max_2theta_spin)
+        lebail_layout.addRow("2θ Range:", range_row)
+
         self.lebail_progress = QProgressBar()
         self.lebail_progress.setVisible(False)
-        lebail_layout.addWidget(self.lebail_progress)
-        
+        lebail_layout.addRow(self.lebail_progress)
+
         self.lebail_status = QLabel("")
+        self.lebail_status.setObjectName("mutedLabel")
         self.lebail_status.setWordWrap(True)
-        lebail_layout.addWidget(self.lebail_status)
-        
+        lebail_layout.addRow(self.lebail_status)
+
         left_layout.addWidget(lebail_group)
-        
-        # Plot customization group
+
+        # Plot customization
         custom_group = QGroupBox("Plot Customization")
-        custom_layout = QVBoxLayout(custom_group)
-        
-        # Experimental data settings
-        exp_layout = QHBoxLayout()
-        exp_layout.addWidget(QLabel("Exp. Data:"))
+        custom_layout = QFormLayout(custom_group)
+
+        exp_row = QHBoxLayout()
         self.exp_color_btn = QPushButton("Color")
         self.exp_color_btn.clicked.connect(lambda: self.choose_color('exp_color'))
-        exp_layout.addWidget(self.exp_color_btn)
+        exp_row.addWidget(self.exp_color_btn)
         self.exp_width_spin = QDoubleSpinBox()
         self.exp_width_spin.setRange(0.1, 10.0)
         self.exp_width_spin.setValue(1.5)
         self.exp_width_spin.setSingleStep(0.5)
         self.exp_width_spin.valueChanged.connect(lambda v: self.update_setting('exp_linewidth', v))
-        exp_layout.addWidget(self.exp_width_spin)
-        custom_layout.addLayout(exp_layout)
-        
-        # Calculated pattern settings
-        calc_layout = QHBoxLayout()
-        calc_layout.addWidget(QLabel("Calc. Pattern:"))
+        exp_row.addWidget(self.exp_width_spin)
+        custom_layout.addRow("Exp. Data:", exp_row)
+
+        calc_row = QHBoxLayout()
         self.calc_color_btn = QPushButton("Color")
         self.calc_color_btn.clicked.connect(lambda: self.choose_color('calc_color'))
-        calc_layout.addWidget(self.calc_color_btn)
+        calc_row.addWidget(self.calc_color_btn)
         self.calc_width_spin = QDoubleSpinBox()
         self.calc_width_spin.setRange(0.1, 10.0)
         self.calc_width_spin.setValue(1.5)
         self.calc_width_spin.setSingleStep(0.5)
         self.calc_width_spin.valueChanged.connect(lambda v: self.update_setting('calc_linewidth', v))
-        calc_layout.addWidget(self.calc_width_spin)
-        custom_layout.addLayout(calc_layout)
-        
-        # Difference pattern settings
-        diff_layout = QHBoxLayout()
-        diff_layout.addWidget(QLabel("Difference:"))
+        calc_row.addWidget(self.calc_width_spin)
+        custom_layout.addRow("Calc. Pattern:", calc_row)
+
+        diff_row = QHBoxLayout()
         self.diff_color_btn = QPushButton("Color")
         self.diff_color_btn.clicked.connect(lambda: self.choose_color('diff_color'))
-        diff_layout.addWidget(self.diff_color_btn)
+        diff_row.addWidget(self.diff_color_btn)
         self.diff_width_spin = QDoubleSpinBox()
         self.diff_width_spin.setRange(0.1, 10.0)
         self.diff_width_spin.setValue(1.0)
         self.diff_width_spin.setSingleStep(0.5)
         self.diff_width_spin.valueChanged.connect(lambda v: self.update_setting('diff_linewidth', v))
-        calc_layout.addWidget(self.diff_width_spin)
-        custom_layout.addLayout(diff_layout)
-        
-        # Waterfall plot settings
-        waterfall_layout = QHBoxLayout()
-        waterfall_layout.addWidget(QLabel("Waterfall Offset:"))
+        diff_row.addWidget(self.diff_width_spin)
+        custom_layout.addRow("Difference:", diff_row)
+
         self.waterfall_spin = QDoubleSpinBox()
         self.waterfall_spin.setRange(0.0, 1000.0)
         self.waterfall_spin.setValue(0.0)
         self.waterfall_spin.setSingleStep(10.0)
         self.waterfall_spin.valueChanged.connect(lambda v: self.update_setting('waterfall_offset', v))
-        waterfall_layout.addWidget(self.waterfall_spin)
-        custom_layout.addLayout(waterfall_layout)
-        
-        # Plot options
+        custom_layout.addRow("Waterfall Offset:", self.waterfall_spin)
+
         self.legend_check = QCheckBox("Show Legend")
         self.legend_check.setChecked(True)
-        self.legend_check.stateChanged.connect(lambda: self.update_setting('show_legend', self.legend_check.isChecked()))
-        custom_layout.addWidget(self.legend_check)
-        
+        self.legend_check.stateChanged.connect(
+            lambda: self.update_setting('show_legend', self.legend_check.isChecked())
+        )
+        custom_layout.addRow(self.legend_check)
+
         self.grid_check = QCheckBox("Show Grid")
         self.grid_check.setChecked(True)
-        self.grid_check.stateChanged.connect(lambda: self.update_setting('show_grid', self.grid_check.isChecked()))
-        custom_layout.addWidget(self.grid_check)
-        
-        # Update plot button
+        self.grid_check.stateChanged.connect(
+            lambda: self.update_setting('show_grid', self.grid_check.isChecked())
+        )
+        custom_layout.addRow(self.grid_check)
+
         self.update_plot_btn = QPushButton("Update Plot")
         self.update_plot_btn.clicked.connect(self.update_plot)
-        custom_layout.addWidget(self.update_plot_btn)
-        
+        custom_layout.addRow(self.update_plot_btn)
+
         left_layout.addWidget(custom_group)
-        
-        # Export group
+
+        # Export
         export_group = QGroupBox("Export")
-        export_layout = QVBoxLayout(export_group)
-        
-        # DPI setting
-        dpi_layout = QHBoxLayout()
-        dpi_layout.addWidget(QLabel("DPI:"))
+        export_layout = QFormLayout(export_group)
+
         self.dpi_spin = QSpinBox()
         self.dpi_spin.setRange(72, 600)
         self.dpi_spin.setValue(300)
         self.dpi_spin.setSingleStep(50)
         self.dpi_spin.valueChanged.connect(lambda v: self.update_setting('dpi', v))
-        dpi_layout.addWidget(self.dpi_spin)
-        export_layout.addLayout(dpi_layout)
-        
+        export_layout.addRow("DPI:", self.dpi_spin)
+
         self.export_png_btn = QPushButton("Export as PNG")
         self.export_png_btn.clicked.connect(lambda: self.export_plot('png'))
-        export_layout.addWidget(self.export_png_btn)
-        
+        export_layout.addRow(self.export_png_btn)
+
         self.export_pdf_btn = QPushButton("Export as PDF")
         self.export_pdf_btn.clicked.connect(lambda: self.export_plot('pdf'))
-        export_layout.addWidget(self.export_pdf_btn)
-        
+        export_layout.addRow(self.export_pdf_btn)
+
         self.export_svg_btn = QPushButton("Export as SVG")
         self.export_svg_btn.clicked.connect(lambda: self.export_plot('svg'))
-        export_layout.addWidget(self.export_svg_btn)
-        
+        export_layout.addRow(self.export_svg_btn)
+
         self.export_data_btn = QPushButton("Export Data (CSV)")
         self.export_data_btn.clicked.connect(self.export_data)
-        export_layout.addWidget(self.export_data_btn)
-        
+        export_layout.addRow(self.export_data_btn)
+
         left_layout.addWidget(export_group)
-        
         left_layout.addStretch()
-        
+
+        left_scroll.setWidget(left_panel)
+
         # Right panel - visualization
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
-        
-        # Create tab widget for different views
+        right_layout.setContentsMargins(0, 0, 0, 0)
+
         self.viz_tabs = QTabWidget()
-        
-        # Main plot tab
+
         plot_widget = QWidget()
         plot_layout = QVBoxLayout(plot_widget)
-        
-        self.figure = Figure(figsize=(10, 8))
+        plot_layout.setContentsMargins(0, 0, 0, 0)
+        plot_layout.setSpacing(2)
+
+        mode = get_current_mode()
+        palette = get_plot_palette(mode)
+        self.figure = Figure(figsize=(10, 8), facecolor=palette["figure_facecolor"])
         self.canvas = FigureCanvas(self.figure)
-        self.toolbar = NavigationToolbar(self.canvas, self)
-        
+        self.toolbar = NavigationToolbar(self.canvas, plot_widget)
+
         plot_layout.addWidget(self.toolbar)
         plot_layout.addWidget(self.canvas)
-        
+        apply_plot_style(self.figure, mode)
+
         self.viz_tabs.addTab(plot_widget, "Main Plot")
-        
-        # Refinement results tab
+
         results_widget = QWidget()
         results_layout = QVBoxLayout(results_widget)
-        
         self.results_text = QTextEdit()
         self.results_text.setReadOnly(True)
         results_layout.addWidget(self.results_text)
-        
         self.viz_tabs.addTab(results_widget, "Refinement Results")
-        
-        # Phase table tab
+
         phase_widget = QWidget()
         phase_layout = QVBoxLayout(phase_widget)
-        
         self.phase_table = QTableWidget()
         self.phase_table.setColumnCount(5)
-        self.phase_table.setHorizontalHeaderLabels(['Phase', 'Formula', 'Scale Factor', 'Rwp (%)', 'Color'])
+        self.phase_table.setHorizontalHeaderLabels(
+            ['Phase', 'Formula', 'Scale Factor', 'Rwp (%)', 'Color']
+        )
+        self.phase_table.setAlternatingRowColors(True)
         phase_layout.addWidget(self.phase_table)
-        
+
         phase_customize_btn = QPushButton("Customize Phase Colors")
         phase_customize_btn.clicked.connect(self.customize_phase_colors)
         phase_layout.addWidget(phase_customize_btn)
-        
         self.viz_tabs.addTab(phase_widget, "Phase Details")
-        
+
         right_layout.addWidget(self.viz_tabs)
-        
-        # Add panels to splitter
+
         splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(left_panel)
+        splitter.addWidget(left_scroll)
         splitter.addWidget(right_panel)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        
+
         main_layout.addWidget(splitter)
-    
+
     def _toggle_range_inputs(self):
         """Enable/disable 2-theta range input fields"""
         enabled = self.use_range_check.isChecked()
@@ -628,19 +601,35 @@ class VisualizationTab(QWidget):
         """Update the main plot with current data and settings"""
         if not self.experimental_pattern:
             return
-            
+
         self.figure.clear()
-        
-        # Determine if we're doing waterfall plot
+
         waterfall_offset = self.plot_settings['waterfall_offset']
-        
+
         if waterfall_offset > 0:
             self._create_waterfall_plot()
         else:
             self._create_standard_plot()
-            
+
+        apply_plot_style(
+            self.figure,
+            get_current_mode(),
+            show_grid=self.plot_settings.get('show_grid', True),
+        )
         self.canvas.draw()
-        
+
+    def on_theme_changed(self, mode: str):
+        palette = get_plot_palette(mode)
+        # Only update default colors if user hasn't customized away from theme defaults
+        self.plot_settings['exp_color'] = palette['exp_line']
+        self.plot_settings['calc_color'] = palette['calc_line']
+        self.plot_settings['diff_color'] = palette['diff_line']
+        if self.experimental_pattern:
+            self.update_plot()
+        else:
+            apply_plot_style(self.figure, mode)
+            self.canvas.draw()
+
     def _create_standard_plot(self):
         """Create standard overlay plot"""
         ax = self.figure.add_subplot(111)

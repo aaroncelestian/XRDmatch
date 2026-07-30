@@ -4,10 +4,10 @@ Pattern data tab for loading and analyzing diffraction patterns
 
 import numpy as np
 import pandas as pd
-from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
-                             QLabel, QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox,
+from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
+                             QLabel, QComboBox, QDoubleSpinBox,
                              QTableWidget, QTableWidgetItem, QGroupBox, QFileDialog,
-                             QMessageBox, QSplitter, QCheckBox)
+                             QMessageBox, QSplitter)
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QDragEnterEvent, QDropEvent
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -16,7 +16,9 @@ from matplotlib.figure import Figure
 from scipy.signal import find_peaks
 from scipy.sparse import diags
 from scipy.sparse.linalg import spsolve
-import matplotlib.pyplot as plt
+
+from matplotlib_config import apply_plot_style, get_plot_palette
+from gui.theme import get_current_mode
 
 class PatternTab(QWidget):
     """Tab for handling diffraction pattern data"""
@@ -39,38 +41,33 @@ class PatternTab(QWidget):
     def init_ui(self):
         """Initialize the user interface"""
         layout = QVBoxLayout(self)
-        
-        # Control panel
-        control_panel = self.create_control_panel()
-        layout.addWidget(control_panel)
-        
-        # Splitter for plot and peak table
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        layout.addWidget(self.create_control_panel())
+
         splitter = QSplitter(Qt.Orientation.Horizontal)
         layout.addWidget(splitter)
-        
-        # Plot widget
+
         self.plot_widget = self.create_plot_widget()
         splitter.addWidget(self.plot_widget)
-        
-        # Peak table
+
         self.peak_table = self.create_peak_table()
         splitter.addWidget(self.peak_table)
-        
-        # Set splitter proportions
+
         splitter.setSizes([700, 300])
-        
+
     def create_control_panel(self):
         """Create the control panel"""
         group = QGroupBox("Pattern Controls")
         layout = QHBoxLayout(group)
-        
-        # File controls
+
         self.load_btn = QPushButton("Load Pattern")
+        self.load_btn.setObjectName("primaryButton")
         self.load_btn.clicked.connect(self.load_pattern_dialog)
         layout.addWidget(self.load_btn)
-        
-        # Wavelength controls - placed immediately after Load button for visibility
-        layout.addWidget(QLabel("  λ:"))
+
+        layout.addWidget(QLabel("λ:"))
         self.wavelength_combo = QComboBox()
         self.wavelength_combo.addItems([
             "Cu Kα1 (1.5406)",
@@ -83,9 +80,9 @@ class PatternTab(QWidget):
             "Custom"
         ])
         self.wavelength_combo.currentTextChanged.connect(self.wavelength_changed)
-        self.wavelength_combo.setToolTip("Select X-ray wavelength - IMPORTANT: Must match your experimental data!")
+        self.wavelength_combo.setToolTip("Select X-ray wavelength - must match experimental data")
         layout.addWidget(self.wavelength_combo)
-        
+
         self.custom_wavelength = QDoubleSpinBox()
         self.custom_wavelength.setRange(0.1, 10.0)
         self.custom_wavelength.setDecimals(4)
@@ -94,49 +91,54 @@ class PatternTab(QWidget):
         self.custom_wavelength.valueChanged.connect(self.custom_wavelength_changed)
         self.custom_wavelength.setToolTip("Enter custom wavelength in Ångströms")
         layout.addWidget(self.custom_wavelength)
-        
-        # File status label
-        self.file_label = QLabel("No file loaded - Drag & drop files here!")
-        self.file_label.setStyleSheet("QLabel { color: #666; font-style: italic; }")
-        layout.addWidget(self.file_label)
-        
-        layout.addStretch()
-        
+
+        self.file_label = QLabel("No file loaded — drag & drop files here")
+        self.file_label.setObjectName("mutedLabel")
+        layout.addWidget(self.file_label, 1)
+
         return group
-        
+
     def create_plot_widget(self):
         """Create the matplotlib plot widget"""
         group = QGroupBox("Diffraction Pattern")
         layout = QVBoxLayout(group)
-        
-        self.figure = Figure(figsize=(10, 6))
+        layout.setContentsMargins(6, 10, 6, 6)
+        layout.setSpacing(2)
+
+        mode = get_current_mode()
+        palette = get_plot_palette(mode)
+        self.figure = Figure(figsize=(10, 6), facecolor=palette["figure_facecolor"])
         self.canvas = FigureCanvas(self.figure)
-        
-        # Add navigation toolbar
-        self.toolbar = NavigationToolbar(self.canvas, self)
+
+        self.toolbar = NavigationToolbar(self.canvas, group)
         layout.addWidget(self.toolbar)
         layout.addWidget(self.canvas)
-        
+
         self.ax = self.figure.add_subplot(111)
         self.ax.set_xlabel('2θ (degrees)')
         self.ax.set_ylabel('Intensity (counts)')
         self.ax.set_title('X-ray Diffraction Pattern')
-        self.ax.grid(True, alpha=0.3)
-        
+        apply_plot_style(self.figure, mode)
+
         return group
-        
+
     def create_peak_table(self):
         """Create the peak table widget"""
         group = QGroupBox("Detected Peaks")
         layout = QVBoxLayout(group)
-        
+
         self.peak_table_widget = QTableWidget()
         self.peak_table_widget.setColumnCount(4)
         self.peak_table_widget.setHorizontalHeaderLabels(['2θ', 'Intensity', 'd-spacing', 'Rel. Int.'])
+        self.peak_table_widget.setAlternatingRowColors(True)
         layout.addWidget(self.peak_table_widget)
-        
+
         return group
-        
+
+    def on_theme_changed(self, mode: str):
+        apply_plot_style(self.figure, mode)
+        self.plot_pattern()
+
     def wavelength_changed(self, text):
         """Handle wavelength selection change"""
         if "Custom" in text:
@@ -243,7 +245,10 @@ class PatternTab(QWidget):
             self.plot_pattern()
             format_info = f" ({file_format} format)"
             self.file_label.setText(f"Loaded: {file_path.split('/')[-1]}{format_info}")
-            self.file_label.setStyleSheet("QLabel { color: #000; font-style: normal; }")
+            self.file_label.setObjectName("")
+            self.file_label.setStyleSheet("")
+            self.file_label.style().unpolish(self.file_label)
+            self.file_label.style().polish(self.file_label)
             
             # Emit signal
             self.pattern_loaded.emit(self.pattern_data)
@@ -283,7 +288,7 @@ class PatternTab(QWidget):
         # Update title to show format
         format_info = self.pattern_data.get('file_format', 'XY')
         self.ax.set_title(f'X-ray Diffraction Pattern ({format_info} format)')
-        self.ax.grid(True, alpha=0.3)
+        apply_plot_style(self.figure, get_current_mode())
         self.canvas.draw()
     
     def dragEnterEvent(self, event: QDragEnterEvent):

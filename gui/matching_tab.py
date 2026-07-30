@@ -5,21 +5,26 @@ Phase matching tab for comparing experimental and reference patterns
 import numpy as np
 import pandas as pd
 import requests
-from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
-                             QLabel, QTableWidget, QTableWidgetItem, QGroupBox,
-                             QSlider, QDoubleSpinBox, QComboBox, QTextEdit,
-                             QSplitter, QProgressBar, QCheckBox, QMessageBox)
+from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
+                             QLabel, QTableWidget, QTableWidgetItem,
+                             QDoubleSpinBox, QComboBox, QSplitter, QProgressBar,
+                             QCheckBox, QMessageBox, QFormLayout, QSpinBox,
+                             QScrollArea, QFrame)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
-import matplotlib.pyplot as plt
 from utils.cif_parser import CIFParser
 from utils.multi_phase_analyzer import MultiPhaseAnalyzer
 from scipy.special import wofz
 from scipy.stats import pearsonr
 from scipy.interpolate import interp1d
 from typing import Dict
+
+from matplotlib_config import apply_plot_style, get_plot_palette
+from gui.theme import get_current_mode
+from gui.widgets.section import SectionFrame
+
 
 class PhaseMatchingThread(QThread):
     """Thread for phase matching calculations"""
@@ -252,6 +257,8 @@ class PhaseMatchingThread(QThread):
                         phase['cell_alpha'] = pre_calculated['cell_alpha']
                         phase['cell_beta'] = pre_calculated['cell_beta']
                         phase['cell_gamma'] = pre_calculated['cell_gamma']
+                    if pre_calculated.get('rir') is not None:
+                        phase['rir'] = pre_calculated['rir']
                     return pre_calculated
                 else:
                     print("No pre-calculated pattern found, calculating from CIF...")
@@ -631,68 +638,133 @@ class MatchingTab(QWidget):
     def init_ui(self):
         """Initialize the user interface"""
         layout = QVBoxLayout(self)
-        
-        # Control panel
-        control_panel = self.create_control_panel()
-        layout.addWidget(control_panel)
-        
-        # Progress bar
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        # Slim top action bar
+        layout.addWidget(self.create_action_bar())
+
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         layout.addWidget(self.progress_bar)
-        
-        # Main content splitter
+
+        # Params | Plot | Results
         main_splitter = QSplitter(Qt.Orientation.Horizontal)
         layout.addWidget(main_splitter)
-        
-        # Left side: Plot
-        plot_panel = self.create_plot_panel()
-        main_splitter.addWidget(plot_panel)
-        
-        # Right side: Results
-        results_panel = self.create_results_panel()
-        main_splitter.addWidget(results_panel)
-        
-        # Set splitter proportions
-        main_splitter.setSizes([600, 400])
-        
-    def create_control_panel(self):
-        """Create the control panel"""
-        group = QGroupBox("Matching Parameters")
-        layout = QHBoxLayout(group)
-        
-        # Tolerance setting
-        layout.addWidget(QLabel("2θ tolerance (°):"))
+
+        main_splitter.addWidget(self.create_parameter_panel())
+        main_splitter.addWidget(self.create_plot_panel())
+        main_splitter.addWidget(self.create_results_panel())
+        main_splitter.setStretchFactor(0, 0)
+        main_splitter.setStretchFactor(1, 3)
+        main_splitter.setStretchFactor(2, 2)
+        main_splitter.setSizes([260, 620, 420])
+
+    def create_action_bar(self):
+        """Slim top bar: status + primary actions."""
+        bar = QFrame()
+        bar.setObjectName("actionBar")
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(10)
+
+        self.matching_status_label = QLabel("Load pattern and detect peaks to enable matching")
+        self.matching_status_label.setWordWrap(True)
+        self.matching_status_label.setProperty("class", "statusMuted")
+        self.matching_status_label.setObjectName("mutedLabel")
+        layout.addWidget(self.matching_status_label, 1)
+
+        self.match_btn = QPushButton("Start Matching")
+        self.match_btn.setObjectName("primaryButton")
+        self.match_btn.clicked.connect(self.start_matching)
+        self.match_btn.setEnabled(False)
+        layout.addWidget(self.match_btn)
+
+        self.multi_phase_btn = QPushButton("Multi-Phase Analysis")
+        self.multi_phase_btn.clicked.connect(self.start_multi_phase_analysis)
+        self.multi_phase_btn.setEnabled(False)
+        self.multi_phase_btn.setToolTip("Joint Le Bail accept/reject with optional residual discovery")
+        layout.addWidget(self.multi_phase_btn)
+
+        self.clear_btn = QPushButton("Clear Results")
+        self.clear_btn.clicked.connect(self.clear_results)
+        layout.addWidget(self.clear_btn)
+
+        return bar
+
+    def create_parameter_panel(self):
+        """Scrollable left column of FormLayout parameter sections."""
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setMinimumWidth(240)
+        scroll.setMaximumWidth(320)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        container = QWidget()
+        col = QVBoxLayout(container)
+        col.setContentsMargins(0, 0, 4, 0)
+        col.setSpacing(6)
+
+        # Matching
+        match_sec = SectionFrame("Matching", layout_type="form")
         self.tolerance_spin = QDoubleSpinBox()
         self.tolerance_spin.setRange(0.01, 2.0)
         self.tolerance_spin.setDecimals(2)
         self.tolerance_spin.setValue(0.20)
         self.tolerance_spin.setSingleStep(0.01)
-        layout.addWidget(self.tolerance_spin)
-        
-        # Minimum match score
-        layout.addWidget(QLabel("Min. match score:"))
+        match_sec.body.addRow("2θ tolerance (°):", self.tolerance_spin)
+
         self.min_score_spin = QDoubleSpinBox()
         self.min_score_spin.setRange(0.0, 1.0)
         self.min_score_spin.setDecimals(2)
         self.min_score_spin.setValue(0.01)
         self.min_score_spin.setSingleStep(0.05)
-        layout.addWidget(self.min_score_spin)
-        
-        # Global theoretical pattern scaling (now affects all phases)
-        layout.addWidget(QLabel("Global scale (%):"))
+        match_sec.body.addRow("Min. match score:", self.min_score_spin)
+
+        self.peak_weight_spin = QDoubleSpinBox()
+        self.peak_weight_spin.setRange(0.0, 1.0)
+        self.peak_weight_spin.setDecimals(2)
+        self.peak_weight_spin.setValue(0.6)
+        self.peak_weight_spin.setSingleStep(0.1)
+        self.peak_weight_spin.setToolTip("Weight for peak-based scoring in combined score")
+        match_sec.body.addRow("Peak weight:", self.peak_weight_spin)
+
+        self.corr_weight_spin = QDoubleSpinBox()
+        self.corr_weight_spin.setRange(0.0, 1.0)
+        self.corr_weight_spin.setDecimals(2)
+        self.corr_weight_spin.setValue(0.4)
+        self.corr_weight_spin.setSingleStep(0.1)
+        self.corr_weight_spin.setToolTip("Weight for correlation-based scoring in combined score")
+        match_sec.body.addRow("Corr. weight:", self.corr_weight_spin)
+
+        def normalize_weights():
+            peak_weight = self.peak_weight_spin.value()
+            corr_weight = self.corr_weight_spin.value()
+            total = peak_weight + corr_weight
+            if total > 0:
+                self.peak_weight_spin.blockSignals(True)
+                self.corr_weight_spin.blockSignals(True)
+                self.peak_weight_spin.setValue(peak_weight / total)
+                self.corr_weight_spin.setValue(corr_weight / total)
+                self.peak_weight_spin.blockSignals(False)
+                self.corr_weight_spin.blockSignals(False)
+
+        self.peak_weight_spin.valueChanged.connect(normalize_weights)
+        self.corr_weight_spin.valueChanged.connect(normalize_weights)
+        col.addWidget(match_sec)
+
+        # Display
+        disp_sec = SectionFrame("Display", layout_type="form")
         self.global_scale_spin = QDoubleSpinBox()
         self.global_scale_spin.setRange(10, 200)
         self.global_scale_spin.setDecimals(0)
         self.global_scale_spin.setValue(80)
         self.global_scale_spin.setSingleStep(10)
         self.global_scale_spin.setSuffix("%")
-        self.global_scale_spin.setToolTip("Apply this scaling to all phases (updates individual phase scales)")
+        self.global_scale_spin.setToolTip("Apply this scaling to all phases")
         self.global_scale_spin.valueChanged.connect(self.apply_global_scaling)
-        layout.addWidget(self.global_scale_spin)
-        
-        # Peak width control for theoretical patterns
-        layout.addWidget(QLabel("Peak FWHM (°):"))
+        disp_sec.body.addRow("Global scale:", self.global_scale_spin)
+
         self.fwhm_spin = QDoubleSpinBox()
         self.fwhm_spin.setRange(0.01, 2.0)
         self.fwhm_spin.setDecimals(2)
@@ -700,195 +772,162 @@ class MatchingTab(QWidget):
         self.fwhm_spin.setSingleStep(0.01)
         self.fwhm_spin.setToolTip("Full Width at Half Maximum for theoretical peak profiles")
         self.fwhm_spin.valueChanged.connect(self.update_plot)
-        layout.addWidget(self.fwhm_spin)
-        
-        # Minimum intensity filter for theoretical peaks
-        layout.addWidget(QLabel("Min. intensity (%):")); 
+        disp_sec.body.addRow("Peak FWHM (°):", self.fwhm_spin)
+
         self.min_intensity_spin = QDoubleSpinBox()
         self.min_intensity_spin.setRange(0, 100)
         self.min_intensity_spin.setDecimals(1)
         self.min_intensity_spin.setValue(1.0)
         self.min_intensity_spin.setSingleStep(1.0)
         self.min_intensity_spin.setSuffix("%")
-        self.min_intensity_spin.setToolTip("Minimum intensity percentage for theoretical peaks to be shown and considered in matching")
+        self.min_intensity_spin.setToolTip("Minimum intensity % for theoretical peaks")
         self.min_intensity_spin.valueChanged.connect(self.update_plot)
-        layout.addWidget(self.min_intensity_spin)
-        
-        # 2θ display limits
-        layout.addWidget(QLabel("2θ range:"))
+        disp_sec.body.addRow("Min. intensity:", self.min_intensity_spin)
+
+        range_row = QHBoxLayout()
         self.min_2theta_spin = QDoubleSpinBox()
         self.min_2theta_spin.setRange(0, 180)
         self.min_2theta_spin.setDecimals(1)
         self.min_2theta_spin.setValue(5.0)
         self.min_2theta_spin.setSingleStep(1.0)
         self.min_2theta_spin.setSuffix("°")
-        self.min_2theta_spin.setToolTip("Minimum 2θ angle to display")
         self.min_2theta_spin.valueChanged.connect(self.update_plot)
-        layout.addWidget(self.min_2theta_spin)
-        
-        layout.addWidget(QLabel("to"))
-        
+        range_row.addWidget(self.min_2theta_spin)
+
         self.max_2theta_spin = QDoubleSpinBox()
         self.max_2theta_spin.setRange(0, 180)
         self.max_2theta_spin.setDecimals(1)
         self.max_2theta_spin.setValue(60.0)
         self.max_2theta_spin.setSingleStep(1.0)
         self.max_2theta_spin.setSuffix("°")
-        self.max_2theta_spin.setToolTip("Maximum 2θ angle to display")
         self.max_2theta_spin.valueChanged.connect(self.update_plot)
-        layout.addWidget(self.max_2theta_spin)
-        
-        # Auto-range button
+        range_row.addWidget(self.max_2theta_spin)
+
         self.auto_range_btn = QPushButton("Auto")
-        self.auto_range_btn.setToolTip("Auto-set 2θ range based on experimental data")
+        self.auto_range_btn.setToolTip("Auto-set 2θ range from experimental data")
         self.auto_range_btn.clicked.connect(self.auto_set_2theta_range)
-        layout.addWidget(self.auto_range_btn)
-        
-        layout.addStretch()
-        
-        # Correlation weighting controls
-        layout.addWidget(QLabel("Peak weight:"))
-        self.peak_weight_spin = QDoubleSpinBox()
-        self.peak_weight_spin.setRange(0.0, 1.0)
-        self.peak_weight_spin.setDecimals(2)
-        self.peak_weight_spin.setValue(0.6)
-        self.peak_weight_spin.setSingleStep(0.1)
-        self.peak_weight_spin.setToolTip("Weight for peak-based scoring in combined score")
-        layout.addWidget(self.peak_weight_spin)
-        
-        layout.addWidget(QLabel("Corr. weight:"))
-        self.corr_weight_spin = QDoubleSpinBox()
-        self.corr_weight_spin.setRange(0.0, 1.0)
-        self.corr_weight_spin.setDecimals(2)
-        self.corr_weight_spin.setValue(0.4)
-        self.corr_weight_spin.setSingleStep(0.1)
-        self.corr_weight_spin.setToolTip("Weight for correlation-based scoring in combined score")
-        layout.addWidget(self.corr_weight_spin)
-        
-        # Auto-normalize weights
-        def normalize_weights():
-            peak_weight = self.peak_weight_spin.value()
-            corr_weight = self.corr_weight_spin.value()
-            total = peak_weight + corr_weight
-            if total > 0:
-                self.peak_weight_spin.setValue(peak_weight / total)
-                self.corr_weight_spin.setValue(corr_weight / total)
-        
-        self.peak_weight_spin.valueChanged.connect(normalize_weights)
-        self.corr_weight_spin.valueChanged.connect(normalize_weights)
-        
-        layout.addStretch()
-        
-        # Matching status label
-        self.matching_status_label = QLabel("Load pattern and detect peaks to enable matching")
-        self.matching_status_label.setWordWrap(True)
-        self.matching_status_label.setStyleSheet("QLabel { color: #666; font-style: italic; }")
-        layout.addWidget(self.matching_status_label)
-        
-        # Action buttons
-        self.match_btn = QPushButton("Start Matching")
-        self.match_btn.clicked.connect(self.start_matching)
-        self.match_btn.setEnabled(False)
-        layout.addWidget(self.match_btn)
-        
-        # Multi-phase analysis button
-        self.multi_phase_btn = QPushButton("Multi-Phase Analysis")
-        self.multi_phase_btn.clicked.connect(self.start_multi_phase_analysis)
-        self.multi_phase_btn.setEnabled(False)
-        self.multi_phase_btn.setToolTip("Sequential phase identification with residue analysis")
-        layout.addWidget(self.multi_phase_btn)
-        
-        
-        self.clear_btn = QPushButton("Clear Results")
-        self.clear_btn.clicked.connect(self.clear_results)
-        layout.addWidget(self.clear_btn)
-        
-        return group
-        
+        range_row.addWidget(self.auto_range_btn)
+        disp_sec.body.addRow("2θ range:", range_row)
+        col.addWidget(disp_sec)
+
+        # Multi-phase
+        mp_sec = SectionFrame("Multi-Phase ID", layout_type="form")
+        self.mp_method_combo = QComboBox()
+        self.mp_method_combo.addItems(["Joint Le Bail (recommended)", "Legacy sequential residual"])
+        mp_sec.body.addRow("Method:", self.mp_method_combo)
+
+        self.mp_max_phases_spin = QSpinBox()
+        self.mp_max_phases_spin.setRange(1, 10)
+        self.mp_max_phases_spin.setValue(5)
+        mp_sec.body.addRow("Max phases:", self.mp_max_phases_spin)
+
+        self.mp_delta_rwp_spin = QDoubleSpinBox()
+        self.mp_delta_rwp_spin.setRange(0.1, 50.0)
+        self.mp_delta_rwp_spin.setDecimals(1)
+        self.mp_delta_rwp_spin.setValue(2.0)
+        self.mp_delta_rwp_spin.setSuffix("%")
+        self.mp_delta_rwp_spin.setToolTip("Minimum Rwp improvement to accept a phase (joint method)")
+        mp_sec.body.addRow("Min ΔRwp:", self.mp_delta_rwp_spin)
+
+        self.mp_residual_research_check = QCheckBox("Residual DB re-search")
+        self.mp_residual_research_check.setChecked(False)
+        self.mp_residual_research_check.setToolTip("Re-query ultra-fast index on fit residual")
+        mp_sec.body.addRow("", self.mp_residual_research_check)
+        col.addWidget(mp_sec)
+
+        col.addStretch()
+        scroll.setWidget(container)
+        return scroll
+
     def create_plot_panel(self):
         """Create the plot panel"""
-        group = QGroupBox("Pattern Comparison")
-        layout = QVBoxLayout(group)
-        
-        # Plot canvas
-        self.figure = Figure(figsize=(8, 10))
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+
+        mode = get_current_mode()
+        palette = get_plot_palette(mode)
+        self.figure = Figure(figsize=(8, 10), facecolor=palette["figure_facecolor"])
         self.canvas = FigureCanvas(self.figure)
-        
-        # Add navigation toolbar
-        self.toolbar = NavigationToolbar(self.canvas, self)
+        self.toolbar = NavigationToolbar(self.canvas, panel)
         layout.addWidget(self.toolbar)
         layout.addWidget(self.canvas)
-        
-        # Create subplots with adjusted height ratios (main plot larger, diff plot smaller)
-        self.ax_main = self.figure.add_subplot(3, 1, (1, 2))  # Takes rows 1-2 (2/3 of space)
-        self.ax_diff = self.figure.add_subplot(3, 1, 3)      # Takes row 3 (1/3 of space)
-        
+
+        self.ax_main = self.figure.add_subplot(3, 1, (1, 2))
+        self.ax_diff = self.figure.add_subplot(3, 1, 3)
+
         self.ax_main.set_xlabel('2θ (degrees)')
         self.ax_main.set_ylabel('Intensity')
         self.ax_main.set_title('Experimental vs Reference Patterns')
-        self.ax_main.grid(True, alpha=0.3)
-        
         self.ax_diff.set_xlabel('d-spacing (Å)')
         self.ax_diff.set_ylabel('Phase')
         self.ax_diff.set_title('Peak Matching Overview')
-        self.ax_diff.grid(True, alpha=0.3)
-        
+        apply_plot_style(self.figure, mode)
         self.figure.tight_layout()
-        
-        return group
-        
+
+        return panel
+
     def create_results_panel(self):
         """Create the results panel"""
-        group = QGroupBox("Matching Results")
-        layout = QVBoxLayout(group)
-        
-        # Selection controls
+        panel = SectionFrame("Matching Results", layout_type="vbox")
+
         selection_layout = QHBoxLayout()
         select_all_btn = QPushButton("Select All")
         select_all_btn.clicked.connect(self.select_all_phases)
         select_all_btn.setToolTip("Select all phases for refinement/export")
         selection_layout.addWidget(select_all_btn)
-        
+
         deselect_all_btn = QPushButton("Deselect All")
         deselect_all_btn.clicked.connect(self.deselect_all_phases)
-        deselect_all_btn.setToolTip("Deselect all phases")
         selection_layout.addWidget(deselect_all_btn)
-        
+
         select_top_btn = QPushButton("Select Top 5")
         select_top_btn.clicked.connect(lambda: self.select_top_n_phases(5))
-        select_top_btn.setToolTip("Select only the top 5 phases")
         selection_layout.addWidget(select_top_btn)
-        
         selection_layout.addStretch()
-        layout.addLayout(selection_layout)
-        
-        # Results table
+        panel.body.addLayout(selection_layout)
+
         self.results_table = QTableWidget()
         self.results_table.setColumnCount(10)
         self.results_table.setHorizontalHeaderLabels([
-            'Select', 'Phase', 'Peak Score', 'Corr. Score', 'Combined', 'Coverage', 'Matches', 'R²', 'Scale %', 'Show'
+            'Select', 'Phase', 'Peak Score', 'Corr. Score', 'Combined',
+            'Coverage', 'Matches', 'R²', 'Scale %', 'Show'
         ])
         self.results_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        layout.addWidget(self.results_table)
-        
-        # Detailed match info
-        detail_group = QGroupBox("Match Details")
-        detail_layout = QVBoxLayout(detail_group)
-        
+        self.results_table.setAlternatingRowColors(True)
+        panel.body.addWidget(self.results_table)
+
+        detail_label = QLabel("Match Details")
+        detail_label.setObjectName("mutedLabel")
+        panel.body.addWidget(detail_label)
+
         self.detail_table = QTableWidget()
         self.detail_table.setColumnCount(8)
         self.detail_table.setHorizontalHeaderLabels([
-            'Exp. 2θ (°)', 'Theo. 2θ (°)', 'Δ 2θ (°)', 'Exp. Int.', 'Theo. Int.', 'Int. Sim.', 'Exp. d (Å)', 'Match Quality'
+            'Exp. 2θ (°)', 'Theo. 2θ (°)', 'Δ 2θ (°)', 'Exp. Int.',
+            'Theo. Int.', 'Int. Sim.', 'Exp. d (Å)', 'Match Quality'
         ])
-        detail_layout.addWidget(self.detail_table)
-        
-        layout.addWidget(detail_group)
-        
-        # Connect table selection
+        self.detail_table.setMaximumHeight(180)
+        self.detail_table.setAlternatingRowColors(True)
+        panel.body.addWidget(self.detail_table)
+
         self.results_table.itemSelectionChanged.connect(self.show_match_details)
-        
-        return group
-        
+        return panel
+
+    def on_theme_changed(self, mode: str):
+        """Restyle matplotlib canvases when theme toggles."""
+        apply_plot_style(self.figure, mode)
+        self.update_plot()
+
+    def _set_status_class(self, kind: str):
+        """Apply QSS status class to matching status label."""
+        names = {"ok": "statusOkLabel", "warn": "statusWarnLabel", "error": "statusErrorLabel"}
+        self.matching_status_label.setObjectName(names.get(kind, "mutedLabel"))
+        self.matching_status_label.setStyleSheet("")
+        self.matching_status_label.style().unpolish(self.matching_status_label)
+        self.matching_status_label.style().polish(self.matching_status_label)
+         
     def auto_set_2theta_range(self):
         """Automatically set 2θ range based on experimental data"""
         pattern_to_use = self.processed_pattern or self.experimental_pattern
@@ -961,8 +1000,8 @@ class MatchingTab(QWidget):
         
         # Update status label with helpful information
         if can_match:
-            self.matching_status_label.setText(f"✓ Ready! {len(self.reference_phases)} phase(s) loaded")
-            self.matching_status_label.setStyleSheet("QLabel { color: #0a0; font-weight: bold; }")
+            self.matching_status_label.setText(f"Ready — {len(self.reference_phases)} phase(s) loaded")
+            self._set_status_class("ok")
         else:
             missing = []
             if not has_pattern:
@@ -971,10 +1010,10 @@ class MatchingTab(QWidget):
                 missing.append("peak detection")
             if len(self.reference_phases) == 0:
                 missing.append("reference phases")
-            
-            status_text = f"⚠ Missing: {', '.join(missing)}"
+
+            status_text = f"Missing: {', '.join(missing)}"
             self.matching_status_label.setText(status_text)
-            self.matching_status_label.setStyleSheet("QLabel { color: #c60; font-style: italic; }")
+            self._set_status_class("warn")
         
         # Multi-phase analysis requires matching results
         can_multi_phase = (can_match and 
@@ -1179,13 +1218,46 @@ class MatchingTab(QWidget):
         self.multi_phase_btn.setEnabled(False)
         
         try:
-            # Perform sequential phase identification
-            self.multi_phase_results = self.multi_phase_analyzer.sequential_phase_identification(
-                experimental_data, 
-                candidate_phases,
-                max_phases=5,
-                residue_threshold=0.05
-            )
+            use_joint = self.mp_method_combo.currentIndex() == 0
+            max_phases = self.mp_max_phases_spin.value()
+            min_delta = self.mp_delta_rwp_spin.value()
+            residual_research = self.mp_residual_research_check.isChecked()
+
+            # Attach RIR from reference phases / DB when available
+            for cand in candidate_phases:
+                phase = cand.get('phase', cand)
+                if phase.get('rir') is None:
+                    # Try reference_phases list
+                    for ref in self.reference_phases:
+                        if ref.get('id') == phase.get('id') and ref.get('rir') is not None:
+                            phase['rir'] = ref['rir']
+                            break
+
+            if use_joint:
+                from utils.fast_pattern_search import FastPatternSearchEngine
+                fast_engine = None
+                if residual_research:
+                    fast_engine = FastPatternSearchEngine()
+                    # Use cached index if present; do not force rebuild here
+                    if fast_engine.search_index is None:
+                        fast_engine._auto_load_cache()
+
+                self.multi_phase_results = self.multi_phase_analyzer.joint_lebail_phase_identification(
+                    experimental_data,
+                    candidate_phases,
+                    max_phases=max_phases,
+                    min_delta_rwp=min_delta,
+                    residual_research=residual_research,
+                    fast_search_engine=fast_engine,
+                    polish=True
+                )
+            else:
+                self.multi_phase_results = self.multi_phase_analyzer.sequential_phase_identification(
+                    experimental_data,
+                    candidate_phases,
+                    max_phases=max_phases,
+                    residue_threshold=0.05
+                )
             
             # Display results
             self.display_multi_phase_results()
@@ -1194,6 +1266,8 @@ class MatchingTab(QWidget):
             QMessageBox.critical(self, "Multi-Phase Analysis Error", 
                                f"Error during multi-phase analysis:\n{str(e)}")
             print(f"Multi-phase analysis error: {e}")
+            import traceback
+            traceback.print_exc()
             
         finally:
             self.progress_bar.setVisible(False)
@@ -1293,7 +1367,12 @@ class MatchingTab(QWidget):
             color = colors[i % len(colors)]
             
             # Plot phase contribution
-            contribution = phase_result['contribution']
+            contribution = phase_result.get('contribution')
+            if contribution is None:
+                continue
+            contribution = np.asarray(contribution, dtype=float)
+            if contribution.shape != np.asarray(exp_two_theta).shape:
+                continue
             normalized_contribution = (contribution / max_exp_intensity) * 100
             
             self.ax_main.plot(exp_two_theta, normalized_contribution, 
@@ -1303,7 +1382,8 @@ class MatchingTab(QWidget):
         # Format main plot
         self.ax_main.set_xlabel('2θ (degrees)')
         self.ax_main.set_ylabel('Normalized Intensity (0-100)')
-        self.ax_main.set_title('Multi-Phase Analysis: Sequential Subtraction Results')
+        method = self.multi_phase_results.get('method', 'multi-phase')
+        self.ax_main.set_title(f'Multi-Phase Analysis ({method})')
         self.ax_main.grid(True, alpha=0.3)
         self.ax_main.legend(loc='upper right')
         
@@ -1311,6 +1391,9 @@ class MatchingTab(QWidget):
         residue_history = self.multi_phase_results['residue_history']
         
         for i, residue in enumerate(residue_history):
+            residue = np.asarray(residue, dtype=float)
+            if residue.shape != np.asarray(exp_two_theta).shape:
+                continue
             normalized_residue = (residue / max_exp_intensity) * 100
             alpha = 1.0 - (i * 0.15)  # Fade older residues
             alpha = max(alpha, 0.3)
@@ -1639,32 +1722,25 @@ class MatchingTab(QWidget):
         if self.processed_pattern:
             title += ' - Background Subtracted'
         self.ax_main.set_title(title)
-        self.ax_main.grid(True, alpha=0.3)
-        if self.ax_main.get_legend_handles_labels()[0]:  # Only show legend if there are items
+        if self.ax_main.get_legend_handles_labels()[0]:
             self.ax_main.legend(loc='upper right')
-        
+
         self.ax_diff.set_xlabel('2θ (degrees)')
         self.ax_diff.set_ylabel('Phase')
         min_int_text = f" (Min. Int.: {self.min_intensity_spin.value():.1f}%)"
         self.ax_diff.set_title('Peak Position Comparisons' + min_int_text)
-        self.ax_diff.grid(True, alpha=0.3)
-        
-        # Set y-axis limits to show the bars properly
+
         self.ax_diff.set_ylim(-1.2, 1.0)
-        
-        # Remove y-axis ticks since they're not meaningful for this plot
         self.ax_diff.set_yticks([])
-        
-        if self.ax_diff.get_legend_handles_labels()[0]:  # Only show legend if there are items
+
+        if self.ax_diff.get_legend_handles_labels()[0]:
             self.ax_diff.legend(loc='upper right')
-        
-        # Apply 2θ limits to both plots (synchronized)
+
         self.ax_main.set_xlim(min_2theta, max_2theta)
         self.ax_diff.set_xlim(min_2theta, max_2theta)
-        
-        # Set y-axis to normalized scale (0-110 to give some headroom)
         self.ax_main.set_ylim(0, 110)
-        
+
+        apply_plot_style(self.figure, get_current_mode())
         self.canvas.draw()
         
                         

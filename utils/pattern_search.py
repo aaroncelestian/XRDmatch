@@ -346,6 +346,88 @@ class PatternSearchEngine:
         
         print(f"✅ Combined search complete: {len(final_results)} results")
         return final_results
+
+    def ensemble_search(self, experimental_data: Dict,
+                        methods: Optional[List[str]] = None,
+                        max_results: int = 50,
+                        **kwargs) -> List[Dict]:
+        """
+        Run multiple search methods and fuse scores by mineral_id.
+
+        methods: subset of 'peaks', 'correlation', 'combined', 'ultrafast'
+        For ultrafast, pass fast_search_engine= in kwargs.
+        """
+        methods = methods or ['peaks', 'correlation', 'ultrafast']
+        fused: Dict[int, Dict] = {}
+
+        if 'peaks' in methods and experimental_data.get('two_theta') is not None:
+            for r in self.search_by_peaks(
+                experimental_data,
+                tolerance=kwargs.get('peak_tolerance', 0.2),
+                min_matches=kwargs.get('min_matches', 2),
+                max_results=max_results * 2
+            ):
+                mid = r['mineral_id']
+                entry = fused.setdefault(mid, {**r, 'method_scores': {}})
+                entry['method_scores']['peaks'] = r.get('match_score', 0.0)
+                entry.update({k: v for k, v in r.items() if k != 'method_scores'})
+
+        if 'correlation' in methods:
+            for r in self.search_by_correlation(
+                experimental_data,
+                min_correlation=kwargs.get('min_correlation', 0.25),
+                max_results=max_results * 2
+            ):
+                mid = r['mineral_id']
+                entry = fused.setdefault(mid, {**r, 'method_scores': {}})
+                entry['method_scores']['correlation'] = r.get('correlation', 0.0)
+                for k, v in r.items():
+                    if k != 'method_scores':
+                        entry[k] = v
+
+        if 'combined' in methods:
+            for r in self.combined_search(
+                experimental_data,
+                peak_tolerance=kwargs.get('peak_tolerance', 0.2),
+                min_correlation=kwargs.get('min_correlation', 0.25),
+                max_results=max_results * 2
+            ):
+                mid = r['mineral_id']
+                entry = fused.setdefault(mid, {**r, 'method_scores': {}})
+                entry['method_scores']['combined'] = r.get('combined_score', 0.0)
+                for k, v in r.items():
+                    if k != 'method_scores':
+                        entry[k] = v
+
+        if 'ultrafast' in methods:
+            fast_engine = kwargs.get('fast_search_engine')
+            if fast_engine is not None:
+                for r in fast_engine.ultra_fast_correlation_search(
+                    experimental_data,
+                    min_correlation=kwargs.get('min_correlation', 0.25),
+                    max_results=max_results * 2
+                ):
+                    mid = r['mineral_id']
+                    entry = fused.setdefault(mid, {**r, 'method_scores': {}})
+                    entry['method_scores']['ultrafast'] = r.get('correlation', 0.0)
+                    for k, v in r.items():
+                        if k != 'method_scores':
+                            entry[k] = v
+
+        results = []
+        for mid, entry in fused.items():
+            scores = list(entry.get('method_scores', {}).values())
+            if not scores:
+                continue
+            entry['ensemble_score'] = float(max(scores))
+            entry['ensemble_mean'] = float(np.mean(scores))
+            entry['combined_score'] = entry['ensemble_score']
+            entry['search_method'] = 'ensemble'
+            results.append(entry)
+
+        results.sort(key=lambda x: x['ensemble_score'], reverse=True)
+        print(f"✅ Ensemble search complete: {len(results)} fused results")
+        return results[:max_results]
     
     def _calculate_peak_match_score(self, exp_two_theta: np.ndarray, exp_intensity: np.ndarray,
                                    theo_two_theta: np.ndarray, theo_intensity: np.ndarray,

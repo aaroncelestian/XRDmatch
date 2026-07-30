@@ -33,6 +33,11 @@ class LeBailRefinement:
         self.refinement_history = []
         self.r_factors = {}
         self.two_theta_range = None  # Optional 2-theta range (min, max)
+        self.quiet = False
+        self.mode = 'polish'  # 'trial' | 'polish'
+        self.peak_intensity_cutoff = 0.0  # fraction of Imax; trial uses ~0.02
+        self.extract_iterations = 5
+        self._profile_cache = {}  # (phase_idx, cache_key) -> sparse profile parts
         
     def set_experimental_data(self, two_theta: np.ndarray, intensity: np.ndarray, 
                             errors: Optional[np.ndarray] = None,
@@ -54,7 +59,7 @@ class LeBailRefinement:
         
         if max_intensity > 0:
             normalized_intensity = (intensity / max_intensity) * 100.0
-            print(f"Normalized experimental intensity: {max_intensity:.0f} → 100.0")
+            self._log(f"Normalized experimental intensity: {max_intensity:.0f} → 100.0")
         else:
             normalized_intensity = intensity
         
@@ -149,8 +154,20 @@ class LeBailRefinement:
         self.experimental_data['intensity'] = self._original_experimental_data['intensity'][mask]
         self.experimental_data['errors'] = self._original_experimental_data['errors'][mask]
         
-        print(f"Applied 2-theta range filter: {min_2theta:.2f}° - {max_2theta:.2f}°")
-        print(f"Data points: {len(two_theta)} → {len(self.experimental_data['two_theta'])}")
+        self._log(f"Applied 2-theta range filter: {min_2theta:.2f}° - {max_2theta:.2f}°")
+        self._log(f"Data points: {len(two_theta)} → {len(self.experimental_data['two_theta'])}")
+
+    def _log(self, message: str):
+        """Print unless quiet mode is enabled"""
+        if not self.quiet:
+            print(message)
+
+    def clear_phases(self):
+        """Remove all phases and profile cache"""
+        self.phases = []
+        self._profile_cache = {}
+        self.refinement_history = []
+        self.r_factors = {}
         
     def _estimate_initial_scale(self, theoretical_peaks: Dict) -> float:
         """
@@ -199,8 +216,7 @@ class LeBailRefinement:
             # Both are normalized to 0-100, so scale should be close to 1.0
             # Target 80% of experimental max for initial estimate
             initial_scale = (exp_max_intensity * 0.8) / theo_max_intensity
-            print(f"Estimated initial scale factor: {initial_scale:.3f}")
-            print(f"  (Normalized exp max: {exp_max_intensity:.1f}, theo max: {theo_max_intensity:.1f})")
+            self._log(f"Estimated initial scale factor: {initial_scale:.3f}")
             return initial_scale
         
         return 1.0
@@ -224,19 +240,50 @@ class LeBailRefinement:
     def refine_phases(self, max_iterations: int = 20, 
                      convergence_threshold: float = 1e-5,
                      two_theta_range: Optional[Tuple[float, float]] = None,
-                     staged_refinement: bool = True) -> Dict:
+                     staged_refinement: bool = True,
+                     mode: str = 'polish',
+                     quiet: Optional[bool] = None) -> Dict:
         """
         Perform Le Bail refinement on all phases
         
         Args:
-            max_iterations: Maximum number of refinement cycles (reduced for performance)
+            max_iterations: Maximum number of refinement cycles
             convergence_threshold: Convergence criterion for R-factors
             two_theta_range: Optional (min, max) 2-theta range to limit refinement
             staged_refinement: Use staged refinement (unit cell first, then profile)
+            mode: 'trial' for fast accept/reject fits, 'polish' for full refinement
+            quiet: Suppress verbose logging (defaults True for trial, False for polish)
             
         Returns:
             Dictionary with refinement results
         """
+        self.mode = mode if mode in ('trial', 'polish') else 'polish'
+        if quiet is not None:
+            self.quiet = quiet
+        else:
+            self.quiet = (self.mode == 'trial')
+
+        if self.mode == 'trial':
+            # Fast path defaults
+            self.peak_intensity_cutoff = 0.02
+            self.extract_iterations = 1
+            max_iterations = min(max_iterations, 2)
+            staged_refinement = False
+            for phase in self.phases:
+                phase['parameters']['refine_cell'] = False
+                phase['parameters']['refine_profile'] = False
+                phase['parameters']['refine_scale'] = True
+                phase['parameters']['refine_intensities'] = False
+                # Trial uses scaled theoretical intensities (not full Le Bail extract each step)
+                phase['parameters']['_use_scaled_pattern'] = True
+        else:
+            self.peak_intensity_cutoff = 0.0
+            self.extract_iterations = 5
+            for phase in self.phases:
+                phase['parameters']['_use_scaled_pattern'] = False
+
+        self._profile_cache = {}
+
         # Update 2-theta range if provided
         if two_theta_range is not None and two_theta_range != self.two_theta_range:
             self.two_theta_range = two_theta_range
@@ -244,8 +291,8 @@ class LeBailRefinement:
         if not self.experimental_data or not self.phases:
             raise ValueError("Must set experimental data and add phases before refinement")
             
-        print(f"Starting Le Bail refinement with {len(self.phases)} phases")
-        print(f"Experimental data: {len(self.experimental_data['two_theta'])} points")
+        self._log(f"Starting Le Bail refinement ({self.mode}) with {len(self.phases)} phases")
+        self._log(f"Experimental data: {len(self.experimental_data['two_theta'])} points")
         
         # Check for Pawley mode and warn if too many peaks
         total_pawley_params = 0
@@ -255,46 +302,37 @@ class LeBailRefinement:
                 total_pawley_params += n_peaks
         
         if total_pawley_params > 0:
-            print(f"⚠️  Pawley mode enabled: refining {total_pawley_params} individual peak intensities")
+            self._log(f"Pawley mode enabled: refining {total_pawley_params} individual peak intensities")
             if total_pawley_params > 100:
-                print(f"⚠️  WARNING: {total_pawley_params} intensity parameters may cause slow/unstable refinement")
-                print(f"   Consider using 2θ range to reduce number of peaks, or disable Pawley mode")
+                self._log(f"WARNING: {total_pawley_params} intensity parameters may cause slow/unstable refinement")
         
-        if staged_refinement:
-            print("Using staged refinement: unit cell → profile parameters")
-            if total_pawley_params > 0:
-                print("  Stage 1: Pawley intensities disabled (too many parameters)")
-                print("  Stage 2: Pawley intensities enabled")
+        if staged_refinement and self.mode == 'polish':
+            self._log("Using staged refinement: unit cell → profile parameters")
         
         # Initialize refinement
         self.refinement_history = []
         previous_rwp = float('inf')
-        rwp_change = float('inf')  # Initialize to avoid reference error
+        rwp_change = float('inf')
         
         # STAGE 1: Refine unit cell and zero shift only (if staged refinement)
-        if staged_refinement:
-            print("\n=== STAGE 1: Unit Cell & Zero Shift Refinement ===")
-            # Temporarily disable profile refinement AND Pawley intensities in stage 1
-            # (too many parameters otherwise)
+        if staged_refinement and self.mode == 'polish':
+            self._log("\n=== STAGE 1: Unit Cell & Zero Shift Refinement ===")
             saved_intensity_settings = []
             for phase in self.phases:
                 phase['parameters']['refine_profile'] = False
-                # Save and disable Pawley refinement for stage 1
                 saved_intensity_settings.append(phase['parameters'].get('refine_intensities', False))
                 phase['parameters']['refine_intensities'] = False
             
-            # Run first stage (about 1/3 of iterations)
             stage1_iterations = max(3, max_iterations // 3)
             for iteration in range(stage1_iterations):
-                print(f"\nStage 1 - Iteration {iteration + 1}/{stage1_iterations}")
+                self._log(f"\nStage 1 - Iteration {iteration + 1}/{stage1_iterations}")
                 
                 for phase_idx, phase in enumerate(self.phases):
-                    phase_name = phase['data']['phase'].get('mineral', f'Phase_{phase_idx}')
                     self._refine_single_phase(phase_idx)
                 
                 calculated_pattern = self._calculate_total_pattern()
                 r_factors = self._calculate_r_factors(calculated_pattern)
-                print(f"R-factors: Rp={r_factors['Rp']:.3f}, Rwp={r_factors['Rwp']:.3f}")
+                self._log(f"R-factors: Rp={r_factors['Rp']:.3f}, Rwp={r_factors['Rwp']:.3f}")
                 
                 iteration_result = {
                     'iteration': iteration + 1,
@@ -305,89 +343,74 @@ class LeBailRefinement:
                 }
                 self.refinement_history.append(iteration_result)
             
-            # STAGE 2: Enable profile refinement and restore Pawley settings
-            print("\n=== STAGE 2: Profile Parameter Refinement ===")
-            print("Enabling profile parameter refinement (U, V, W, η)")
+            self._log("\n=== STAGE 2: Profile Parameter Refinement ===")
             for idx, phase in enumerate(self.phases):
                 phase['parameters']['refine_profile'] = True
-                # Restore Pawley intensity refinement setting
                 if idx < len(saved_intensity_settings):
                     phase['parameters']['refine_intensities'] = saved_intensity_settings[idx]
-                print(f"  Phase {idx}: refine_profile=True, refine_cell=True")
             
-            # Adjust remaining iterations
             remaining_iterations = max_iterations - stage1_iterations
             start_iteration = stage1_iterations
         else:
             remaining_iterations = max_iterations
             start_iteration = 0
         
-        # Main refinement loop (Stage 2 if staged, or full refinement if not)
+        # Main refinement loop
         for iteration in range(remaining_iterations):
             actual_iteration = start_iteration + iteration + 1
-            stage_label = "Stage 2 - " if staged_refinement else ""
-            print(f"\n=== {stage_label}Le Bail Iteration {actual_iteration} ===")
+            stage_label = "Stage 2 - " if (staged_refinement and self.mode == 'polish') else ""
+            self._log(f"\n=== {stage_label}Le Bail Iteration {actual_iteration} ===")
             
-            # Refine each phase sequentially
             for phase_idx, phase in enumerate(self.phases):
                 phase_name = phase['data']['phase'].get('mineral', f'Phase_{phase_idx}')
-                print(f"Refining {phase_name}...")
-                
-                # Optimize phase parameters
+                self._log(f"Refining {phase_name}...")
                 self._refine_single_phase(phase_idx)
                 
-            # Calculate current fit quality
             calculated_pattern = self._calculate_total_pattern()
             r_factors = self._calculate_r_factors(calculated_pattern)
-            
-            # Calculate per-phase contributions and R-factors
             phase_contributions = self._calculate_phase_contributions()
             
-            print(f"R-factors: Rp={r_factors['Rp']:.3f}, Rwp={r_factors['Rwp']:.3f}, "
-                  f"GoF={r_factors['GoF']:.3f}")
+            self._log(f"R-factors: Rp={r_factors['Rp']:.3f}, Rwp={r_factors['Rwp']:.3f}, "
+                      f"GoF={r_factors['GoF']:.3f}")
             
-            # Print per-phase information
             for phase_idx, phase in enumerate(self.phases):
                 phase_name = phase['data']['phase'].get('mineral', f'Phase_{phase_idx}')
                 scale = phase['parameters']['scale_factor']
                 phase_rwp = phase_contributions[phase_idx]['rwp']
                 contribution = phase_contributions[phase_idx]['contribution_percent']
-                print(f"  {phase_name}: Scale={scale:.3f}, Rwp={phase_rwp:.2f}%, Contribution={contribution:.1f}%")
+                self._log(f"  {phase_name}: Scale={scale:.3f}, Rwp={phase_rwp:.2f}%, Contribution={contribution:.1f}%")
             
-            # Store iteration results
             iteration_result = {
                 'iteration': actual_iteration,
                 'stage': 2 if staged_refinement else 0,
+                'mode': self.mode,
                 'r_factors': r_factors.copy(),
                 'parameters': copy.deepcopy([p['parameters'] for p in self.phases]),
                 'calculated_pattern': calculated_pattern.copy()
             }
             self.refinement_history.append(iteration_result)
             
-            # Real-time plotting callback
-            if self.plot_callback is not None:
+            if self.plot_callback is not None and self.mode == 'polish':
                 try:
                     self.plot_callback(iteration_result, self.experimental_data)
                 except Exception as e:
-                    print(f"Warning: Plot callback failed: {e}")
+                    self._log(f"Warning: Plot callback failed: {e}")
             
-            # Check convergence
             rwp_change = abs(previous_rwp - r_factors['Rwp'])
             if rwp_change < convergence_threshold:
-                print(f"Converged after {iteration + 1} iterations (ΔRwp = {rwp_change:.6f})")
+                self._log(f"Converged after {iteration + 1} iterations (ΔRwp = {rwp_change:.6f})")
                 break
                 
             previous_rwp = r_factors['Rwp']
             
-        # Final results
         final_results = {
             'converged': rwp_change < convergence_threshold,
             'iterations': len(self.refinement_history),
+            'mode': self.mode,
             'final_r_factors': self.refinement_history[-1]['r_factors'],
             'refined_phases': copy.deepcopy(self.phases),
             'calculated_pattern': self.refinement_history[-1]['calculated_pattern'],
             'refinement_history': self.refinement_history,
-            # Include the actual 2-theta and intensity arrays used in refinement
             'two_theta': self.experimental_data['two_theta'].copy(),
             'experimental_intensity': self.experimental_data['intensity'].copy()
         }
@@ -401,81 +424,68 @@ class LeBailRefinement:
         phase = self.phases[phase_idx]
         params = phase['parameters']
         
-        # Create parameter vector for optimization
         param_vector, param_bounds, param_names = self._create_parameter_vector(params)
+        if len(param_vector) == 0:
+            return
         
-        # Pre-calculate other phases pattern (doesn't change during this phase's optimization)
         other_pattern = np.zeros_like(self.experimental_data['two_theta'])
-        for i, other_phase in enumerate(self.phases):
+        for i in range(len(self.phases)):
             if i != phase_idx:
-                other_pattern += self._calculate_phase_pattern(i, other_phase['parameters'])
+                other_pattern += self._calculate_phase_pattern(i, self.phases[i]['parameters'])
         
-        # Define objective function
+        maxiter = 8 if self.mode == 'trial' else 50
+        ftol = 1e-3 if self.mode == 'trial' else 1e-6
+        
         def objective(x):
-            # Update parameters
             temp_params = self._vector_to_parameters(x, param_names, params)
-            
-            # Calculate pattern for this phase
-            phase_pattern = self._calculate_phase_pattern(phase_idx, temp_params)
-                    
-            # Total calculated pattern
+            # Merge with base params so non-refined keys remain
+            merged = dict(params)
+            merged.update(temp_params)
+            if 'unit_cell' in temp_params:
+                merged['unit_cell'] = temp_params['unit_cell']
+            phase_pattern = self._calculate_phase_pattern(phase_idx, merged)
             total_pattern = phase_pattern + other_pattern
-            
-            # Calculate weighted residual
             residual = (self.experimental_data['intensity'] - total_pattern) / self.experimental_data['errors']
             return np.sum(residual ** 2)
             
-        # Optimize parameters
         try:
-            # Print initial objective value
             initial_obj = objective(param_vector)
-            print(f"  Initial objective: {initial_obj:.2e}")
+            self._log(f"  Initial objective: {initial_obj:.2e}")
             
             result = minimize(
                 objective,
                 param_vector,
                 bounds=param_bounds,
                 method='L-BFGS-B',
-                options={'maxiter': 50, 'ftol': 1e-6, 'gtol': 1e-5}
+                options={'maxiter': maxiter, 'ftol': ftol, 'gtol': 1e-5}
             )
             
-            if result.success:
-                # Update phase parameters
-                optimized_params = self._vector_to_parameters(result.x, param_names, params)
-                
-                # Show what changed
-                if 'u_param' in optimized_params:
-                    print(f"  Profile refined: U={optimized_params['u_param']:.6f}, V={optimized_params['v_param']:.6f}, W={optimized_params['w_param']:.6f}, η={optimized_params['eta_param']:.3f}")
-                    # Calculate FWHM at 5 degrees for reference
-                    import math
-                    theta_rad = math.radians(5.0 / 2)
-                    tan_theta = math.tan(theta_rad)
-                    fwhm_sq = optimized_params['u_param'] * tan_theta**2 + optimized_params['v_param'] * tan_theta + optimized_params['w_param']
-                    fwhm = math.sqrt(max(fwhm_sq, 0.00001))
-                    print(f"  → FWHM at 2θ=5°: {fwhm:.4f}°")
-                
-                if 'zero_shift' in optimized_params:
-                    print(f"  Zero shift: {optimized_params['zero_shift']:.4f}°")
-                
-                if 'cell_a' in optimized_params:
-                    cell = optimized_params['unit_cell']
-                    print(f"  Unit cell: a={cell['a']:.4f}, b={cell['b']:.4f}, c={cell['c']:.4f}")
-                
-                # Check if scale factor collapsed
-                if 'scale_factor' in optimized_params:
-                    final_scale = optimized_params['scale_factor']
-                    initial_scale = params['scale_factor']
-                    if final_scale < initial_scale * 0.2:
-                        print(f"  ⚠️  WARNING: Scale collapsed from {initial_scale:.3f} to {final_scale:.3f}")
-                        print(f"     This usually means wrong phase or FWHM mismatch")
-                
-                phase['parameters'].update(optimized_params)
-                
-                # Update theoretical peaks with new parameters
+            optimized_params = self._vector_to_parameters(result.x, param_names, params)
+            
+            if 'u_param' in optimized_params:
+                self._log(f"  Profile refined: U={optimized_params['u_param']:.6f}, "
+                          f"V={optimized_params['v_param']:.6f}, W={optimized_params['w_param']:.6f}, "
+                          f"η={optimized_params['eta_param']:.3f}")
+            
+            if 'zero_shift' in optimized_params:
+                self._log(f"  Zero shift: {optimized_params['zero_shift']:.4f}°")
+            
+            if 'cell_a' in optimized_params:
+                cell = optimized_params['unit_cell']
+                self._log(f"  Unit cell: a={cell['a']:.4f}, b={cell['b']:.4f}, c={cell['c']:.4f}")
+            
+            if 'scale_factor' in optimized_params:
+                final_scale = optimized_params['scale_factor']
+                initial_scale = params['scale_factor']
+                if final_scale < initial_scale * 0.2:
+                    self._log(f"  WARNING: Scale collapsed from {initial_scale:.3f} to {final_scale:.3f}")
+            
+            phase['parameters'].update(optimized_params)
+            if self.mode == 'polish':
                 self._update_theoretical_peaks(phase_idx)
                 
         except Exception as e:
-            print(f"Optimization failed for phase {phase_idx}: {e}")
+            self._log(f"Optimization failed for phase {phase_idx}: {e}")
             
     def _create_parameter_vector(self, params: Dict) -> Tuple[np.ndarray, List, List]:
         """Create parameter vector for optimization"""
@@ -483,29 +493,22 @@ class LeBailRefinement:
         param_bounds = []
         param_names = []
         
-        # Scale factor (use max_scale_bound if provided)
-        # In Le Bail mode with intensity extraction, scale factor is not needed
-        # Only refine scale in Pawley mode
         is_pawley = params.get('refine_intensities', False)
+        use_scaled = params.get('_use_scaled_pattern', False)
         
-        if params.get('refine_scale', True) and is_pawley:
+        # Refine scale for Pawley OR trial scaled-pattern mode
+        if params.get('refine_scale', True) and (is_pawley or use_scaled):
             initial_scale = params['scale_factor']
             param_vector.append(initial_scale)
             max_scale = params.get('max_scale_bound', 10.0)
-            
-            # With normalized data (0-100), scale should be close to 1.0
-            # Set bounds relative to initial estimate to prevent collapse
-            min_scale = max(0.01, initial_scale * 0.1)  # At least 10% of initial
-            max_scale_adjusted = min(max_scale, initial_scale * 10.0)  # At most 10x initial
-            
+            min_scale = max(0.01, initial_scale * 0.1)
+            max_scale_adjusted = min(max_scale, initial_scale * 10.0)
             param_bounds.append((min_scale, max_scale_adjusted))
             param_names.append('scale_factor')
-            print(f"  Scale bounds: {min_scale:.3f} - {max_scale_adjusted:.3f} (initial: {initial_scale:.3f})")
-        elif params.get('refine_scale', True):
-            # Le Bail mode: scale factor fixed at 1.0 (not refined)
-            print(f"  Scale factor: 1.0 (fixed, using observed intensities)")
+            self._log(f"  Scale bounds: {min_scale:.3f} - {max_scale_adjusted:.3f} (initial: {initial_scale:.3f})")
+        elif params.get('refine_scale', True) and not use_scaled:
+            self._log(f"  Scale factor: 1.0 (fixed, using observed intensities)")
             
-        # Profile parameters
         if params.get('refine_profile', True):
             param_vector.extend([
                 params['u_param'],
@@ -513,23 +516,20 @@ class LeBailRefinement:
                 params['w_param'],
                 params['eta_param']
             ])
-            # Reasonable bounds for synchrotron data
-            # Allow enough flexibility to fit the actual peak shapes
             param_bounds.extend([
-                (0.0, 0.05),      # U - can vary with sample
-                (-0.01, 0.01),    # V - usually small
-                (0.00001, 0.05),  # W - controls minimum FWHM, allow wider range
-                (0.0, 1.0)        # eta - full range for Voigt mixing
+                (0.0, 0.05),
+                (-0.01, 0.01),
+                (0.00001, 0.05),
+                (0.0, 1.0)
             ])
             param_names.extend(['u_param', 'v_param', 'w_param', 'eta_param'])
-            print(f"  Profile params: U={params['u_param']:.6f}, V={params['v_param']:.6f}, W={params['w_param']:.6f}, η={params['eta_param']:.3f}")
+            self._log(f"  Profile params: U={params['u_param']:.6f}, V={params['v_param']:.6f}, "
+                      f"W={params['w_param']:.6f}, η={params['eta_param']:.3f}")
             
-        # Zero shift (tighter bounds to prevent excessive shifts)
         param_vector.append(params['zero_shift'])
-        param_bounds.append((-0.1, 0.1))  # Reduced from ±0.5 to ±0.1 degrees
+        param_bounds.append((-0.1, 0.1))
         param_names.append('zero_shift')
         
-        # Unit cell parameters
         if params.get('refine_cell', True):
             unit_cell = params['unit_cell']
             param_vector.extend([
@@ -537,8 +537,6 @@ class LeBailRefinement:
                 unit_cell['b'],
                 unit_cell['c']
             ])
-            
-            # Set reasonable bounds based on initial values
             a, b, c = unit_cell['a'], unit_cell['b'], unit_cell['c']
             param_bounds.extend([
                 (a * 0.95, a * 1.05),
@@ -547,12 +545,9 @@ class LeBailRefinement:
             ])
             param_names.extend(['cell_a', 'cell_b', 'cell_c'])
         
-        # Individual peak intensity multipliers (Pawley refinement)
         if params.get('refine_intensities', False) and params.get('peak_intensity_multipliers') is not None:
             multipliers = params['peak_intensity_multipliers']
             param_vector.extend(multipliers)
-            # Allow intensities to vary from 0.1x to 10x the theoretical value
-            # This handles preferred orientation
             for i in range(len(multipliers)):
                 param_bounds.append((0.1, 10.0))
                 param_names.append(f'intensity_mult_{i}')
@@ -569,131 +564,173 @@ class LeBailRefinement:
             if name.startswith('cell_'):
                 if 'unit_cell' not in params:
                     params['unit_cell'] = original_params['unit_cell'].copy()
-                params['unit_cell'][name[5:]] = vector[i]  # Remove 'cell_' prefix
+                params['unit_cell'][name[5:]] = vector[i]
             elif name.startswith('intensity_mult_'):
-                # Collect intensity multipliers
                 intensity_multipliers.append(vector[i])
             else:
                 params[name] = vector[i]
         
-        # Store intensity multipliers as array if any were found
         if intensity_multipliers:
             params['peak_intensity_multipliers'] = np.array(intensity_multipliers)
                 
         return params
         
+    def _filter_peaks(self, theo_peaks: Dict) -> Tuple[np.ndarray, np.ndarray]:
+        """Apply intensity cutoff; return positions and intensities"""
+        positions = np.asarray(theo_peaks.get('two_theta', []), dtype=float)
+        intensities = np.asarray(theo_peaks.get('intensity', []), dtype=float)
+        if len(positions) == 0:
+            return positions, intensities
+        if self.peak_intensity_cutoff > 0:
+            imax = np.max(intensities) if np.max(intensities) > 0 else 1.0
+            mask = intensities >= (self.peak_intensity_cutoff * imax)
+            return positions[mask], intensities[mask]
+        return positions, intensities
+
     def _calculate_phase_pattern(self, phase_idx: int, parameters: Dict) -> np.ndarray:
-        """Calculate diffraction pattern for a single phase using Le Bail intensity extraction"""
+        """Calculate diffraction pattern for a single phase"""
         phase = self.phases[phase_idx]
         theo_peaks = phase['theoretical_peaks']
         
         if len(theo_peaks.get('two_theta', [])) == 0:
             return np.zeros_like(self.experimental_data['two_theta'])
+
+        positions, intensities = self._filter_peaks(theo_peaks)
+        if len(positions) == 0:
+            return np.zeros_like(self.experimental_data['two_theta'])
             
-        # Apply zero shift to peak positions
-        shifted_positions = theo_peaks['two_theta'] + parameters.get('zero_shift', 0.0)
-        
-        # Calculate peak widths using Caglioti function
+        shifted_positions = positions + parameters.get('zero_shift', 0.0)
         peak_widths = self._calculate_peak_widths(shifted_positions, parameters)
-        
-        # Generate pattern using pseudo-Voigt profiles
-        pattern = np.zeros_like(self.experimental_data['two_theta'])
         scale_factor = parameters.get('scale_factor', 1.0)
         eta = parameters.get('eta_param', 0.5)
-        
-        # Get intensity multipliers if using Pawley refinement
         intensity_multipliers = parameters.get('peak_intensity_multipliers')
         is_pawley = intensity_multipliers is not None
-        
-        # For Le Bail: extract intensities using proper partitioning
+        use_scaled = parameters.get('_use_scaled_pattern', False) or self.mode == 'trial'
+
+        if use_scaled and not is_pawley:
+            # Fast trial path: scale theoretical intensities (no Le Bail extract)
+            effective = intensities * scale_factor
+            return self._accumulate_pseudo_voigt(
+                shifted_positions, peak_widths, effective, eta
+            )
+
         if not is_pawley:
             extracted_intensities = self._extract_lebail_intensities(
-                shifted_positions, peak_widths, eta, parameters
+                shifted_positions, peak_widths, eta
             )
-            # Debug: check extracted intensities
-            if np.sum(extracted_intensities) == 0:
-                print(f"  ⚠️  WARNING: All extracted intensities are zero!")
-                print(f"     Peak widths: min={np.min(peak_widths):.6f}, max={np.max(peak_widths):.6f}")
-                print(f"     Positions: min={np.min(shifted_positions):.2f}, max={np.max(shifted_positions):.2f}")
-        
-        for idx, (pos, intensity, width) in enumerate(zip(shifted_positions, theo_peaks['intensity'], peak_widths)):
-            if width > 0 and intensity > 0:
-                if is_pawley:
-                    # Pawley mode: free intensity parameters
-                    effective_intensity = intensity * scale_factor * intensity_multipliers[idx]
-                else:
-                    # Le Bail mode: use extracted intensities
-                    effective_intensity = extracted_intensities[idx]
-                
-                peak_profile = self._pseudo_voigt_profile(
-                    self.experimental_data['two_theta'], pos, width, effective_intensity, eta
-                )
-                pattern += peak_profile
-                
+            effective = extracted_intensities
+        else:
+            # Need full peak list for Pawley multipliers — use unfiltered theo peaks
+            all_pos = np.asarray(theo_peaks['two_theta'], dtype=float) + parameters.get('zero_shift', 0.0)
+            all_int = np.asarray(theo_peaks['intensity'], dtype=float)
+            all_widths = self._calculate_peak_widths(all_pos, parameters)
+            effective = all_int * scale_factor * intensity_multipliers
+            return self._accumulate_pseudo_voigt(all_pos, all_widths, effective, eta)
+
+        return self._accumulate_pseudo_voigt(shifted_positions, peak_widths, effective, eta)
+
+    def _accumulate_pseudo_voigt(self, positions: np.ndarray, widths: np.ndarray,
+                                  intensities: np.ndarray, eta: float) -> np.ndarray:
+        """Windowed accumulation of pseudo-Voigt peaks into a dense pattern"""
+        x = self.experimental_data['two_theta']
+        pattern = np.zeros_like(x)
+        if len(x) == 0:
+            return pattern
+
+        # Approximate dx for index windowing
+        dx = float(np.median(np.diff(x))) if len(x) > 1 else 0.02
+        x0 = float(x[0])
+        n = len(x)
+
+        for pos, width, intensity in zip(positions, widths, intensities):
+            if width <= 0 or intensity <= 0:
+                continue
+            cutoff = 5.0 * width
+            i_lo = max(0, int((pos - cutoff - x0) / dx) - 1)
+            i_hi = min(n, int((pos + cutoff - x0) / dx) + 2)
+            if i_lo >= i_hi:
+                continue
+            x_local = x[i_lo:i_hi]
+            sigma_g = width / (2 * np.sqrt(2 * np.log(2)))
+            gaussian = np.exp(-0.5 * ((x_local - pos) / sigma_g) ** 2)
+            gamma_l = width / 2.0
+            lorentzian = 1.0 / (1.0 + ((x_local - pos) / gamma_l) ** 2)
+            pattern[i_lo:i_hi] += intensity * ((1.0 - eta) * gaussian + eta * lorentzian)
+
         return pattern
     
     def _extract_lebail_intensities(self, positions: np.ndarray, widths: np.ndarray, 
-                                     eta: float, parameters: Dict) -> np.ndarray:
+                                     eta: float) -> np.ndarray:
         """
-        Le Bail intensity extraction using proper partitioning
-        
-        For each peak, calculate its contribution to the observed pattern
-        by partitioning overlapping peaks based on their profile shapes.
-        This is the correct Le Bail method.
+        Le Bail intensity extraction using windowed partitioning.
+        Avoids allocating full-length profile arrays per peak.
         """
         exp_2theta = self.experimental_data['two_theta']
         exp_intensity = self.experimental_data['intensity']
         n_peaks = len(positions)
-        
-        # Initialize extracted intensities with a good first guess
-        # Use peak height at each position as starting point
-        extracted_intensities = np.zeros(n_peaks)
-        for idx, pos in enumerate(positions):
-            # Find closest experimental point
-            closest_idx = np.argmin(np.abs(exp_2theta - pos))
-            if closest_idx < len(exp_intensity):
-                extracted_intensities[idx] = max(0, exp_intensity[closest_idx])
-        
-        # Pre-calculate profile shapes for all peaks (normalized to unit area)
-        # We'll scale these by the extracted intensities
-        profiles = []
+        n_pts = len(exp_2theta)
+        extracted = np.zeros(n_peaks)
+
+        if n_peaks == 0 or n_pts == 0:
+            return extracted
+
+        dx = float(np.median(np.diff(exp_2theta))) if n_pts > 1 else 0.02
+        x0 = float(exp_2theta[0])
+
+        # Sparse storage: list of (i_lo, i_hi, normalized_local_profile)
+        sparse_profiles = []
         for pos, width in zip(positions, widths):
-            if width > 0:
-                # Create normalized profile (unit intensity)
-                profile = self._pseudo_voigt_profile(exp_2theta, pos, width, 1.0, eta)
-                # Normalize to unit area
-                profile_sum = np.sum(profile)
-                if profile_sum > 0:
-                    profile = profile / profile_sum
-                profiles.append(profile)
-            else:
-                profiles.append(np.zeros_like(exp_2theta))
-        
-        # Iterative Le Bail extraction (3-5 iterations for convergence)
-        for iteration in range(5):
-            # Calculate total calculated pattern with current intensities
-            total_calc = np.zeros_like(exp_2theta)
-            for idx, profile in enumerate(profiles):
-                total_calc += extracted_intensities[idx] * profile
-            
-            # Extract intensities by partitioning
-            for idx, profile in enumerate(profiles):
-                if np.sum(profile) == 0:
+            if width <= 0:
+                sparse_profiles.append(None)
+                continue
+            cutoff = 5.0 * width
+            i_lo = max(0, int((pos - cutoff - x0) / dx) - 1)
+            i_hi = min(n_pts, int((pos + cutoff - x0) / dx) + 2)
+            if i_lo >= i_hi:
+                sparse_profiles.append(None)
+                continue
+            x_local = exp_2theta[i_lo:i_hi]
+            sigma_g = width / (2 * np.sqrt(2 * np.log(2)))
+            gaussian = np.exp(-0.5 * ((x_local - pos) / sigma_g) ** 2)
+            gamma_l = width / 2.0
+            lorentzian = 1.0 / (1.0 + ((x_local - pos) / gamma_l) ** 2)
+            profile = (1.0 - eta) * gaussian + eta * lorentzian
+            psum = np.sum(profile)
+            if psum > 0:
+                profile = profile / psum
+            sparse_profiles.append((i_lo, i_hi, profile))
+
+            # Initial guess from nearest observed intensity
+            closest_idx = int(np.clip(round((pos - x0) / dx), 0, n_pts - 1))
+            extracted[len(sparse_profiles) - 1] = max(0.0, float(exp_intensity[closest_idx]))
+
+        # Fix initial guesses (index was wrong above if some were None) — redo cleanly
+        extracted = np.zeros(n_peaks)
+        for idx, pos in enumerate(positions):
+            closest_idx = int(np.clip(round((pos - x0) / dx), 0, n_pts - 1))
+            extracted[idx] = max(0.0, float(exp_intensity[closest_idx]))
+
+        n_iter = max(1, int(self.extract_iterations))
+        for _ in range(n_iter):
+            total_calc = np.zeros(n_pts)
+            for idx, sp in enumerate(sparse_profiles):
+                if sp is None:
                     continue
-                
-                # Calculate this peak's fraction of the total at each point
-                # Avoid division by zero
+                i_lo, i_hi, profile = sp
+                total_calc[i_lo:i_hi] += extracted[idx] * profile
+
+            for idx, sp in enumerate(sparse_profiles):
+                if sp is None:
+                    continue
+                i_lo, i_hi, profile = sp
+                local_total = total_calc[i_lo:i_hi]
+                local_obs = exp_intensity[i_lo:i_hi]
+                contrib = extracted[idx] * profile
                 with np.errstate(divide='ignore', invalid='ignore'):
-                    fraction = np.where(total_calc > 0, 
-                                      extracted_intensities[idx] * profile / total_calc,
-                                      0.0)
-                    fraction = np.nan_to_num(fraction, 0.0)
-                
-                # Extract intensity: sum of (observed * fraction)
-                # This partitions the observed intensity among overlapping peaks
-                extracted_intensities[idx] = np.sum(exp_intensity * fraction)
-        
-        return extracted_intensities
+                    fraction = np.where(local_total > 0, contrib / local_total, 0.0)
+                extracted[idx] = float(np.sum(local_obs * fraction))
+
+        return extracted
         
     def _calculate_peak_widths(self, two_theta: np.ndarray, parameters: Dict) -> np.ndarray:
         """Calculate peak widths using Caglioti function: FWHM² = U*tan²θ + V*tanθ + W"""
@@ -701,26 +738,19 @@ class LeBailRefinement:
         V = parameters.get('v_param', -0.001)
         W = parameters.get('w_param', 0.01)
         
-        # Convert to radians for calculation
         theta_rad = np.radians(two_theta / 2)
         tan_theta = np.tan(theta_rad)
         
-        # Caglioti function
         fwhm_squared = U * tan_theta**2 + V * tan_theta + W
-        
-        # Ensure positive widths
         fwhm_squared = np.maximum(fwhm_squared, 0.001)
-        fwhm = np.sqrt(fwhm_squared)
-        
-        return fwhm
+        return np.sqrt(fwhm_squared)
         
     def _pseudo_voigt_profile(self, x: np.ndarray, center: float, fwhm: float, 
                             intensity: float, eta: float) -> np.ndarray:
-        """Generate pseudo-Voigt peak profile (optimized)"""
+        """Generate pseudo-Voigt peak profile (windowed)"""
         if fwhm <= 0 or intensity <= 0:
             return np.zeros_like(x)
         
-        # Only calculate profile within ±5*FWHM of peak center (optimization)
         cutoff = 5 * fwhm
         mask = np.abs(x - center) <= cutoff
         
@@ -730,15 +760,10 @@ class LeBailRefinement:
         profile = np.zeros_like(x)
         x_local = x[mask]
         
-        # Gaussian component
         sigma_g = fwhm / (2 * np.sqrt(2 * np.log(2)))
         gaussian = np.exp(-0.5 * ((x_local - center) / sigma_g) ** 2)
-        
-        # Lorentzian component  
         gamma_l = fwhm / 2
         lorentzian = 1 / (1 + ((x_local - center) / gamma_l) ** 2)
-        
-        # Pseudo-Voigt mixing
         profile[mask] = intensity * ((1 - eta) * gaussian + eta * lorentzian)
         
         return profile
@@ -751,9 +776,6 @@ class LeBailRefinement:
         if not params.get('refine_cell', True):
             return
             
-        # This is a simplified update - in practice, you'd recalculate
-        # peak positions from Miller indices and refined unit cell
-        # For now, we'll apply the zero shift
         zero_shift = params.get('zero_shift', 0.0)
         original_peaks = phase['data']['theoretical_peaks']
         
@@ -779,15 +801,12 @@ class LeBailRefinement:
         total_pattern = self._calculate_total_pattern()
         
         for phase_idx in range(len(self.phases)):
-            # Calculate this phase's pattern
             phase_pattern = self._calculate_phase_pattern(phase_idx, self.phases[phase_idx]['parameters'])
             
-            # Calculate contribution as fraction of total calculated intensity
             total_intensity = np.sum(total_pattern)
             phase_intensity = np.sum(phase_pattern)
             contribution_percent = (phase_intensity / total_intensity * 100) if total_intensity > 0 else 0
             
-            # Calculate Rwp for this phase alone vs experimental
             residual = (obs - phase_pattern) / errors
             rwp_num = np.sum(residual ** 2)
             rwp_den = np.sum((obs / errors) ** 2)
@@ -797,7 +816,8 @@ class LeBailRefinement:
                 'phase_idx': phase_idx,
                 'contribution_percent': contribution_percent,
                 'rwp': phase_rwp,
-                'scale_factor': self.phases[phase_idx]['parameters']['scale_factor']
+                'scale_factor': self.phases[phase_idx]['parameters']['scale_factor'],
+                'integrated_intensity': float(phase_intensity)
             })
         
         return contributions
@@ -808,27 +828,21 @@ class LeBailRefinement:
         calc = calculated_pattern
         errors = self.experimental_data['errors']
         
-        # Profile R-factor
         rp = np.sum(np.abs(obs - calc)) / np.sum(obs) if np.sum(obs) > 0 else float('inf')
         
-        # Weighted profile R-factor
         rwp_num = np.sum(((obs - calc) / errors) ** 2)
         rwp_den = np.sum((obs / errors) ** 2)
         rwp = np.sqrt(rwp_num / rwp_den) if rwp_den > 0 else float('inf')
         
-        # Expected R-factor
         n_obs = len(obs)
         n_param = sum(len(self._create_parameter_vector(p['parameters'])[0]) for p in self.phases)
         r_exp = np.sqrt((n_obs - n_param) / rwp_den) if rwp_den > 0 and n_obs > n_param else float('inf')
         
-        # Goodness of fit
         gof = rwp / r_exp if r_exp > 0 and not np.isinf(r_exp) else float('inf')
-        
-        # Chi-squared
         chi_squared = rwp_num / (n_obs - n_param) if n_obs > n_param else float('inf')
         
         return {
-            'Rp': rp * 100,      # Convert to percentage
+            'Rp': rp * 100,
             'Rwp': rwp * 100,
             'Rexp': r_exp * 100,
             'GoF': gof,

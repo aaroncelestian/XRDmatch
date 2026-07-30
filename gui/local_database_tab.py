@@ -163,190 +163,167 @@ class LocalDatabaseTab(QWidget):
     def init_ui(self):
         """Initialize the user interface"""
         layout = QVBoxLayout(self)
-        
-        # Database management section
-        db_management = self.create_database_management_section()
-        layout.addWidget(db_management)
-        
-        # Search section
-        search_section = self.create_search_section()
-        layout.addWidget(search_section)
-        
-        # Results section
-        results_section = self.create_results_section()
-        layout.addWidget(results_section)
-    
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        layout.addWidget(self.create_database_management_section())
+        layout.addWidget(self.create_search_section())
+        layout.addWidget(self.create_results_section(), 1)
+
     def create_database_management_section(self):
         """Create database management controls"""
         group = QGroupBox("Database Management")
         layout = QVBoxLayout(group)
-        
-        # Database stats
+        layout.setSpacing(8)
+
         stats_layout = QHBoxLayout()
         self.stats_label = QLabel("Database: Loading...")
-        stats_layout.addWidget(self.stats_label)
-        stats_layout.addStretch()
-        
+        stats_layout.addWidget(self.stats_label, 1)
+
         refresh_btn = QPushButton("Refresh Stats")
         refresh_btn.clicked.connect(self.update_database_stats)
         stats_layout.addWidget(refresh_btn)
-        
         layout.addLayout(stats_layout)
-        
-        # DIF Import controls
-        dif_layout = QHBoxLayout()
-        
-        # Single DIF import
+
+        # 2-column action grid
+        grid = QHBoxLayout()
+        left_col = QVBoxLayout()
+        right_col = QVBoxLayout()
+
         single_dif_btn = QPushButton("Import Single DIF File")
         single_dif_btn.clicked.connect(self.import_single_dif)
         single_dif_btn.setToolTip("Import a single DIF file with diffraction pattern data")
-        dif_layout.addWidget(single_dif_btn)
-        
-        # Bulk DIF import
+        left_col.addWidget(single_dif_btn)
+
         bulk_dif_btn = QPushButton("Import DIF Directory")
         bulk_dif_btn.clicked.connect(self.import_dif_directory)
         bulk_dif_btn.setToolTip("Import all DIF files from a directory")
-        dif_layout.addWidget(bulk_dif_btn)
-        
-        layout.addLayout(dif_layout)
-        
-        # AMCSD Bulk import
-        amcsd_layout = QHBoxLayout()
-        
-        amcsd_bulk_btn = QPushButton("🚀 Import AMCSD Bulk DIF File")
+        left_col.addWidget(bulk_dif_btn)
+
+        update_rir_btn = QPushButton("Update RIR from DIF")
+        update_rir_btn.clicked.connect(self.update_rir_from_dif)
+        update_rir_btn.setToolTip("Parse RIR/density from data/difdata.dif into existing minerals")
+        left_col.addWidget(update_rir_btn)
+
+        amcsd_bulk_btn = QPushButton("Import AMCSD Bulk DIF")
+        amcsd_bulk_btn.setObjectName("primaryButton")
         amcsd_bulk_btn.clicked.connect(self.import_amcsd_bulk_dif)
         amcsd_bulk_btn.setToolTip("Import entire AMCSD bulk DIF file (all minerals)")
-        amcsd_bulk_btn.setStyleSheet("QPushButton { background-color: #2196F3; color: white; font-weight: bold; padding: 8px; }")
-        amcsd_layout.addWidget(amcsd_bulk_btn)
-        
-        layout.addLayout(amcsd_layout)
-        
-        # CIF to DIF conversion (placeholder)
-        cif_layout = QHBoxLayout()
-        
-        cif_to_dif_btn = QPushButton("🔄 Generate DIF from CIF")
+        right_col.addWidget(amcsd_bulk_btn)
+
+        cif_to_dif_btn = QPushButton("Generate DIF from CIF")
         cif_to_dif_btn.clicked.connect(self.generate_dif_from_cif)
         cif_to_dif_btn.setToolTip("Convert CIF files to DIF format with pseudo-Voigt profiles")
-        cif_to_dif_btn.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 8px; }")
-        cif_layout.addWidget(cif_to_dif_btn)
-        
-        layout.addLayout(cif_layout)
-        
-        # Pattern statistics
-        stats_btn_layout = QHBoxLayout()
-        
+        right_col.addWidget(cif_to_dif_btn)
+
         diffraction_stats_btn = QPushButton("Show Pattern Statistics")
         diffraction_stats_btn.clicked.connect(self.show_diffraction_statistics)
         diffraction_stats_btn.setToolTip("View statistics about stored diffraction patterns")
-        stats_btn_layout.addWidget(diffraction_stats_btn)
-        
-        layout.addLayout(stats_btn_layout)
-        
-        # Progress bar
+        right_col.addWidget(diffraction_stats_btn)
+
+        grid.addLayout(left_col)
+        grid.addLayout(right_col)
+        layout.addLayout(grid)
+
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         layout.addWidget(self.progress_bar)
-        
-        # Status label
+
         self.status_label = QLabel("")
+        self.status_label.setObjectName("mutedLabel")
         layout.addWidget(self.status_label)
-        
+
         return group
-    
+
     def create_search_section(self):
         """Create search controls"""
         group = QGroupBox("Search Local Database")
         layout = QVBoxLayout(group)
-        
-        # Search type selection
+
         search_type_layout = QHBoxLayout()
         search_type_layout.addWidget(QLabel("Search by:"))
-        
+
         self.search_type = QComboBox()
         self.search_type.addItems(["Mineral Name", "Chemical Formula", "Elements", "Space Group"])
         self.search_type.currentTextChanged.connect(self.search_type_changed)
         search_type_layout.addWidget(self.search_type)
-        
         search_type_layout.addStretch()
         layout.addLayout(search_type_layout)
-        
-        # Search input
+
         search_input_layout = QHBoxLayout()
         search_input_layout.addWidget(QLabel("Search term:"))
-        
+
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Enter search term...")
         self.search_input.returnPressed.connect(self.perform_search)
         search_input_layout.addWidget(self.search_input)
-        
+
         search_btn = QPushButton("Search")
+        search_btn.setObjectName("primaryButton")
         search_btn.clicked.connect(self.perform_search)
         search_input_layout.addWidget(search_btn)
-        
         layout.addLayout(search_input_layout)
-        
-        # Search options
+
         options_layout = QHBoxLayout()
-        
         options_layout.addWidget(QLabel("Max results:"))
         self.max_results = QSpinBox()
         self.max_results.setRange(10, 1000)
         self.max_results.setValue(100)
         options_layout.addWidget(self.max_results)
-        
         options_layout.addStretch()
         layout.addLayout(options_layout)
-        
+
         return group
-    
+
     def create_results_section(self):
-        """Create results display"""
+        """Create results display — flat details, no nested GroupBoxes."""
         group = QGroupBox("Search Results")
         layout = QVBoxLayout(group)
-        
-        # Results table
+
         self.results_table = QTableWidget()
         self.results_table.setColumnCount(8)
         self.results_table.setHorizontalHeaderLabels([
             'Mineral', 'Formula', 'Space Group', 'a (Å)', 'b (Å)', 'c (Å)', 'Authors', 'AMCSD ID'
         ])
         self.results_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.results_table.setAlternatingRowColors(True)
         self.results_table.itemSelectionChanged.connect(self.show_mineral_details)
-        layout.addWidget(self.results_table)
-        
-        # Details section
+        layout.addWidget(self.results_table, 1)
+
         details_layout = QHBoxLayout()
-        
-        # Mineral details
-        details_group = QGroupBox("Mineral Details")
-        details_group_layout = QVBoxLayout(details_group)
-        
+
+        details_col = QVBoxLayout()
+        details_label = QLabel("Mineral Details")
+        details_label.setObjectName("mutedLabel")
+        details_col.addWidget(details_label)
+
         self.details_text = QTextEdit()
         self.details_text.setMaximumHeight(150)
         self.details_text.setReadOnly(True)
-        details_group_layout.addWidget(self.details_text)
-        
-        details_layout.addWidget(details_group)
-        
-        # Actions
-        actions_group = QGroupBox("Actions")
-        actions_layout = QVBoxLayout(actions_group)
-        
+        details_col.addWidget(self.details_text)
+        details_layout.addLayout(details_col, 3)
+
+        actions_col = QVBoxLayout()
+        actions_label = QLabel("Actions")
+        actions_label.setObjectName("mutedLabel")
+        actions_col.addWidget(actions_label)
+
         self.use_for_matching_btn = QPushButton("Use for Phase Matching")
+        self.use_for_matching_btn.setObjectName("primaryButton")
         self.use_for_matching_btn.clicked.connect(self.use_for_matching)
         self.use_for_matching_btn.setEnabled(False)
-        actions_layout.addWidget(self.use_for_matching_btn)
-        
+        actions_col.addWidget(self.use_for_matching_btn)
+
         self.view_cif_btn = QPushButton("View CIF Content")
         self.view_cif_btn.clicked.connect(self.view_cif_content)
         self.view_cif_btn.setEnabled(False)
-        actions_layout.addWidget(self.view_cif_btn)
-        
-        details_layout.addWidget(actions_group)
+        actions_col.addWidget(self.view_cif_btn)
+        actions_col.addStretch()
+        details_layout.addLayout(actions_col, 1)
+
         layout.addLayout(details_layout)
-        
         return group
-    
+
     def update_database_stats(self):
         """Update database statistics display"""
         try:
@@ -474,6 +451,38 @@ class LocalDatabaseTab(QWidget):
                               "No new patterns were imported. They may already exist in the database.")
         
         self.update_database_stats()
+
+    def update_rir_from_dif(self):
+        """Update RIR/density fields from the AMCSD bulk DIF file"""
+        from pathlib import Path
+        default = Path(__file__).parent.parent / "data" / "difdata.dif"
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Select AMCSD Bulk DIF",
+            str(default if default.exists() else Path.home()),
+            "DIF Files (*.dif);;All Files (*)"
+        )
+        if not file_path:
+            return
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 100)
+        self.status_label.setText("Updating RIR values...")
+        try:
+            stats = self.db_manager.update_rir_from_dif(
+                file_path,
+                progress_callback=self.progress_bar.setValue
+            )
+            QMessageBox.information(
+                self, "RIR Update Complete",
+                f"Updated: {stats.get('updated', 0)}\n"
+                f"No RIR in block: {stats.get('no_rir', 0)}\n"
+                f"Not in DB: {stats.get('missing', 0)}\n"
+                f"Errors: {stats.get('errors', 0)}"
+            )
+            self.status_label.setText(f"RIR update complete ({stats.get('updated', 0)} minerals)")
+        except Exception as e:
+            QMessageBox.critical(self, "RIR Update Failed", str(e))
+        finally:
+            self.progress_bar.setVisible(False)
     
     def generate_dif_from_cif(self):
         """Generate DIF files from CIF files"""
@@ -1425,7 +1434,7 @@ class CifToDifDialog(QMessageBox):
         file_layout.addWidget(self.single_file_btn)
         
         self.single_file_label = QLabel("No file selected")
-        self.single_file_label.setStyleSheet("color: gray; font-style: italic;")
+        self.single_file_label.setObjectName("mutedLabel")
         file_layout.addWidget(self.single_file_label)
         
         # Multiple files option
@@ -1439,7 +1448,7 @@ class CifToDifDialog(QMessageBox):
         file_layout.addWidget(self.multiple_files_btn)
         
         self.multiple_files_label = QLabel("No directory selected")
-        self.multiple_files_label.setStyleSheet("color: gray; font-style: italic;")
+        self.multiple_files_label.setObjectName("mutedLabel")
         file_layout.addWidget(self.multiple_files_label)
         
         layout.addWidget(file_group)
@@ -1453,7 +1462,7 @@ class CifToDifDialog(QMessageBox):
         output_layout.addWidget(self.output_btn)
         
         self.output_label = QLabel("No directory selected")
-        self.output_label.setStyleSheet("color: gray; font-style: italic;")
+        self.output_label.setObjectName("mutedLabel")
         output_layout.addWidget(self.output_label)
         
         layout.addWidget(output_group)
@@ -1501,10 +1510,14 @@ class CifToDifDialog(QMessageBox):
         
         if single_selected:
             self.multiple_files_label.setText("No directory selected")
-            self.multiple_files_label.setStyleSheet("color: gray; font-style: italic;")
+            self.multiple_files_label.setObjectName("mutedLabel")
+            self.multiple_files_label.style().unpolish(self.multiple_files_label)
+            self.multiple_files_label.style().polish(self.multiple_files_label)
         else:
             self.single_file_label.setText("No file selected")
-            self.single_file_label.setStyleSheet("color: gray; font-style: italic;")
+            self.single_file_label.setObjectName("mutedLabel")
+            self.single_file_label.style().unpolish(self.single_file_label)
+            self.single_file_label.style().polish(self.single_file_label)
     
     def select_single_file(self):
         """Select a single CIF file"""
@@ -1515,7 +1528,10 @@ class CifToDifDialog(QMessageBox):
         if file_path:
             self.cif_files = [file_path]
             self.single_file_label.setText(os.path.basename(file_path))
-            self.single_file_label.setStyleSheet("color: black;")
+            self.single_file_label.setObjectName("")
+            self.single_file_label.setStyleSheet("")
+            self.single_file_label.style().unpolish(self.single_file_label)
+            self.single_file_label.style().polish(self.single_file_label)
     
     def select_directory(self):
         """Select directory with CIF files"""
@@ -1530,11 +1546,15 @@ class CifToDifDialog(QMessageBox):
             if cif_files:
                 self.cif_files = [str(f) for f in cif_files]
                 self.multiple_files_label.setText(f"{len(cif_files)} CIF files found")
-                self.multiple_files_label.setStyleSheet("color: black;")
+                self.multiple_files_label.setObjectName("")
+                self.multiple_files_label.setStyleSheet("")
             else:
                 self.multiple_files_label.setText("No CIF files found in directory")
-                self.multiple_files_label.setStyleSheet("color: red;")
+                self.multiple_files_label.setObjectName("statusErrorLabel")
+                self.multiple_files_label.setStyleSheet("")
                 self.cif_files = []
+            self.multiple_files_label.style().unpolish(self.multiple_files_label)
+            self.multiple_files_label.style().polish(self.multiple_files_label)
     
     def select_output_directory(self):
         """Select output directory for DIF files"""
@@ -1545,7 +1565,10 @@ class CifToDifDialog(QMessageBox):
         if dir_path:
             self.output_directory = dir_path
             self.output_label.setText(dir_path)
-            self.output_label.setStyleSheet("color: black;")
+            self.output_label.setObjectName("")
+            self.output_label.setStyleSheet("")
+            self.output_label.style().unpolish(self.output_label)
+            self.output_label.style().polish(self.output_label)
     
     def wavelength_changed(self, text):
         """Handle wavelength selection change"""

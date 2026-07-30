@@ -4,19 +4,21 @@ Implements both peak-based and correlation-based pattern matching
 """
 
 import numpy as np
-from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
+from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QLabel, QTableWidget, QTableWidgetItem, QGroupBox,
                              QDoubleSpinBox, QComboBox, QTextEdit, QSpinBox,
                              QSplitter, QProgressBar, QCheckBox, QMessageBox,
-                             QTabWidget, QFormLayout)
+                             QFormLayout)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
-import matplotlib.pyplot as plt
 from utils.pattern_search import PatternSearchEngine
 from utils.fast_pattern_search import FastPatternSearchEngine
 import time
+
+from matplotlib_config import apply_plot_style, get_plot_palette
+from gui.theme import get_current_mode
 
 class PatternSearchThread(QThread):
     """Thread for pattern search operations"""
@@ -82,48 +84,47 @@ class PatternSearchTab(QWidget):
     def init_ui(self):
         """Initialize the user interface"""
         layout = QVBoxLayout(self)
-        
-        # Control panel
-        control_panel = self.create_control_panel()
-        layout.addWidget(control_panel)
-        
-        # Progress bar
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        layout.addWidget(self.create_control_panel())
+
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         layout.addWidget(self.progress_bar)
-        
-        # Status label
+
         self.status_label = QLabel("Ready for pattern search")
+        self.status_label.setObjectName("mutedLabel")
         layout.addWidget(self.status_label)
-        
-        # Main content splitter
+
         main_splitter = QSplitter(Qt.Orientation.Horizontal)
         layout.addWidget(main_splitter)
-        
-        # Left side: Results
-        results_panel = self.create_results_panel()
-        main_splitter.addWidget(results_panel)
-        
-        # Right side: Plot
-        plot_panel = self.create_plot_panel()
-        main_splitter.addWidget(plot_panel)
-        
-        # Set splitter proportions
+
+        main_splitter.addWidget(self.create_results_panel())
+        main_splitter.addWidget(self.create_plot_panel())
         main_splitter.setSizes([500, 500])
-        
+
     def create_control_panel(self):
         """Create the control panel with search parameters"""
-        group = QGroupBox("Ultra-Fast Pattern Search")
+        group = QGroupBox("Pattern Search")
         layout = QVBoxLayout(group)
         
-        # Ultra-Fast search parameters
         fast_layout = QFormLayout()
+
+        self.search_method_combo = QComboBox()
+        self.search_method_combo.addItems([
+            "Ultra-Fast Correlation",
+            "Peak Match",
+            "Pearson Correlation",
+            "Combined (peak + correlation)",
+            "Ensemble (fuse methods)"
+        ])
+        self.search_method_combo.currentIndexChanged.connect(self.on_search_method_changed)
+        fast_layout.addRow("Algorithm:", self.search_method_combo)
         
-        # Index status and controls
         self.index_status_label = QLabel("Index Status: Not Built")
         fast_layout.addRow("Status:", self.index_status_label)
         
-        # Build index button
         index_button_layout = QHBoxLayout()
         self.build_index_btn = QPushButton("Build Search Index")
         self.build_index_btn.clicked.connect(self.build_search_index)
@@ -138,20 +139,25 @@ class PatternSearchTab(QWidget):
         
         fast_layout.addRow("Index:", index_button_layout)
         
-        # Fast search parameters
         self.fast_min_correlation_spin = QDoubleSpinBox()
         self.fast_min_correlation_spin.setRange(0.1, 1.0)
         self.fast_min_correlation_spin.setDecimals(2)
         self.fast_min_correlation_spin.setValue(0.3)
-        self.fast_min_correlation_spin.setToolTip("Minimum correlation for ultra-fast search")
+        self.fast_min_correlation_spin.setToolTip("Minimum correlation for ultra-fast / correlation search")
         fast_layout.addRow("Min. Correlation:", self.fast_min_correlation_spin)
+
+        self.peak_tolerance_spin = QDoubleSpinBox()
+        self.peak_tolerance_spin.setRange(0.05, 1.0)
+        self.peak_tolerance_spin.setDecimals(2)
+        self.peak_tolerance_spin.setValue(0.2)
+        self.peak_tolerance_spin.setSuffix("°")
+        fast_layout.addRow("Peak Tolerance:", self.peak_tolerance_spin)
         
         self.fast_max_results_spin = QSpinBox()
         self.fast_max_results_spin.setRange(10, 200)
         self.fast_max_results_spin.setValue(50)
         fast_layout.addRow("Max Results:", self.fast_max_results_spin)
         
-        # Grid resolution for index building
         self.grid_resolution_spin = QDoubleSpinBox()
         self.grid_resolution_spin.setRange(0.005, 0.1)
         self.grid_resolution_spin.setDecimals(3)
@@ -160,22 +166,19 @@ class PatternSearchTab(QWidget):
         self.grid_resolution_spin.setToolTip("Grid resolution for search index (smaller = more accurate but larger)")
         fast_layout.addRow("Grid Resolution:", self.grid_resolution_spin)
         
-        # Performance info
         self.performance_label = QLabel("Performance: Not tested")
         fast_layout.addRow("Speed:", self.performance_label)
         
         layout.addLayout(fast_layout)
         
-        # Check if index is already loaded (after ALL UI elements are created)
         self.update_index_status()
         
-        # Action buttons
         button_layout = QHBoxLayout()
         
-        self.search_btn = QPushButton("🚀 Start Ultra-Fast Search")
-        self.search_btn.clicked.connect(self.start_ultra_fast_search)
+        self.search_btn = QPushButton("Start Search")
+        self.search_btn.setObjectName("primaryButton")
+        self.search_btn.clicked.connect(self.start_search)
         self.search_btn.setEnabled(False)
-        self.search_btn.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 10px; }")
         button_layout.addWidget(self.search_btn)
         
         self.clear_btn = QPushButton("Clear Results")
@@ -191,6 +194,12 @@ class PatternSearchTab(QWidget):
         layout.addLayout(button_layout)
         
         return group
+
+    def on_search_method_changed(self, _index=None):
+        """Enable/disable index controls based on method"""
+        needs_index = self.search_method_combo.currentIndex() in (0, 4)  # ultrafast or ensemble
+        self.build_index_btn.setEnabled(True)
+        self.update_search_availability()
     
     def create_results_panel(self):
         """Create the results panel"""
@@ -217,29 +226,32 @@ class PatternSearchTab(QWidget):
     
     def create_plot_panel(self):
         """Create the plot panel"""
-        group = QGroupBox("Pattern Comparison")
-        layout = QVBoxLayout(group)
-        
-        # Plot canvas
-        self.figure = Figure(figsize=(8, 6))
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+
+        mode = get_current_mode()
+        palette = get_plot_palette(mode)
+        self.figure = Figure(figsize=(8, 6), facecolor=palette["figure_facecolor"])
         self.canvas = FigureCanvas(self.figure)
-        
-        # Add navigation toolbar
-        self.toolbar = NavigationToolbar(self.canvas, self)
+
+        self.toolbar = NavigationToolbar(self.canvas, panel)
         layout.addWidget(self.toolbar)
         layout.addWidget(self.canvas)
-        
-        # Create subplot
+
         self.ax = self.figure.add_subplot(1, 1, 1)
         self.ax.set_xlabel('2θ (degrees)')
         self.ax.set_ylabel('Intensity')
-        self.ax.set_title('Experimental Pattern')
-        self.ax.grid(True, alpha=0.3)
-        
-        self.figure.tight_layout()
-        
-        return group
-    
+        self.ax.set_title('Pattern Comparison')
+        apply_plot_style(self.figure, mode)
+
+        return panel
+
+    def on_theme_changed(self, mode: str):
+        apply_plot_style(self.figure, mode)
+        self.plot_experimental_pattern()
+
     def set_experimental_pattern(self, pattern_data):
         """Set the experimental pattern data
         
@@ -308,9 +320,9 @@ class PatternSearchTab(QWidget):
             self.ax.set_xlabel('2θ (degrees)')
             self.ax.set_ylabel('Intensity')
             self.ax.set_title('Experimental Pattern')
-            self.ax.grid(True, alpha=0.3)
             self.ax.legend()
-        
+
+        apply_plot_style(self.figure, get_current_mode())
         self.canvas.draw()
     
     
@@ -467,15 +479,14 @@ class PatternSearchTab(QWidget):
             self.ax.set_xlabel('2θ (degrees)')
             self.ax.set_ylabel('Intensity')
             self.ax.set_title(f'Pattern Comparison: {result["mineral_name"]}')
-            self.ax.grid(True, alpha=0.3)
             self.ax.legend()
-            
-            # Set reasonable axis limits
+
             pattern_to_use = self.processed_pattern or self.experimental_pattern
             if pattern_to_use:
-                self.ax.set_xlim(min(pattern_to_use['two_theta']), 
+                self.ax.set_xlim(min(pattern_to_use['two_theta']),
                                max(pattern_to_use['two_theta']))
-            
+
+            apply_plot_style(self.figure, get_current_mode())
             self.canvas.draw()
             
         except Exception as e:
@@ -520,10 +531,18 @@ class PatternSearchTab(QWidget):
                     'mineral': result['mineral_name'],
                     'formula': result.get('chemical_formula', 'Unknown'),
                     'space_group': result.get('space_group', 'Unknown'),
-                    'local_db': True,  # Mark as from local database
-                    'search_score': result.get('combined_score', 
-                                             result.get('correlation', 
-                                                       result.get('match_score', 0)))
+                    'cell_a': result.get('cell_a'),
+                    'cell_b': result.get('cell_b'),
+                    'cell_c': result.get('cell_c'),
+                    'cell_alpha': result.get('cell_alpha'),
+                    'cell_beta': result.get('cell_beta'),
+                    'cell_gamma': result.get('cell_gamma'),
+                    'rir': result.get('rir'),
+                    'local_db': True,
+                    'search_score': result.get('ensemble_score',
+                                             result.get('combined_score',
+                                             result.get('correlation',
+                                                       result.get('match_score', 0))))
                 }
                 selected_results.append(phase_data)
         
@@ -625,6 +644,98 @@ class PatternSearchTab(QWidget):
             self.benchmark_btn.setEnabled(True)
             self.benchmark_btn.setText("Benchmark")
     
+    def start_search(self):
+        """Dispatch search based on selected algorithm"""
+        method_idx = self.search_method_combo.currentIndex()
+        if method_idx == 0:
+            self.start_ultra_fast_search()
+            return
+
+        pattern_to_use = self.processed_pattern or self.experimental_pattern
+        if not pattern_to_use:
+            QMessageBox.warning(self, "No Pattern Data",
+                              "Load an experimental pattern before searching.")
+            return
+
+        # Peak-based methods need peak positions if available
+        search_data = dict(pattern_to_use)
+        if self.experimental_peaks:
+            search_data.update({
+                'peaks_two_theta': self.experimental_peaks.get('two_theta',
+                                                              self.experimental_peaks.get('peak_positions')),
+                'peaks_intensity': self.experimental_peaks.get('intensity',
+                                                              self.experimental_peaks.get('peak_intensities')),
+            })
+            # pattern_search.search_by_peaks expects two_theta/intensity as peaks
+            if method_idx in (1, 3, 4) and search_data.get('peaks_two_theta') is not None:
+                peak_data = {
+                    'two_theta': np.asarray(search_data['peaks_two_theta']),
+                    'intensity': np.asarray(search_data['peaks_intensity']),
+                    'wavelength': pattern_to_use.get('wavelength', 1.5406)
+                }
+            else:
+                peak_data = pattern_to_use
+        else:
+            peak_data = pattern_to_use
+
+        min_correlation = self.fast_min_correlation_spin.value()
+        max_results = self.fast_max_results_spin.value()
+        peak_tol = self.peak_tolerance_spin.value()
+
+        try:
+            self.progress_bar.setVisible(True)
+            self.progress_bar.setRange(0, 0)
+            self.search_btn.setEnabled(False)
+            self.status_label.setText("Searching...")
+
+            if method_idx == 1:
+                results = self.search_engine.search_by_peaks(
+                    peak_data, tolerance=peak_tol, max_results=max_results
+                )
+            elif method_idx == 2:
+                results = self.search_engine.search_by_correlation(
+                    pattern_to_use, min_correlation=min_correlation, max_results=max_results
+                )
+            elif method_idx == 3:
+                combined_input = {
+                    **pattern_to_use,
+                    'two_theta': peak_data.get('two_theta', pattern_to_use['two_theta']),
+                    'intensity': peak_data.get('intensity', pattern_to_use['intensity']),
+                }
+                # combined_search expects peaks in experimental_data and also full pattern
+                # Pass full pattern; peak search uses two_theta/intensity from it
+                results = self.search_engine.combined_search(
+                    pattern_to_use if self.experimental_peaks is None else {
+                        'two_theta': peak_data['two_theta'],
+                        'intensity': peak_data['intensity'],
+                        'wavelength': pattern_to_use.get('wavelength', 1.5406),
+                        # correlation path needs full pattern — stash under alternate keys
+                        'full_two_theta': pattern_to_use['two_theta'],
+                        'full_intensity': pattern_to_use['intensity'],
+                    },
+                    peak_tolerance=peak_tol,
+                    min_correlation=min_correlation,
+                    max_results=max_results
+                )
+            else:  # ensemble
+                results = self.search_engine.ensemble_search(
+                    pattern_to_use if self.experimental_peaks is None else peak_data,
+                    methods=['peaks', 'correlation', 'ultrafast'],
+                    max_results=max_results,
+                    peak_tolerance=peak_tol,
+                    min_correlation=min_correlation,
+                    fast_search_engine=self.fast_search_engine
+                )
+
+            self.display_search_results(results)
+        except Exception as e:
+            self.handle_search_error(str(e))
+            import traceback
+            traceback.print_exc()
+        finally:
+            self.progress_bar.setVisible(False)
+            self.search_btn.setEnabled(True)
+
     def start_ultra_fast_search(self):
         """Start ultra-fast correlation search
         

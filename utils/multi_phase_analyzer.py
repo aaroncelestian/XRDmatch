@@ -22,24 +22,356 @@ class MultiPhaseAnalyzer:
         self.lebail_engine = LeBailRefinement()
         self.refined_phases_cache = {}
         
-    def sequential_phase_identification(self, experimental_data: Dict, 
+    def joint_lebail_phase_identification(self, experimental_data: Dict,
+                                          candidate_phases: List[Dict],
+                                          max_phases: int = 5,
+                                          min_delta_rwp: float = 2.0,
+                                          min_scale: float = 0.05,
+                                          residual_threshold: float = 0.05,
+                                          fast_search_engine=None,
+                                          residual_research: bool = True,
+                                          polish: bool = True) -> Dict:
+        """
+        Multi-phase ID using trial joint Le Bail for accept/reject.
+
+        Residual correlation is used only to propose the next candidate.
+        A candidate is accepted only if trial joint refinement improves Rwp
+        enough and the phase scale is significant. Optional final polish refine.
+        """
+        exp_two_theta = np.asarray(experimental_data['two_theta'], dtype=float)
+        exp_intensity = np.asarray(experimental_data['intensity'], dtype=float)
+        wavelength = experimental_data.get('wavelength', 1.5406)
+
+        remaining = list(candidate_phases)
+        all_candidates = list(candidate_phases)
+        active = []
+        excluded_names = set()
+        trial_history = []
+        current_rwp = None
+        current_residue = exp_intensity.copy()
+        residue_history = [current_residue.copy()]
+        calculated_pattern = np.zeros_like(exp_intensity)
+
+        print(f"Joint Le Bail multiphase ID: {len(remaining)} candidates, max_phases={max_phases}")
+
+        for iteration in range(max_phases):
+            residue_fraction = float(np.max(current_residue) / max(np.max(exp_intensity), 1e-12))
+            if residue_fraction < residual_threshold:
+                print(f"Residue fraction {residue_fraction:.3f} below threshold; stopping")
+                break
+
+            # Keep pool free of already-accepted mineral names
+            remaining = self._exclude_minerals(remaining, excluded_names)
+
+            # Optionally replenish / re-rank candidates from residual DB search
+            if residual_research and fast_search_engine is not None and iteration > 0:
+                try:
+                    residual_pattern = {
+                        'two_theta': exp_two_theta,
+                        'intensity': np.maximum(current_residue, 0),
+                        'wavelength': wavelength
+                    }
+                    new_hits = fast_search_engine.ultra_fast_correlation_search(
+                        residual_pattern, min_correlation=0.25, max_results=30
+                    )
+                    remaining = self._merge_residual_hits(
+                        remaining, new_hits, active, all_candidates=all_candidates
+                    )
+                    remaining = self._exclude_minerals(remaining, excluded_names)
+                except Exception as e:
+                    print(f"Residual re-search skipped: {e}")
+
+            proposal, score, _ = self._find_best_phase_for_residue(
+                exp_two_theta, current_residue, remaining, wavelength,
+                excluded_names=excluded_names
+            )
+            if proposal is None or score < 0.1:
+                print(f"No suitable proposal (score={score:.3f}); stopping")
+                break
+
+            phase_name = self._phase_name(proposal)
+            print(f"\n=== Trial {iteration + 1}: propose {phase_name} (corr={score:.3f}) ===")
+
+            trial_set = active + [proposal]
+            trial_result = self._run_joint_refine(
+                experimental_data, trial_set, mode='trial'
+            )
+            if trial_result is None:
+                remaining = self._remove_phase(remaining, proposal)
+                continue
+
+            trial_rwp = trial_result['final_r_factors']['Rwp']
+            trial_scales = [
+                p['parameters'].get('scale_factor', 0.0)
+                for p in trial_result['refined_phases']
+            ]
+            new_scale = trial_scales[-1] if trial_scales else 0.0
+
+            baseline = current_rwp if current_rwp is not None else float('inf')
+            delta = baseline - trial_rwp if np.isfinite(baseline) else float('inf')
+            accept = (delta >= min_delta_rwp or current_rwp is None) and new_scale >= min_scale
+
+            trial_history.append({
+                'phase': phase_name,
+                'proposed_score': score,
+                'rwp': trial_rwp,
+                'delta_rwp': delta if np.isfinite(delta) else None,
+                'scale': new_scale,
+                'accepted': accept
+            })
+
+            remaining = self._remove_phase(remaining, proposal)
+
+            if not accept:
+                print(f"Reject {phase_name}: ΔRwp={delta if np.isfinite(delta) else 'n/a'}, scale={new_scale:.3f}")
+                continue
+
+            print(f"Accept {phase_name}: Rwp={trial_rwp:.2f}% "
+                  f"(Δ={f'{delta:.2f}' if np.isfinite(delta) else 'init'}), "
+                  f"scale={new_scale:.3f}")
+            active.append(proposal)
+            excluded_names.add(self._mineral_key(proposal))
+            # Drop every DB entry for this mineral (not just this id)
+            remaining = self._exclude_minerals(remaining, excluded_names)
+            current_rwp = trial_rwp
+            calculated_pattern = trial_result['calculated_pattern']
+            # Both patterns are on normalized 0-100 in engine; map residual to original units
+            calc_norm = trial_result['calculated_pattern']
+            exp_norm = trial_result['experimental_intensity']
+            if len(calc_norm) == len(exp_norm) and np.max(exp_norm) > 0:
+                resid_norm = np.maximum(exp_norm - calc_norm, 0)
+                current_residue = resid_norm / 100.0 * np.max(exp_intensity)
+            residue_history.append(current_residue.copy())
+
+        # Final polish on accepted set
+        polish_results = None
+        if polish and active:
+            print("\n=== Polish refine on accepted phase set ===")
+            polish_results = self._run_joint_refine(
+                experimental_data, active, mode='polish'
+            )
+
+        identified_phases = []
+        source_results = polish_results or (
+            self._run_joint_refine(experimental_data, active, mode='trial') if active else None
+        )
+        score_by_name = {
+            t['phase']: t['proposed_score']
+            for t in trial_history if t.get('accepted')
+        }
+        max_exp = float(np.max(exp_intensity)) if np.max(exp_intensity) > 0 else 1.0
+        if source_results:
+            phase_patterns = source_results.get('phase_patterns') or []
+            # Rebuild contributions from refined phases
+            for i, refined in enumerate(source_results['refined_phases']):
+                phase_src = active[i] if i < len(active) else refined.get('data', {})
+                phase_data = phase_src.get('phase', phase_src) if isinstance(phase_src, dict) else {}
+                if 'phase' in phase_src:
+                    phase_data = phase_src['phase']
+                elif 'data' in refined and 'phase' in refined['data']:
+                    phase_data = refined['data']['phase']
+
+                # Ensure rir propagates
+                if 'rir' not in phase_data and isinstance(phase_src, dict):
+                    phase_data = dict(phase_data)
+                    phase_data['rir'] = phase_src.get('rir') or phase_src.get('phase', {}).get('rir')
+
+                scale = refined['parameters'].get('scale_factor', 1.0)
+                theo = refined.get('theoretical_peaks') or phase_src.get('theoretical_peaks', {})
+                imax = float(np.max(theo.get('intensity', [0]))) if theo else 0.0
+
+                # Map normalized (0-100) phase pattern back to experimental intensity units
+                if i < len(phase_patterns) and phase_patterns[i] is not None:
+                    contribution = np.asarray(phase_patterns[i], dtype=float) / 100.0 * max_exp
+                else:
+                    contribution = np.zeros_like(exp_intensity)
+
+                identified_phases.append({
+                    'phase': phase_data,
+                    'theoretical_peaks': theo,
+                    'match_score': score_by_name.get(phase_data.get('mineral', ''), 0.0),
+                    'optimized_scaling': scale,
+                    'initial_scaling': scale,
+                    'iteration': i + 1,
+                    'contribution': contribution,
+                    'integrated_proxy': scale * max(imax, 1.0),
+                    'rir': phase_data.get('rir'),
+                    'lebail_params': refined['parameters']
+                })
+
+            if len(source_results['calculated_pattern']) == len(exp_intensity):
+                calculated_pattern = source_results['calculated_pattern']
+                current_residue = np.maximum(
+                    source_results['experimental_intensity'] - calculated_pattern, 0
+                )
+                current_residue = current_residue / 100.0 * max_exp
+
+        result = {
+            'identified_phases': identified_phases,
+            'residue_history': residue_history,
+            'final_residue': current_residue,
+            'experimental_data': experimental_data,
+            'residue_fraction': float(np.max(current_residue) / max(np.max(exp_intensity), 1e-12)),
+            'lebail_refinement': polish_results or source_results,
+            'trial_history': trial_history,
+            'method': 'joint_lebail',
+            'final_rwp': (polish_results or source_results or {}).get('final_r_factors', {}).get('Rwp')
+                        if (polish_results or source_results) else current_rwp
+        }
+        result['rir_wt_percent'] = self.calculate_rir_weight_percents(result)
+        return result
+
+    def _run_joint_refine(self, experimental_data: Dict, phase_list: List[Dict],
+                          mode: str = 'trial') -> Optional[Dict]:
+        """Run joint Le Bail/trial refine on a phase list"""
+        try:
+            engine = LeBailRefinement()
+            engine.set_experimental_data(
+                np.asarray(experimental_data['two_theta'], dtype=float),
+                np.asarray(experimental_data['intensity'], dtype=float),
+                two_theta_range=experimental_data.get('two_theta_range')
+            )
+            for phase in phase_list:
+                phase_payload = {
+                    'phase': phase.get('phase', phase),
+                    'theoretical_peaks': phase.get('theoretical_peaks')
+                }
+                if phase_payload['theoretical_peaks'] is None:
+                    continue
+                init = {
+                    'refine_cell': mode == 'polish',
+                    'refine_profile': mode == 'polish',
+                    'refine_scale': True,
+                    'u_param': 0.01,
+                    'v_param': -0.001,
+                    'w_param': 0.015,
+                    'eta_param': 0.5,
+                }
+                engine.add_phase(phase_payload, init)
+
+            if not engine.phases:
+                return None
+
+            max_iter = 3 if mode == 'trial' else 12
+            results = engine.refine_phases(
+                max_iterations=max_iter,
+                mode=mode,
+                staged_refinement=(mode == 'polish'),
+                quiet=(mode == 'trial')
+            )
+            # Per-phase calculated patterns on the engine's 0-100 intensity scale
+            results['phase_patterns'] = [
+                engine._calculate_phase_pattern(i, engine.phases[i]['parameters'])
+                for i in range(len(engine.phases))
+            ]
+            return results
+        except Exception as e:
+            print(f"Joint refine failed ({mode}): {e}")
+            return None
+
+    def _phase_name(self, phase: Dict) -> str:
+        if 'phase' in phase:
+            return phase['phase'].get('mineral', 'Unknown')
+        return phase.get('mineral', phase.get('mineral_name', 'Unknown'))
+
+    def _mineral_key(self, phase: Dict) -> str:
+        """Normalized mineral name for duplicate exclusion"""
+        return str(self._phase_name(phase)).strip().lower()
+
+    def _phase_id(self, phase: Dict):
+        if 'phase' in phase:
+            return phase['phase'].get('id')
+        return phase.get('id', phase.get('mineral_id'))
+
+    def _exclude_minerals(self, candidates: List[Dict], excluded_names: set) -> List[Dict]:
+        """Drop candidates whose mineral name is already accepted"""
+        return [p for p in candidates if self._mineral_key(p) not in excluded_names]
+
+    def _remove_phase(self, candidates: List[Dict], phase: Dict) -> List[Dict]:
+        """Remove this id and every entry with the same mineral name"""
+        pid = self._phase_id(phase)
+        key = self._mineral_key(phase)
+        return [
+            p for p in candidates
+            if self._phase_id(p) != pid and self._mineral_key(p) != key
+        ]
+
+    def _merge_residual_hits(self, remaining: List[Dict], hits: List[Dict],
+                             active: List[Dict],
+                             all_candidates: Optional[List[Dict]] = None) -> List[Dict]:
+        """
+        Re-rank remaining candidates using residual search scores.
+        Also pull in other already-loaded candidates that match residual hits
+        (must already have theoretical_peaks).
+        """
+        excluded = {self._mineral_key(p) for p in active}
+        hit_scores = {}
+        for hit in hits:
+            name = str(hit.get('mineral_name', '')).strip().lower()
+            if not name or name in excluded:
+                continue
+            hit_scores[name] = max(hit_scores.get(name, 0.0), float(hit.get('correlation', 0.0)))
+            hid = hit.get('mineral_id', hit.get('id'))
+            if hid is not None:
+                hit_scores[f'id:{hid}'] = float(hit.get('correlation', 0.0))
+
+        pool = list(remaining)
+        if all_candidates:
+            rem_ids = {self._phase_id(p) for p in remaining}
+            for cand in all_candidates:
+                if self._mineral_key(cand) in excluded:
+                    continue
+                if self._phase_id(cand) in rem_ids:
+                    continue
+                if not cand.get('theoretical_peaks'):
+                    continue
+                key = self._mineral_key(cand)
+                if key in hit_scores or f'id:{self._phase_id(cand)}' in hit_scores:
+                    pool.append(cand)
+
+        # Sort by residual hit score when available, else keep order
+        def sort_key(p):
+            key = self._mineral_key(p)
+            pid = self._phase_id(p)
+            return max(hit_scores.get(key, 0.0), hit_scores.get(f'id:{pid}', 0.0))
+
+        pool.sort(key=sort_key, reverse=True)
+        return pool
+
+    def calculate_rir_weight_percents(self, multi_phase_result: Dict) -> Dict[str, Optional[float]]:
+        """
+        Chung RIR quantification: w_i = (I_i / RIR_i) / sum(I_j / RIR_j)
+        I_i uses integrated_proxy (scale * Imax) from joint fit.
+        Phases missing RIR are marked None and excluded from the sum.
+        """
+        identified = multi_phase_result.get('identified_phases', [])
+        weights = {}
+        terms = []
+        for phase_result in identified:
+            phase = phase_result.get('phase', {})
+            name = phase.get('mineral', 'Unknown')
+            rir = phase_result.get('rir', phase.get('rir'))
+            intensity = phase_result.get('integrated_proxy')
+            if intensity is None:
+                intensity = phase_result.get('optimized_scaling', 0.0) * 100.0
+            if rir is None or rir <= 0:
+                weights[name] = None
+                continue
+            terms.append((name, float(intensity) / float(rir)))
+
+        total = sum(t for _, t in terms)
+        for name, term in terms:
+            weights[name] = (100.0 * term / total) if total > 0 else 0.0
+        return weights
+
+    def sequential_phase_identification(self, experimental_data: Dict,
                                      candidate_phases: List[Dict],
                                      max_phases: int = 5,
                                      residue_threshold: float = 0.05,
                                      use_lebail: bool = True) -> Dict:
         """
-        Perform sequential phase identification with residue analysis
-        
-        Args:
-            experimental_data: Dict with 'two_theta', 'intensity', 'wavelength'
-                              IMPORTANT: Should use background-subtracted intensity data
-                              Background subtraction must be performed before phase matching
-            candidate_phases: List of phase dictionaries from matching
-            max_phases: Maximum number of phases to identify
-            residue_threshold: Stop when residue intensity drops below this fraction
-            
-        Returns:
-            Dict with identified phases, residues, and optimization results
+        Legacy sequential scale-and-subtract identification.
+        Prefer joint_lebail_phase_identification for overlapping peaks.
         """
         
         # Initialize with original experimental data
@@ -112,7 +444,9 @@ class MultiPhaseAnalyzer:
                 'initial_scaling': best_scaling,
                 'iteration': iteration + 1,
                 'residue_before': current_residue.copy(),
-                'contribution': current_residue - subtracted_pattern
+                'contribution': current_residue - subtracted_pattern,
+                'rir': phase_data.get('rir') if isinstance(phase_data, dict) else None,
+                'integrated_proxy': optimized_scaling * float(np.max(best_phase.get('theoretical_peaks', {}).get('intensity', [100]) or [100]))
             }
             
             identified_phases.append(phase_result)
@@ -148,28 +482,42 @@ class MultiPhaseAnalyzer:
                 experimental_data, identified_phases
             )
             
-        return {
+        result = {
             'identified_phases': identified_phases,
             'residue_history': residue_history,
             'final_residue': current_residue,
             'experimental_data': experimental_data,
             'residue_fraction': np.max(current_residue) / np.max(experimental_data['intensity']),
-            'lebail_refinement': refinement_results
+            'lebail_refinement': refinement_results,
+            'method': 'sequential_residual'
         }
+        result['rir_wt_percent'] = self.calculate_rir_weight_percents(result)
+        return result
     
     def _find_best_phase_for_residue(self, exp_two_theta: np.ndarray, 
                                    current_residue: np.ndarray,
                                    candidate_phases: List[Dict],
-                                   wavelength: float) -> Tuple[Optional[Dict], float, float]:
+                                   wavelength: float,
+                                   excluded_names: Optional[set] = None) -> Tuple[Optional[Dict], float, float]:
         """
-        Find the phase that best matches the current residue pattern
+        Find the phase that best explains the current residue.
+        Score is residual-weighted: correlation × fraction of residue intensity explained.
+        Already-accepted mineral names are skipped.
         """
         best_phase = None
         best_score = 0.0
         best_scaling = 1.0
+        excluded_names = excluded_names or set()
+        residue_sum = float(np.sum(np.maximum(current_residue, 0)))
+        if residue_sum <= 0:
+            return None, 0.0, 1.0
         
         for phase in candidate_phases:
-            # Generate theoretical pattern
+            if self._mineral_key(phase) in excluded_names:
+                continue
+            # Skip candidates without theoretical peaks (can't trial-refine)
+            if not phase.get('theoretical_peaks'):
+                continue
             theoretical_pattern = self._generate_theoretical_pattern(
                 phase, wavelength, exp_two_theta
             )
@@ -177,10 +525,27 @@ class MultiPhaseAnalyzer:
             if theoretical_pattern is None:
                 continue
                 
-            # Calculate correlation with current residue
-            score, optimal_scaling = self._calculate_residue_correlation(
+            correlation, optimal_scaling = self._calculate_residue_correlation(
                 exp_two_theta, current_residue, theoretical_pattern
             )
+            if correlation < 0.05:
+                continue
+
+            # How much residual intensity would this phase remove (non-negative clamp)
+            scaled = theoretical_pattern * optimal_scaling
+            if np.max(scaled) > 0 and np.max(current_residue) > 0:
+                # Align scale so theo max maps into residue units via LS scaling already
+                # _calculate_residue_correlation scales on normalized patterns; remap:
+                norm_res = current_residue / np.max(current_residue)
+                norm_theo = theoretical_pattern / np.max(theoretical_pattern)
+                scaled_res_units = norm_theo * optimal_scaling * np.max(current_residue)
+                explained = float(np.sum(np.minimum(scaled_res_units, np.maximum(current_residue, 0))))
+                explained_frac = explained / residue_sum
+            else:
+                explained_frac = 0.0
+
+            # Residual-first score: emphasize unexplained intensity covered
+            score = 0.35 * correlation + 0.65 * explained_frac
             
             if score > best_score:
                 best_score = score
@@ -307,30 +672,42 @@ class MultiPhaseAnalyzer:
     
     def calculate_phase_fractions(self, multi_phase_result: Dict) -> Dict[str, float]:
         """
-        Calculate quantitative phase fractions from identified phases
+        Prefer Chung RIR wt% when available; fall back to intensity contribution.
         """
-        identified_phases = multi_phase_result['identified_phases']
-        
+        rir_wts = multi_phase_result.get('rir_wt_percent')
+        if not rir_wts:
+            rir_wts = self.calculate_rir_weight_percents(multi_phase_result)
+
+        # If any phase has RIR, return RIR-based fractions (as 0-1), skipping None
+        if any(v is not None for v in rir_wts.values()):
+            out = {}
+            for name, wt in rir_wts.items():
+                if wt is None:
+                    continue
+                out[name] = wt / 100.0
+            if out:
+                return out
+
+        identified_phases = multi_phase_result.get('identified_phases', [])
         if not identified_phases:
             return {}
-            
-        # Calculate total contribution of all phases
-        total_contribution = 0
+
         phase_contributions = {}
-        
+        total_contribution = 0.0
         for phase_result in identified_phases:
-            contribution = np.sum(phase_result['contribution'])
+            if phase_result.get('contribution') is not None:
+                contribution = float(np.sum(phase_result['contribution']))
+            else:
+                contribution = float(phase_result.get('integrated_proxy',
+                                                      phase_result.get('optimized_scaling', 0.0)))
             phase_name = phase_result['phase'].get('mineral', 'Unknown')
             phase_contributions[phase_name] = contribution
             total_contribution += contribution
-            
-        # Calculate fractions
-        phase_fractions = {}
-        for phase_name, contribution in phase_contributions.items():
-            fraction = contribution / total_contribution if total_contribution > 0 else 0
-            phase_fractions[phase_name] = fraction
-            
-        return phase_fractions
+
+        return {
+            name: (c / total_contribution if total_contribution > 0 else 0.0)
+            for name, c in phase_contributions.items()
+        }
     
     def generate_residue_analysis_report(self, multi_phase_result: Dict) -> str:
         """
@@ -341,21 +718,40 @@ class MultiPhaseAnalyzer:
         
         report = []
         report.append("=== Multi-Phase Analysis Report ===\n")
-        
+        report.append(f"Method: {multi_phase_result.get('method', 'unknown')}")
+        if multi_phase_result.get('final_rwp') is not None:
+            report.append(f"Final Rwp: {multi_phase_result['final_rwp']:.2f}%")
         report.append(f"Phases Identified: {len(identified_phases)}")
         report.append(f"Final Residue: {final_residue_fraction:.1%} of original intensity\n")
         
-        # Phase details
         phase_fractions = self.calculate_phase_fractions(multi_phase_result)
+        rir_wts = multi_phase_result.get('rir_wt_percent') or self.calculate_rir_weight_percents(multi_phase_result)
         
         for i, phase_result in enumerate(identified_phases, 1):
             phase_name = phase_result['phase'].get('mineral', 'Unknown')
             fraction = phase_fractions.get(phase_name, 0)
+            rir = phase_result.get('rir', phase_result.get('phase', {}).get('rir'))
+            wt = rir_wts.get(phase_name)
             
             report.append(f"Phase {i}: {phase_name}")
             report.append(f"  - Match Score: {phase_result['match_score']:.3f}")
             report.append(f"  - Optimized Scaling: {phase_result['optimized_scaling']:.3f}")
-            report.append(f"  - Estimated Fraction: {fraction:.1%}")
+            if rir is not None:
+                report.append(f"  - RIR: {rir:.3f}")
+            if wt is not None:
+                report.append(f"  - RIR wt%: {wt:.1f}%")
+            else:
+                report.append(f"  - Estimated Fraction: {fraction:.1%} (no RIR)")
+            report.append("")
+
+        if multi_phase_result.get('trial_history'):
+            report.append("Trial history:")
+            for t in multi_phase_result['trial_history']:
+                status = 'ACCEPT' if t['accepted'] else 'reject'
+                report.append(
+                    f"  {status}: {t['phase']} Rwp={t['rwp']:.2f}% "
+                    f"scale={t['scale']:.3f} corr={t['proposed_score']:.3f}"
+                )
             report.append("")
             
         # Analysis quality assessment

@@ -94,6 +94,12 @@ class LocalCIFDatabase:
             )
         ''')
         
+        # Migrate: add RIR column if missing (AMCSD Reference Intensity Ratio vs corundum)
+        cursor.execute("PRAGMA table_info(minerals)")
+        mineral_cols = {row[1] for row in cursor.fetchall()}
+        if 'rir' not in mineral_cols:
+            cursor.execute('ALTER TABLE minerals ADD COLUMN rir REAL')
+        
         # Create search indices
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_mineral_name ON minerals (mineral_name)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_formula ON minerals (chemical_formula)')
@@ -759,15 +765,23 @@ class LocalCIFDatabase:
             
             if existing:
                 mineral_id = existing[0]
+                # Update RIR/density if newly parsed values are available
+                if dif_data.get('rir') is not None or dif_data.get('density') is not None:
+                    cursor.execute('''
+                        UPDATE minerals
+                        SET rir = COALESCE(?, rir),
+                            density = COALESCE(?, density)
+                        WHERE id = ?
+                    ''', (dif_data.get('rir'), dif_data.get('density'), mineral_id))
             else:
                 # Create new mineral entry
                 cursor.execute('''
                     INSERT INTO minerals (
                         mineral_name, chemical_formula, space_group, crystal_system,
                         cell_a, cell_b, cell_c, cell_alpha, cell_beta, cell_gamma,
-                        cell_volume, density, amcsd_id, authors, journal, year, doi,
+                        cell_volume, density, rir, amcsd_id, authors, journal, year, doi,
                         cif_content, cif_hash
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     dif_data['mineral_name'],
                     dif_data['chemical_formula'],
@@ -780,7 +794,8 @@ class LocalCIFDatabase:
                     dif_data.get('cell_beta', 90.0),
                     dif_data.get('cell_gamma', 90.0),
                     dif_data.get('cell_volume'),
-                    None,
+                    dif_data.get('density'),
+                    dif_data.get('rir'),
                     dif_data.get('amcsd_id'),
                     None, None, None, None,
                     f"# DIF imported from {os.path.basename(source_file)}",
@@ -803,8 +818,9 @@ class LocalCIFDatabase:
             ''', (mineral_id, dif_data['wavelength']))
             
             if cursor.fetchone():
+                conn.commit()
                 conn.close()
-                return 0  # Already exists
+                return 0  # Already exists (RIR may still have been updated)
             
             # Store diffraction pattern
             cursor.execute('''
@@ -831,6 +847,68 @@ class LocalCIFDatabase:
             if 'conn' in locals():
                 conn.close()
             return -1  # Error
+
+    def update_rir_from_dif(self, dif_file_path: str, progress_callback=None) -> Dict[str, int]:
+        """
+        Update RIR (and density) on existing minerals from an AMCSD bulk DIF file
+        without re-importing diffraction patterns.
+        """
+        stats = {'updated': 0, 'missing': 0, 'no_rir': 0, 'errors': 0}
+        try:
+            with open(dif_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+            blocks = self._split_amcsd_dif_blocks(content)
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+
+            for i, block in enumerate(blocks):
+                try:
+                    dif_data = self._parse_amcsd_single_block(block)
+                    if not dif_data:
+                        stats['errors'] += 1
+                        continue
+                    if dif_data.get('rir') is None:
+                        stats['no_rir'] += 1
+                        continue
+
+                    mineral_id = None
+                    if dif_data.get('amcsd_id'):
+                        cursor.execute('SELECT id FROM minerals WHERE amcsd_id = ?', (dif_data['amcsd_id'],))
+                        row = cursor.fetchone()
+                        if row:
+                            mineral_id = row[0]
+                    if mineral_id is None:
+                        cursor.execute(
+                            'SELECT id FROM minerals WHERE mineral_name = ?',
+                            (dif_data['mineral_name'],)
+                        )
+                        row = cursor.fetchone()
+                        if row:
+                            mineral_id = row[0]
+
+                    if mineral_id is None:
+                        stats['missing'] += 1
+                        continue
+
+                    cursor.execute('''
+                        UPDATE minerals
+                        SET rir = ?, density = COALESCE(?, density)
+                        WHERE id = ?
+                    ''', (dif_data.get('rir'), dif_data.get('density'), mineral_id))
+                    stats['updated'] += 1
+                except Exception:
+                    stats['errors'] += 1
+
+                if progress_callback and (i + 1) % 50 == 0:
+                    progress_callback(int((i + 1) / max(len(blocks), 1) * 100))
+
+            conn.commit()
+            conn.close()
+            print(f"RIR update complete: {stats}")
+            return stats
+        except Exception as e:
+            print(f"Error updating RIR from DIF: {e}")
+            return stats
     
     def import_dif_file(self, dif_file_path: str) -> int:
         """
@@ -877,6 +955,13 @@ class LocalCIFDatabase:
             if existing:
                 mineral_id = existing[0]
                 print(f"Found existing mineral: {dif_data['mineral_name']} (ID: {mineral_id})")
+                if dif_data.get('rir') is not None or dif_data.get('density') is not None:
+                    cursor.execute('''
+                        UPDATE minerals
+                        SET rir = COALESCE(?, rir),
+                            density = COALESCE(?, density)
+                        WHERE id = ?
+                    ''', (dif_data.get('rir'), dif_data.get('density'), mineral_id))
             else:
                 # Create new mineral entry with all required fields
                 cursor.execute('''
@@ -898,7 +983,7 @@ class LocalCIFDatabase:
                     dif_data.get('cell_beta', 90.0),
                     dif_data.get('cell_gamma', 90.0),
                     dif_data.get('cell_volume'),
-                    None,  # density
+                    dif_data.get('density'),
                     dif_data.get('amcsd_id'),
                     None,  # authors
                     None,  # journal
@@ -917,6 +1002,10 @@ class LocalCIFDatabase:
                         INSERT INTO mineral_elements (mineral_id, element, count)
                         VALUES (?, ?, ?)
                     ''', (mineral_id, element, count))
+
+                if dif_data.get('rir') is not None:
+                    cursor.execute('UPDATE minerals SET rir = ? WHERE id = ?',
+                                   (dif_data['rir'], mineral_id))
             
             # Check if pattern already exists
             cursor.execute('''
@@ -926,6 +1015,7 @@ class LocalCIFDatabase:
             
             if cursor.fetchone():
                 print(f"Diffraction pattern already exists for {dif_data['mineral_name']}")
+                conn.commit()
                 conn.close()
                 return 0
             
@@ -1044,6 +1134,15 @@ class LocalCIFDatabase:
                             data['two_theta'].append(two_theta)
                             data['d_spacings'].append(d_spacing)
                             data['intensities'].append(intensity)
+                        elif len(parts) == 2:
+                            # Sometimes just 2theta and intensity
+                            two_theta = float(parts[0])
+                            intensity = float(parts[1])
+                            d_spacing = 1.5406 / (2 * np.sin(np.radians(two_theta / 2)))
+                            
+                            data['two_theta'].append(two_theta)
+                            data['d_spacings'].append(d_spacing)
+                            data['intensities'].append(intensity)
                     except (ValueError, IndexError):
                         continue
             
@@ -1137,6 +1236,20 @@ class LocalCIFDatabase:
                         data['space_group'] = space_group.split()[0] if space_group else 'Unknown'
                         print(f"   Space Group: {data['space_group']}")
                     except:
+                        pass
+
+                # Density (g/cm3)
+                if 'Density (g/cm3):' in line or 'Density (g/cm³):' in line:
+                    try:
+                        data['density'] = float(line.split(':')[1].strip().split()[0])
+                    except (ValueError, IndexError):
+                        pass
+
+                # AMCSD RIR vs corundum (Chung method)
+                if line.startswith('RIR:') or line.lstrip().startswith('RIR:'):
+                    try:
+                        data['rir'] = float(line.split(':')[1].strip().split()[0])
+                    except (ValueError, IndexError):
                         pass
                 
                 # Look for data section header
@@ -1463,7 +1576,7 @@ class LocalCIFDatabase:
             # First get mineral metadata including unit cell parameters
             cursor.execute('''
                 SELECT mineral_name, chemical_formula, space_group,
-                       cell_a, cell_b, cell_c, cell_alpha, cell_beta, cell_gamma
+                       cell_a, cell_b, cell_c, cell_alpha, cell_beta, cell_gamma, rir
                 FROM minerals
                 WHERE id = ?
             ''', (mineral_id,))
@@ -1473,7 +1586,8 @@ class LocalCIFDatabase:
                 conn.close()
                 return None
             
-            mineral_name, formula, space_group, cell_a, cell_b, cell_c, cell_alpha, cell_beta, cell_gamma = mineral_data
+            (mineral_name, formula, space_group, cell_a, cell_b, cell_c,
+             cell_alpha, cell_beta, cell_gamma, rir) = mineral_data
             
             # Look for Cu Kα pattern (our reference wavelength)
             # Try both common Cu Kα wavelengths and prefer AMCSD_DIF over other calculation methods
@@ -1547,7 +1661,8 @@ class LocalCIFDatabase:
                         'cell_c': cell_c,
                         'cell_alpha': cell_alpha,
                         'cell_beta': cell_beta,
-                        'cell_gamma': cell_gamma
+                        'cell_gamma': cell_gamma,
+                        'rir': rir
                     }
                 else:
                     # Same wavelength, return as-is
@@ -1563,7 +1678,8 @@ class LocalCIFDatabase:
                         'cell_c': cell_c,
                         'cell_alpha': cell_alpha,
                         'cell_beta': cell_beta,
-                        'cell_gamma': cell_gamma
+                        'cell_gamma': cell_gamma,
+                        'rir': rir
                     }
             
             return None

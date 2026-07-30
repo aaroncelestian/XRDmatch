@@ -8,20 +8,20 @@ Data processing tab for XRD pattern preprocessing including:
 """
 
 import numpy as np
-from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
+from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QLabel, QComboBox, QDoubleSpinBox, QSpinBox,
-                             QGroupBox, QSlider, QCheckBox, QSplitter,
-                             QMessageBox, QProgressBar, QTabWidget, QGridLayout,
-                             QFrame, QToolButton, QButtonGroup, QFileDialog)
+                             QSlider, QCheckBox, QSplitter, QMessageBox,
+                             QProgressBar, QTabWidget, QGridLayout, QFileDialog)
 from PyQt5.QtCore import Qt, pyqtSignal, QTimer
-from PyQt5.QtGui import QIcon
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
 from scipy.sparse import diags
 from scipy.sparse.linalg import spsolve
 from scipy.signal import find_peaks
-import matplotlib.pyplot as plt
+
+from matplotlib_config import apply_plot_style, get_plot_palette
+from gui.theme import get_current_mode
 
 class ProcessingTab(QWidget):
     """Tab for data processing and background subtraction"""
@@ -52,135 +52,122 @@ class ProcessingTab(QWidget):
     def init_ui(self):
         """Initialize the user interface"""
         layout = QVBoxLayout(self)
-        
-        # Create splitter for controls and plot
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
         splitter = QSplitter(Qt.Orientation.Horizontal)
         layout.addWidget(splitter)
-        
-        # Left panel - controls
+
         controls_widget = self.create_controls_panel()
         splitter.addWidget(controls_widget)
-        
-        # Right panel - plot
+
         plot_widget = self.create_plot_widget()
         splitter.addWidget(plot_widget)
-        
-        # Set splitter proportions (30% controls, 70% plot)
-        splitter.setSizes([400, 900])
-        
+
+        splitter.setSizes([380, 920])
+
     def create_controls_panel(self):
         """Create the controls panel with tabbed interface"""
         widget = QWidget()
         layout = QVBoxLayout(widget)
-        
-        # Pattern info (always visible)
-        info_group = self.create_pattern_info_group()
-        layout.addWidget(info_group)
-        
-        # Create tabbed interface for different processing options
+        layout.setContentsMargins(0, 0, 4, 0)
+        layout.setSpacing(6)
+
+        layout.addWidget(self.create_pattern_info_header())
+
         tab_widget = QTabWidget()
-        
-        # Sample holder subtraction tab (should be first)
+
         holder_tab = QWidget()
         holder_layout = QVBoxLayout(holder_tab)
-        holder_group = self.create_sample_holder_group()
-        holder_layout.addWidget(holder_group)
+        holder_layout.setContentsMargins(8, 8, 8, 8)
+        self._build_sample_holder_controls(holder_layout)
         holder_layout.addStretch()
         tab_widget.addTab(holder_tab, "Sample Holder")
-        
-        # Background subtraction tab
+
         bg_tab = QWidget()
         bg_layout = QVBoxLayout(bg_tab)
-        bg_group = self.create_background_group()
-        bg_layout.addWidget(bg_group)
+        bg_layout.setContentsMargins(8, 8, 8, 8)
+        self._build_background_controls(bg_layout)
         bg_layout.addStretch()
         tab_widget.addTab(bg_tab, "Background")
-        
-        # Corrections tab
+
         corr_tab = QWidget()
         corr_layout = QVBoxLayout(corr_tab)
-        corr_group = self.create_corrections_group()
-        corr_layout.addWidget(corr_group)
+        corr_layout.setContentsMargins(8, 8, 8, 8)
+        self._build_corrections_controls(corr_layout)
         corr_layout.addStretch()
         tab_widget.addTab(corr_tab, "Corrections")
-        
-        # Peak detection tab
+
         peak_tab = QWidget()
         peak_layout = QVBoxLayout(peak_tab)
-        peak_group = self.create_peak_detection_group()
-        peak_layout.addWidget(peak_group)
+        peak_layout.setContentsMargins(8, 8, 8, 8)
+        self._build_peak_detection_controls(peak_layout)
         peak_layout.addStretch()
         tab_widget.addTab(peak_tab, "Peak Detection")
-        
-        # Additional processing tab
+
         filter_tab = QWidget()
         filter_layout = QVBoxLayout(filter_tab)
-        filter_group = self.create_filtering_group()
-        filter_layout.addWidget(filter_group)
+        filter_layout.setContentsMargins(8, 8, 8, 8)
+        self._build_filtering_controls(filter_layout)
         filter_layout.addStretch()
         tab_widget.addTab(filter_tab, "Filtering")
-        
+
         layout.addWidget(tab_widget)
-        
-        # Action buttons (always visible at bottom)
-        actions_group = self.create_actions_group()
-        layout.addWidget(actions_group)
-        
+        layout.addWidget(self.create_actions_bar())
+
         return widget
-        
-    def create_pattern_info_group(self):
-        """Create pattern information group"""
-        group = QGroupBox("Pattern Information")
-        layout = QVBoxLayout(group)
-        
+
+    def create_pattern_info_header(self):
+        """Compact pattern info strip (not a heavy GroupBox)."""
+        header = QWidget()
+        layout = QVBoxLayout(header)
+        layout.setContentsMargins(4, 2, 4, 2)
+        layout.setSpacing(2)
+
         self.pattern_info_label = QLabel("No pattern loaded")
         layout.addWidget(self.pattern_info_label)
-        
+
+        meta = QHBoxLayout()
         self.data_points_label = QLabel("Data points: -")
-        layout.addWidget(self.data_points_label)
-        
+        self.data_points_label.setObjectName("mutedLabel")
+        meta.addWidget(self.data_points_label)
         self.range_label = QLabel("2θ range: -")
-        layout.addWidget(self.range_label)
-        
-        return group
-        
-    def create_sample_holder_group(self):
-        """Create sample holder subtraction controls"""
-        group = QGroupBox("Sample Holder Subtraction")
-        layout = QVBoxLayout(group)
-        
-        # Enable/disable sample holder subtraction
+        self.range_label.setObjectName("mutedLabel")
+        meta.addWidget(self.range_label)
+        meta.addStretch()
+        layout.addLayout(meta)
+
+        return header
+
+    def _build_sample_holder_controls(self, layout):
+        """Sample holder subtraction controls (flat, no nested GroupBox)."""
         self.enable_holder_subtraction = QCheckBox("Enable Sample Holder Subtraction")
         self.enable_holder_subtraction.stateChanged.connect(self.on_holder_enable_changed)
         layout.addWidget(self.enable_holder_subtraction)
-        
-        # File loading section
+
         file_layout = QHBoxLayout()
         self.load_holder_btn = QPushButton("Load Sample Holder Pattern")
         self.load_holder_btn.clicked.connect(self.load_sample_holder_pattern)
         file_layout.addWidget(self.load_holder_btn)
-        
+
         self.clear_holder_btn = QPushButton("Clear")
         self.clear_holder_btn.clicked.connect(self.clear_sample_holder)
         self.clear_holder_btn.setEnabled(False)
         file_layout.addWidget(self.clear_holder_btn)
         layout.addLayout(file_layout)
-        
-        # Sample holder info
+
         self.holder_info_label = QLabel("No sample holder pattern loaded")
-        self.holder_info_label.setStyleSheet("QLabel { color: #666; font-size: 10px; }")
+        self.holder_info_label.setObjectName("mutedLabel")
         layout.addWidget(self.holder_info_label)
-        
-        # Help text
-        help_text = QLabel("Load a sample holder pattern (glass slide, aluminum plate, etc.) to subtract its contribution from your experimental data. This should be done first, before background subtraction.")
-        help_text.setStyleSheet("QLabel { color: #666; font-size: 9px; }")
+
+        help_text = QLabel(
+            "Load a sample holder pattern to subtract before background correction."
+        )
+        help_text.setObjectName("mutedLabel")
         help_text.setWordWrap(True)
         layout.addWidget(help_text)
-        
-        # Scaling controls
+
         scale_layout = QGridLayout()
-        
-        # Intensity scaling
         scale_layout.addWidget(QLabel("Intensity Scale (%):"), 0, 0)
         self.holder_scale_spin = QDoubleSpinBox()
         self.holder_scale_spin.setRange(0.1, 500.0)
@@ -191,8 +178,7 @@ class ProcessingTab(QWidget):
         self.holder_scale_spin.setToolTip("Scale the intensity of the sample holder pattern")
         self.holder_scale_spin.valueChanged.connect(self.on_holder_parameter_changed)
         scale_layout.addWidget(self.holder_scale_spin, 0, 1)
-        
-        # 2θ offset for alignment
+
         scale_layout.addWidget(QLabel("2θ Offset (°):"), 1, 0)
         self.holder_offset_spin = QDoubleSpinBox()
         self.holder_offset_spin.setRange(-5.0, 5.0)
@@ -202,55 +188,42 @@ class ProcessingTab(QWidget):
         self.holder_offset_spin.setToolTip("Shift sample holder pattern in 2θ for alignment")
         self.holder_offset_spin.valueChanged.connect(self.on_holder_parameter_changed)
         scale_layout.addWidget(self.holder_offset_spin, 1, 1)
-        
         layout.addLayout(scale_layout)
-        
-        # Preview options
+
         preview_layout = QHBoxLayout()
         self.show_holder_pattern = QCheckBox("Show Holder")
         self.show_holder_pattern.setChecked(True)
         self.show_holder_pattern.stateChanged.connect(self.update_plot)
         preview_layout.addWidget(self.show_holder_pattern)
-        
+
         self.show_subtracted = QCheckBox("Show Subtracted")
         self.show_subtracted.setChecked(True)
         self.show_subtracted.stateChanged.connect(self.update_plot)
         preview_layout.addWidget(self.show_subtracted)
-        
+
         self.realtime_holder_preview = QCheckBox("Real-time")
         self.realtime_holder_preview.setChecked(True)
         preview_layout.addWidget(self.realtime_holder_preview)
         layout.addLayout(preview_layout)
-        
-        # Initially disabled
+
         self.set_holder_controls_enabled(False)
-        
-        return group
-        
-    def create_background_group(self):
-        """Create compact background subtraction controls"""
-        group = QGroupBox("ALS Background Subtraction")
-        layout = QVBoxLayout(group)
-        
-        # Enable/disable background subtraction
+
+    def _build_background_controls(self, layout):
+        """ALS background subtraction controls (flat)."""
         self.enable_bg_subtraction = QCheckBox("Enable Background Subtraction")
         self.enable_bg_subtraction.stateChanged.connect(self.on_bg_enable_changed)
         layout.addWidget(self.enable_bg_subtraction)
-        
-        # Parameters in grid layout for compactness
+
         params_layout = QGridLayout()
-        
-        # Lambda parameter (smoothness)
         params_layout.addWidget(QLabel("Smoothness (λ):"), 0, 0)
         self.lambda_slider = QSlider(Qt.Orientation.Horizontal)
-        self.lambda_slider.setRange(2, 8)  # 10^2 to 10^8
-        self.lambda_slider.setValue(5)  # 10^5
+        self.lambda_slider.setRange(2, 8)
+        self.lambda_slider.setValue(5)
         self.lambda_slider.valueChanged.connect(self.on_lambda_changed)
         params_layout.addWidget(self.lambda_slider, 0, 1)
         self.lambda_value_label = QLabel("1e5")
         params_layout.addWidget(self.lambda_value_label, 0, 2)
-        
-        # P parameter (asymmetry)
+
         params_layout.addWidget(QLabel("Asymmetry (p):"), 1, 0)
         self.p_spinbox = QDoubleSpinBox()
         self.p_spinbox.setRange(0.001, 0.1)
@@ -259,250 +232,222 @@ class ProcessingTab(QWidget):
         self.p_spinbox.setSingleStep(0.001)
         self.p_spinbox.valueChanged.connect(self.on_parameter_changed)
         params_layout.addWidget(self.p_spinbox, 1, 1, 1, 2)
-        
-        # Iterations
+
         params_layout.addWidget(QLabel("Iterations:"), 2, 0)
         self.iterations_spinbox = QSpinBox()
         self.iterations_spinbox.setRange(5, 50)
         self.iterations_spinbox.setValue(10)
         self.iterations_spinbox.valueChanged.connect(self.on_parameter_changed)
         params_layout.addWidget(self.iterations_spinbox, 2, 1, 1, 2)
-        
         layout.addLayout(params_layout)
-        
-        # Preview options in horizontal layout
+
         preview_layout = QHBoxLayout()
         self.show_background = QCheckBox("Show BG")
         self.show_background.setChecked(True)
         self.show_background.stateChanged.connect(self.update_plot)
         preview_layout.addWidget(self.show_background)
-        
+
         self.show_original = QCheckBox("Show Orig")
         self.show_original.stateChanged.connect(self.update_plot)
         preview_layout.addWidget(self.show_original)
-        
+
         self.realtime_preview = QCheckBox("Real-time")
         self.realtime_preview.setChecked(True)
         preview_layout.addWidget(self.realtime_preview)
         layout.addLayout(preview_layout)
-        
-        # Progress bar for processing
+
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         layout.addWidget(self.progress_bar)
-        
-        # Initially disabled
+
         self.set_bg_controls_enabled(False)
-        
-        return group
-        
-    def create_corrections_group(self):
-        """Create sample displacement and other corrections"""
-        group = QGroupBox("Sample Displacement & Corrections")
-        layout = QVBoxLayout(group)
-        
-        # Sample displacement correction
+
+    def _build_corrections_controls(self, layout):
+        """Sample displacement and other corrections (flat)."""
         disp_layout = QHBoxLayout()
         disp_layout.addWidget(QLabel("2θ offset (°):"))
-        
+
         self.displacement_spin = QDoubleSpinBox()
         self.displacement_spin.setRange(-2.0, 2.0)
         self.displacement_spin.setDecimals(4)
         self.displacement_spin.setValue(0.0000)
         self.displacement_spin.setSingleStep(0.0010)
-        self.displacement_spin.setToolTip("Sample displacement correction - shifts all 2θ values by this amount")
+        self.displacement_spin.setToolTip("Shifts all 2θ values by this amount")
         self.displacement_spin.valueChanged.connect(self.apply_displacement_correction)
         disp_layout.addWidget(self.displacement_spin)
-        
-        # Auto-correct button
+
         auto_correct_btn = QPushButton("Auto-Correct")
         auto_correct_btn.setToolTip("Automatically estimate displacement using peak positions")
         auto_correct_btn.clicked.connect(self.auto_correct_displacement)
         disp_layout.addWidget(auto_correct_btn)
-        
-        # Reset button
+
         reset_btn = QPushButton("Reset")
         reset_btn.setToolTip("Reset displacement to zero")
         reset_btn.clicked.connect(self.reset_displacement)
         disp_layout.addWidget(reset_btn)
-        
         layout.addLayout(disp_layout)
-        
-        # Info label
-        self.displacement_info = QLabel("Sample displacement can cause systematic peak shifts.\nAdjust the offset to align experimental peaks with reference patterns.")
-        self.displacement_info.setStyleSheet("QLabel { color: #666; font-size: 10px; }")
+
+        self.displacement_info = QLabel(
+            "Sample displacement can cause systematic peak shifts. "
+            "Adjust the offset to align experimental peaks with reference patterns."
+        )
+        self.displacement_info.setObjectName("mutedLabel")
         self.displacement_info.setWordWrap(True)
         layout.addWidget(self.displacement_info)
-        
-        # Initially disabled
+
         self.set_correction_controls_enabled(False)
-        
-        return group
-        
-    def create_filtering_group(self):
-        """Create filtering and smoothing controls"""
-        group = QGroupBox("Additional Processing")
-        layout = QVBoxLayout(group)
-        
-        # Smoothing
+
+    def _build_filtering_controls(self, layout):
+        """Filtering and smoothing controls (flat)."""
         self.enable_smoothing = QCheckBox("Enable Smoothing")
         self.enable_smoothing.stateChanged.connect(self.on_parameter_changed)
         layout.addWidget(self.enable_smoothing)
-        
+
         smooth_layout = QHBoxLayout()
         smooth_layout.addWidget(QLabel("Window Size:"))
-        
         self.smooth_window = QSpinBox()
         self.smooth_window.setRange(3, 21)
         self.smooth_window.setValue(5)
-        self.smooth_window.setSingleStep(2)  # Keep odd numbers
+        self.smooth_window.setSingleStep(2)
         self.smooth_window.valueChanged.connect(self.on_parameter_changed)
         smooth_layout.addWidget(self.smooth_window)
         layout.addLayout(smooth_layout)
-        
-        # Noise reduction
+
         self.enable_noise_reduction = QCheckBox("Noise Reduction")
         self.enable_noise_reduction.stateChanged.connect(self.on_parameter_changed)
         layout.addWidget(self.enable_noise_reduction)
-        
-        return group
-        
-    def create_peak_detection_group(self):
-        """Create compact peak detection controls"""
-        group = QGroupBox("Peak Detection & Manual Editing")
-        layout = QVBoxLayout(group)
-        
-        # Peak editing mode toggle
+
+    def _build_peak_detection_controls(self, layout):
+        """Peak detection and manual editing (flat)."""
         edit_layout = QHBoxLayout()
         self.peak_edit_btn = QPushButton("Enable Peak Editing")
         self.peak_edit_btn.setCheckable(True)
         self.peak_edit_btn.clicked.connect(self.toggle_peak_editing)
         edit_layout.addWidget(self.peak_edit_btn)
-        
+
         self.clear_manual_btn = QPushButton("Clear Manual")
         self.clear_manual_btn.clicked.connect(self.clear_manual_peaks)
         edit_layout.addWidget(self.clear_manual_btn)
         layout.addLayout(edit_layout)
-        
-        # Instructions
+
         instructions = QLabel("Click plot to add peaks, right-click to remove")
-        instructions.setStyleSheet("color: gray; font-size: 10px;")
+        instructions.setObjectName("mutedLabel")
         layout.addWidget(instructions)
-        
-        # Compact parameter grid
+
         params_layout = QGridLayout()
-        
-        # Height and prominence
         params_layout.addWidget(QLabel("Min Height:"), 0, 0)
         self.min_height = QSpinBox()
         self.min_height.setRange(1, 10000)
         self.min_height.setValue(50)
         params_layout.addWidget(self.min_height, 0, 1)
-        
+
         params_layout.addWidget(QLabel("Min Prominence:"), 0, 2)
         self.min_prominence = QSpinBox()
         self.min_prominence.setRange(1, 1000)
         self.min_prominence.setValue(10)
         params_layout.addWidget(self.min_prominence, 0, 3)
-        
-        # Width and distance
+
         params_layout.addWidget(QLabel("Min Width:"), 1, 0)
         self.min_width = QSpinBox()
         self.min_width.setRange(1, 20)
         self.min_width.setValue(1)
         params_layout.addWidget(self.min_width, 1, 1)
-        
+
         params_layout.addWidget(QLabel("Min Distance:"), 1, 2)
         self.min_distance = QSpinBox()
         self.min_distance.setRange(1, 50)
         self.min_distance.setValue(3)
         params_layout.addWidget(self.min_distance, 1, 3)
-        
         layout.addLayout(params_layout)
-        
-        # Sensitivity and options
+
         sens_layout = QHBoxLayout()
         sens_layout.addWidget(QLabel("Sensitivity:"))
         self.sensitivity = QComboBox()
         self.sensitivity.addItems(["High", "Medium", "Low"])
         self.sensitivity.setCurrentIndex(0)
         sens_layout.addWidget(self.sensitivity)
-        
+
         self.show_all_candidates = QCheckBox("Show candidates")
         self.show_all_candidates.stateChanged.connect(self.update_plot)
         sens_layout.addWidget(self.show_all_candidates)
         layout.addLayout(sens_layout)
-        
-        # Find peaks button
+
         self.find_peaks_btn = QPushButton("Find Peaks")
+        self.find_peaks_btn.setObjectName("primaryButton")
         self.find_peaks_btn.clicked.connect(self.find_peaks)
         self.find_peaks_btn.setEnabled(False)
         layout.addWidget(self.find_peaks_btn)
-        
-        return group
-        
-    def create_actions_group(self):
-        """Create compact action buttons"""
-        group = QGroupBox("Actions")
-        layout = QVBoxLayout(group)
-        
-        # Main action buttons in horizontal layout
+
+    def create_actions_bar(self):
+        """Primary actions without GroupBox chrome."""
+        bar = QWidget()
+        layout = QVBoxLayout(bar)
+        layout.setContentsMargins(0, 4, 0, 0)
+        layout.setSpacing(6)
+
         main_layout = QHBoxLayout()
-        
         self.apply_btn = QPushButton("Apply Processing")
+        self.apply_btn.setObjectName("primaryButton")
         self.apply_btn.clicked.connect(self.apply_processing)
         self.apply_btn.setEnabled(False)
         main_layout.addWidget(self.apply_btn)
-        
+
         self.reset_btn = QPushButton("Reset")
         self.reset_btn.clicked.connect(self.reset_to_original)
         self.reset_btn.setEnabled(False)
         main_layout.addWidget(self.reset_btn)
-        
         layout.addLayout(main_layout)
-        
-        # Export button
+
         self.export_btn = QPushButton("Export Processed Data")
         self.export_btn.clicked.connect(self.export_processed_data)
         self.export_btn.setEnabled(False)
         layout.addWidget(self.export_btn)
-        
-        return group
-        
+
+        return bar
+
     def create_plot_widget(self):
         """Create the matplotlib plot widget"""
-        group = QGroupBox("Pattern Preview")
-        layout = QVBoxLayout(group)
-        
-        self.figure = Figure(figsize=(12, 8))
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+
+        mode = get_current_mode()
+        palette = get_plot_palette(mode)
+        self.figure = Figure(figsize=(12, 8), facecolor=palette["figure_facecolor"])
         self.canvas = FigureCanvas(self.figure)
-        
-        # Add navigation toolbar
-        self.toolbar = NavigationToolbar(self.canvas, self)
+
+        self.toolbar = NavigationToolbar(self.canvas, panel)
         layout.addWidget(self.toolbar)
         layout.addWidget(self.canvas)
-        
+
         self.ax = self.figure.add_subplot(111)
         self.ax.set_xlabel('2θ (degrees)')
         self.ax.set_ylabel('Intensity (counts)')
         self.ax.set_title('XRD Pattern Processing Preview')
-        self.ax.grid(True, alpha=0.3)
-        
-        # Connect mouse events for peak editing
+        apply_plot_style(self.figure, mode)
+
         self.canvas.mpl_connect('button_press_event', self.on_plot_click)
-        
-        return group
-        
+
+        return panel
+
+    def on_theme_changed(self, mode: str):
+        apply_plot_style(self.figure, mode)
+        self.update_plot()
+
     def toggle_peak_editing(self):
         """Toggle peak editing mode"""
         self.peak_editing_mode = self.peak_edit_btn.isChecked()
         if self.peak_editing_mode:
             self.peak_edit_btn.setText("Disable Peak Editing")
-            self.peak_edit_btn.setStyleSheet("QPushButton { background-color: #ffcccc; }")
+            self.peak_edit_btn.setObjectName("dangerButton")
         else:
             self.peak_edit_btn.setText("Enable Peak Editing")
-            self.peak_edit_btn.setStyleSheet("")
-            
+            self.peak_edit_btn.setObjectName("")
+        self.peak_edit_btn.style().unpolish(self.peak_edit_btn)
+        self.peak_edit_btn.style().polish(self.peak_edit_btn)
+        self.peak_edit_btn.setStyleSheet("")
+        
     def clear_manual_peaks(self):
         """Clear all manually added/removed peaks"""
         self.manual_peaks.clear()
@@ -1238,9 +1183,8 @@ class ProcessingTab(QWidget):
             title += ' - Peak Editing Mode'
             
         self.ax.set_title(title)
-        self.ax.grid(True, alpha=0.3)
         self.ax.legend()
-        
+        apply_plot_style(self.figure, get_current_mode())
         self.canvas.draw()
         
     def apply_processing(self):
