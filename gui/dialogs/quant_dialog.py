@@ -9,7 +9,8 @@ from PyQt5.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from matplotlib_config import apply_plot_style, get_plot_palette
+from matplotlib_config import apply_plot_style, draw_error_bars, get_plot_palette
+from gui import display_settings
 from gui.theme import get_current_mode
 from gui.widgets.plot_host import create_plot_host
 from gui.stages.refine_stage import RefineStage
@@ -97,7 +98,13 @@ class QuantDialog(QDialog):
         self.refresh_plot()
 
     def on_theme_changed(self, mode: str):
-        apply_plot_style(self.quant_figure, mode)
+        apply_plot_style(self.quant_figure, mode, show_grid=display_settings.show_grid())
+        self.refresh_plot()
+
+    def on_display_settings_changed(self, prefs: dict):
+        dpi = prefs.get("plot_dpi")
+        if dpi is not None:
+            self.refine_stage.dpi.setValue(int(dpi))
         self.refresh_plot()
 
     def refresh_plot(self):
@@ -106,7 +113,7 @@ class QuantDialog(QDialog):
         ax.clear()
         palette = get_plot_palette(mode)
         self._plot_refine(ax, palette)
-        apply_plot_style(self.quant_figure, mode)
+        apply_plot_style(self.quant_figure, mode, show_grid=display_settings.show_grid())
         self.quant_canvas.draw_idle()
         self._update_results_table()
 
@@ -226,21 +233,23 @@ class QuantDialog(QDialog):
     def _plot_refine(self, ax, palette):
         results = self.session.lebail_results
         pattern = self.session.active_pattern()
+        lw = display_settings.line_width()
+        diff_lw = display_settings.line_width(0.7)
         if results and results.get("success"):
             rr = results.get("refinement_results") or {}
             tt = rr.get("two_theta", pattern["two_theta"] if pattern else None)
             exp = rr.get("experimental_intensity")
             calc = rr.get("calculated_pattern")
             if tt is not None and exp is not None:
-                ax.plot(tt, exp, color=palette["exp_line"], lw=1.2, label="Experimental")
+                ax.plot(tt, exp, color=palette["exp_line"], lw=lw, label="Experimental")
             if tt is not None and calc is not None:
-                ax.plot(tt, calc, color=palette["calc_line"], lw=1.2, label="Calculated")
+                ax.plot(tt, calc, color=palette["calc_line"], lw=lw, label="Calculated")
                 if exp is not None:
                     diff = np.asarray(exp) - np.asarray(calc)
                     offset = -0.15 * (np.max(exp) if len(exp) else 0)
                     ax.plot(
                         tt, diff + offset, color=palette["diff_line"],
-                        lw=0.8, label="Difference",
+                        lw=diff_lw, label="Difference",
                     )
             ax.set_title("Le Bail Refinement")
         elif self.session.rir_results:
@@ -248,19 +257,24 @@ class QuantDialog(QDialog):
             tt = rir["two_theta"]
             exp = np.asarray(rir["observed"])
             calc = np.asarray(rir["calculated"])
-            ax.plot(tt, exp, color=palette["exp_line"], lw=1.2, label="Experimental")
-            ax.plot(tt, calc, color=palette["calc_line"], lw=1.2, label="RIR fit")
+            ax.plot(tt, exp, color=palette["exp_line"], lw=lw, label="Experimental")
+            ax.plot(tt, calc, color=palette["calc_line"], lw=lw, label="RIR fit")
             offset = -0.15 * (np.max(exp) if len(exp) else 0)
             ax.plot(
                 tt, exp - calc + offset, color=palette["diff_line"],
-                lw=0.8, label="Difference",
+                lw=diff_lw, label="Difference",
             )
             ax.set_title("RIR Quantification — fixed reference patterns, scale only")
         elif pattern is not None:
             ax.plot(
                 pattern["two_theta"], pattern["intensity"],
-                color=palette["exp_line"], lw=1.2, label="Experimental",
+                color=palette["exp_line"], lw=lw, label="Experimental",
             )
+            if display_settings.show_error_bars():
+                draw_error_bars(
+                    ax, pattern["two_theta"], pattern["intensity"],
+                    pattern.get("intensity_error"), palette["exp_line"],
+                )
             ax.set_title("Quant — run Le Bail to see fit")
         else:
             ax.text(
@@ -271,5 +285,5 @@ class QuantDialog(QDialog):
             ax.set_title("Quant Analysis")
         ax.set_xlabel("2θ (degrees)")
         ax.set_ylabel("Intensity")
-        if ax.get_legend_handles_labels()[0]:
+        if display_settings.show_legend() and ax.get_legend_handles_labels()[0]:
             ax.legend(loc="upper right")

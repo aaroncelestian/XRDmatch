@@ -14,6 +14,7 @@ from PyQt5.QtWidgets import (
 from utils.multi_phase_analyzer import MultiPhaseAnalyzer
 from utils.lebail_refinement import LeBailRefinement
 from matplotlib_config import get_plot_palette
+from gui import display_settings
 from gui.theme import get_current_mode
 
 
@@ -204,7 +205,10 @@ class RefineStage(QWidget):
 
         self.dpi = QSpinBox()
         self.dpi.setRange(72, 600)
-        self.dpi.setValue(300)
+        self.dpi.setValue(display_settings.export_dpi())
+        self.dpi.valueChanged.connect(
+            lambda value: display_settings.update({"plot_dpi": value})
+        )
         adv_form.addRow("Export DPI:", self.dpi)
 
         toolbox.addItem(adv, "Range & export")

@@ -10,6 +10,7 @@ from matplotlib.figure import Figure
 from PyQt5.QtWidgets import QVBoxLayout, QWidget
 
 from matplotlib_config import apply_plot_style, get_plot_palette
+from gui import display_settings
 from gui.theme import get_current_mode
 
 
@@ -38,5 +39,5 @@ def create_plot_host(
     layout.addWidget(toolbar)
     layout.addWidget(canvas)
 
-    apply_plot_style(figure, mode)
+    apply_plot_style(figure, mode, show_grid=display_settings.show_grid())
     return host, figure, canvas, toolbar

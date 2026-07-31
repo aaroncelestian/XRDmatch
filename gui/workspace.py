@@ -13,12 +13,16 @@ from PyQt5.QtWidgets import (
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-from matplotlib_config import apply_plot_style, get_plot_palette
+from matplotlib.widgets import SpanSelector
+
+from matplotlib_config import apply_plot_style, draw_error_bars, get_plot_palette
+from gui import display_settings
 from gui.theme import get_current_mode
 from gui.widgets.file_browser import FileBrowser
 from gui.widgets.plot_host import create_plot_host
 from gui.stages import ProcessStage, IdentifyStage
 from gui.pattern_io import load_pattern_file
+from utils import emphasis
 from utils.two_theta_shift import DISPLACEMENT, describe as describe_shift
 
 
@@ -53,6 +57,9 @@ class AnalysisWorkspace(QWidget):
         self._details_dialog = None
         self._preview = None  # {"name", "two_theta", "intensity"}
         self._peak_highlight = None  # {"two_theta", "intensity", "d_spacing"}
+        self._peak_edit = False  # clicks on the plot add/remove peaks
+        self._emphasis_mode = False  # drags on the plot mark priority regions
+        self._emphasis_selector = None
 
         self.process_stage = ProcessStage(session, self)
         self.identify_stage = IdentifyStage(session, self)
@@ -82,6 +89,7 @@ class AnalysisWorkspace(QWidget):
         self.search_canvas = self.canvas
         self.search_ax = self.ax
         self._add_view_toggles()
+        self.canvas.mpl_connect("button_press_event", self._on_plot_click)
         self.right_splitter.addWidget(plot_host)
 
         self.bottom_tabs = QTabWidget()
@@ -99,6 +107,8 @@ class AnalysisWorkspace(QWidget):
         session.peaks_changed.connect(self._on_session_changed)
         session.candidates_changed.connect(self._on_session_changed)
         session.matches_changed.connect(self._on_session_changed)
+        session.emphasis_changed.connect(self.refresh_plot)
+        display_settings.add_listener(self.on_display_settings_changed)
 
         self.refresh_plot()
         QTimer.singleShot(0, self._apply_default_sizes)
@@ -323,10 +333,16 @@ class AnalysisWorkspace(QWidget):
         self.refresh_plot()
 
     def on_theme_changed(self, mode: str):
-        apply_plot_style(self.figure, mode)
+        apply_plot_style(self.figure, mode, show_grid=display_settings.show_grid())
         self.refresh_plot()
         if self._quant_dialog is not None:
             self._quant_dialog.on_theme_changed(mode)
+
+    def on_display_settings_changed(self, prefs: dict):
+        """Settings -> Display changed; redraw with the new grid / widths."""
+        self.refresh_plot()
+        if self._quant_dialog is not None:
+            self._quant_dialog.on_display_settings_changed(prefs)
 
     # --- file loading ---
 
@@ -382,17 +398,22 @@ class AnalysisWorkspace(QWidget):
         )
         self.peaks_table.blockSignals(True)
         self.peaks_table.clear()
-        self.peaks_table.setColumnCount(3)
-        self.peaks_table.setHorizontalHeaderLabels(["2θ (°)", "Intensity", "d (Å)"])
+        self.peaks_table.setColumnCount(4)
+        self.peaks_table.setHorizontalHeaderLabels(
+            ["2θ (°)", "Intensity", "d (Å)", "Source"]
+        )
         tt = peaks.get("two_theta", [])
         inten = peaks.get("intensity", [])
         d = peaks.get("d_spacing", [])
+        manual = np.asarray(peaks.get("manual", []), dtype=bool)
         self.peaks_table.setRowCount(len(tt))
         for i in range(len(tt)):
             self.peaks_table.setItem(i, 0, QTableWidgetItem(f"{tt[i]:.3f}"))
             self.peaks_table.setItem(i, 1, QTableWidgetItem(f"{inten[i]:.0f}"))
             dv = f"{d[i]:.4f}" if i < len(d) and np.isfinite(d[i]) else "—"
             self.peaks_table.setItem(i, 2, QTableWidgetItem(dv))
+            src = "manual" if i < len(manual) and manual[i] else "detected"
+            self.peaks_table.setItem(i, 3, QTableWidgetItem(src))
         self.peaks_table.blockSignals(False)
 
         self._peak_highlight = None
@@ -481,6 +502,231 @@ class AnalysisWorkspace(QWidget):
             f"{len(cleaned['two_theta'])} remain."
         )
         self.set_status(f"Deleted {removed} peak{'s' if removed > 1 else ''}")
+
+    # --- manual peak editing ---
+
+    def set_peak_edit_mode(self, enabled: bool):
+        """Turn plot clicks into peak edits."""
+        self._peak_edit = bool(enabled)
+        if self._peak_edit and self._emphasis_mode:
+            # Both want the left button; emphasis has its own toggle to clear
+            self.identify_stage.emphasis_btn.setChecked(False)
+        self.canvas.setCursor(Qt.CrossCursor if self._peak_edit else Qt.ArrowCursor)
+        if self._peak_edit:
+            self.show_bottom_tab("peaks")
+            self.process_stage.peak_status.setText(
+                "Editing peaks: left-click the plot to add one, right-click a peak to "
+                "remove it. Find Peaks rebuilds the list and discards manual peaks."
+            )
+            self.set_status("Peak editing on")
+        else:
+            self.set_status("Peak editing off")
+
+    def _on_plot_click(self, event):
+        """Add or remove a peak at the clicked 2θ while edit mode is on."""
+        if event.inaxes is not self.ax or event.xdata is None:
+            return
+        # Pan and zoom own the mouse while a toolbar tool is armed
+        if str(getattr(self.toolbar, "mode", "")):
+            return
+        if self._emphasis_mode and event.button == 3:
+            self._remove_emphasis_at(float(event.xdata))
+            return
+        if not self._peak_edit:
+            return
+        if event.button == 1:
+            self.add_peak_at(float(event.xdata))
+        elif event.button == 3:
+            self.remove_peak_near(float(event.xdata))
+
+    # --- emphasised regions ---
+
+    def set_emphasis_mode(self, enabled: bool):
+        """Turn plot drags into priority regions for search/match."""
+        self._emphasis_mode = bool(enabled)
+        if self._emphasis_mode and self._peak_edit:
+            # Both want the left button; peak editing has its own toggle to clear
+            self.process_stage.edit_peaks_btn.setChecked(False)
+        self.canvas.setCursor(
+            Qt.SizeHorCursor if self._emphasis_mode else Qt.ArrowCursor
+        )
+        self._arm_emphasis_selector()
+        if self._emphasis_mode:
+            self.set_status(
+                "Emphasis on: drag across the plot to prioritise a 2θ range, "
+                "right-click a shaded band to drop it"
+            )
+        else:
+            self.set_status("Emphasis drawing off")
+
+    def _arm_emphasis_selector(self):
+        """
+        (Re)build the span selector.
+
+        Every refresh_plot clears the axes, which throws away the selector's
+        rectangle, so the selector has to be rebuilt alongside the plot rather
+        than once at startup.
+        """
+        if self._emphasis_selector is not None:
+            self._emphasis_selector.set_active(False)
+            self._emphasis_selector = None
+        if not self._emphasis_mode:
+            return
+        self._emphasis_selector = SpanSelector(
+            self.ax,
+            self._on_emphasis_span,
+            "horizontal",
+            useblit=False,
+            button=1,
+            minspan=emphasis.MIN_SPAN,
+            props={"facecolor": "#7e57c2", "alpha": 0.25},
+        )
+
+    def _on_emphasis_span(self, lo: float, hi: float):
+        if str(getattr(self.toolbar, "mode", "")):
+            return
+        weight = float(self.identify_stage.emphasis_weight.value())
+        self.session.add_emphasis_region(lo, hi, weight)
+        self.set_status(
+            f"Emphasising {min(lo, hi):.2f}–{max(lo, hi):.2f}° at ×{weight:g} — "
+            "run Search to use it"
+        )
+
+    def _remove_emphasis_at(self, two_theta: float):
+        if self.session.remove_emphasis_at(two_theta):
+            self.set_status(f"Dropped the emphasis region at {two_theta:.2f}°")
+
+    def _draw_emphasis(self, ax):
+        """Shade the prioritised ranges behind everything else."""
+        regions = self.session.emphasis_regions
+        if not regions:
+            return
+        weights = {r["weight"] for r in regions}
+        label = f"Emphasis ×{weights.pop():g}" if len(weights) == 1 else "Emphasis"
+        xlim = ax.get_xlim()  # a band drawn past the data must not pull the view
+        for i, region in enumerate(regions):
+            ax.axvspan(
+                region["lo"], region["hi"],
+                facecolor="#7e57c2", alpha=0.15, zorder=0,
+                label=label if i == 0 else None,
+            )
+        ax.set_xlim(xlim)
+
+    def _click_tolerance(self) -> float:
+        """Hit window for a click: generous zoomed out, tight zoomed in."""
+        xlim = self.ax.get_xlim()
+        span = abs(float(xlim[1]) - float(xlim[0]))
+        return max(float(self.process_stage.min_sep.value()), 0.01 * span)
+
+    def add_peak_at(self, two_theta: float):
+        """Add a peak the detector missed, snapped to the nearest apex."""
+        pattern = self.session.active_pattern()
+        if pattern is None:
+            self.set_status("Load a pattern before adding peaks")
+            return
+        tt = np.asarray(pattern["two_theta"], dtype=float)
+        inten = np.asarray(pattern["intensity"], dtype=float)
+        if len(tt) == 0:
+            return
+
+        min_sep = float(self.process_stage.min_sep.value())
+        step = ProcessStage._median_step(tt)
+        half = max(2, int(round(min_sep / 2.0 / max(step, 1e-6))))
+        idx = ProcessStage._refine_to_local_max(
+            inten, int(np.argmin(np.abs(tt - two_theta))), half_window=half
+        )
+        peak_tt = float(tt[idx])
+
+        peaks = self.session.peaks
+        existing = np.asarray((peaks or {}).get("two_theta", []), dtype=float)
+        if len(existing):
+            nearest = int(np.argmin(np.abs(existing - peak_tt)))
+            if abs(float(existing[nearest]) - peak_tt) < min_sep:
+                self.peaks_table.setCurrentCell(nearest, 0)
+                self.set_status(
+                    f"A peak already sits at {float(existing[nearest]):.3f}°"
+                )
+                return
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            d = float(self.session.wavelength) / (
+                2.0 * np.sin(np.radians(peak_tt / 2.0))
+            )
+        d = float(d) if np.isfinite(d) else float("nan")
+
+        updated, row = self._insert_peak(
+            peaks,
+            peak_tt,
+            {
+                "indices": int(idx),
+                "two_theta": peak_tt,
+                "intensity": float(inten[idx]),
+                "d_spacing": d,
+                "manual": True,
+            },
+        )
+        self.session.set_peaks(updated)
+        self.set_results_peaks(updated, select_row=row)
+        d_note = f" (d = {d:.4f} Å)" if np.isfinite(d) else ""
+        self.process_stage.peak_status.setText(
+            f"Added peak at {peak_tt:.3f}°{d_note}; "
+            f"{len(updated['two_theta'])} peaks total."
+        )
+        self.set_status(f"Added peak at {peak_tt:.3f}°")
+        self.refresh_plot()
+
+    def remove_peak_near(self, two_theta: float):
+        """Delete the peak closest to a click, if one is close enough."""
+        tt = np.asarray((self.session.peaks or {}).get("two_theta", []), dtype=float)
+        if len(tt) == 0:
+            self.set_status("No peaks to remove")
+            return
+        row = int(np.argmin(np.abs(tt - two_theta)))
+        tol = self._click_tolerance()
+        if abs(float(tt[row]) - two_theta) > tol:
+            self.set_status(f"No peak within {tol:.2f}° of {two_theta:.2f}°")
+            return
+        self.delete_peak_rows([row])
+
+    def _insert_peak(self, peaks: Optional[dict], two_theta: float, values: dict):
+        """
+        Splice one peak into the session's peak arrays, keeping 2θ order.
+
+        Every column is extended, not just the ones this widget knows about, so a
+        peak list that has been through Kα2 stripping or residual bookkeeping
+        stays internally consistent.
+        """
+        if peaks is None or len(np.asarray(peaks.get("two_theta", []))) == 0:
+            fresh = {
+                "indices": np.array([values["indices"]], dtype=int),
+                "two_theta": np.array([two_theta], dtype=float),
+                "intensity": np.array([values["intensity"]], dtype=float),
+                "d_spacing": np.array([values["d_spacing"]], dtype=float),
+                "manual": np.array([True]),
+                "wavelength": float(self.session.wavelength),
+            }
+            return fresh, 0
+
+        positions = np.asarray(peaks["two_theta"], dtype=float)
+        n = len(positions)
+        row = int(np.searchsorted(positions, two_theta))
+        updated = dict(peaks)
+        for key, value in peaks.items():
+            arr = np.asarray(value)
+            if arr.ndim != 1 or len(arr) != n:
+                continue
+            if key in values:
+                fill = values[key]
+            elif arr.dtype == bool:
+                fill = False
+            elif np.issubdtype(arr.dtype, np.integer):
+                fill = 0
+            else:
+                fill = np.nan
+            updated[key] = np.insert(arr, row, fill)
+        if "manual" not in peaks:
+            updated["manual"] = np.insert(np.zeros(n, dtype=bool), row, True)
+        return updated, row
 
     @staticmethod
     def _lines_cell(result: dict) -> QTableWidgetItem:
@@ -884,13 +1130,35 @@ class AnalysisWorkspace(QWidget):
         else:
             self._plot_load(ax, palette)
 
+        self._draw_emphasis(ax)
         self._draw_preview(ax)
         self._draw_peak_highlight(ax)
-        if ax.get_legend_handles_labels()[0]:
+        if display_settings.show_legend() and ax.get_legend_handles_labels()[0]:
             ax.legend(loc="upper right", fontsize=8)
 
-        apply_plot_style(self.figure, mode)
+        apply_plot_style(self.figure, mode, show_grid=display_settings.show_grid())
+        self._arm_emphasis_selector()
         self.canvas.draw_idle()
+
+    @staticmethod
+    def _draw_error_bars(ax, two_theta, intensity, errors, color, scale=1.0):
+        """Whiskers from an XYE file's third column, when the user wants them."""
+        if not display_settings.show_error_bars():
+            return
+        draw_error_bars(ax, two_theta, intensity, errors, color, scale)
+
+    def _draw_manual_peaks(self, ax, peaks, heights):
+        """Ring hand-placed peaks so they read differently from detected ones."""
+        manual = np.asarray(peaks.get("manual", []), dtype=bool)
+        tt = np.asarray(peaks.get("two_theta", []), dtype=float)
+        if len(manual) != len(tt) or not manual.any():
+            return
+        ax.plot(
+            tt[manual], np.asarray(heights, dtype=float)[manual], "s",
+            mfc="none", mec="#d81b60", mew=1.3,
+            ms=display_settings.marker_size(2.0), ls="none",
+            label="Manual peaks", zorder=6,
+        )
 
     def _draw_peak_highlight(self, ax):
         """Mark the peak selected in the Peaks table."""
@@ -955,13 +1223,17 @@ class AnalysisWorkspace(QWidget):
             return
         ax.plot(
             pattern["two_theta"], pattern["intensity"],
-            color=palette["exp_line"], lw=1.2, label="Experimental",
+            color=palette["exp_line"], lw=display_settings.line_width(),
+            label="Experimental",
+        )
+        self._draw_error_bars(
+            ax, pattern["two_theta"], pattern["intensity"],
+            pattern.get("intensity_error"), palette["exp_line"],
         )
         ax.set_xlabel("2θ (degrees)")
         ax.set_ylabel("Intensity")
         fmt = pattern.get("file_format", "")
         ax.set_title(f"XRD Pattern ({fmt})" if fmt else "XRD Pattern")
-        ax.legend(loc="upper right")
 
     def _plot_process(self, ax, palette):
         raw = self.session.raw_pattern
@@ -969,26 +1241,34 @@ class AnalysisWorkspace(QWidget):
         if raw is not None and self._visible("raw"):
             ax.plot(
                 raw["two_theta"], raw["intensity"],
-                color=palette["diff_line"], lw=0.8, alpha=0.5, label="Raw",
+                color=palette["diff_line"], lw=display_settings.line_width(0.7),
+                alpha=0.5, label="Raw",
             )
         if processed is not None:
             if self._visible("processed"):
                 ax.plot(
                     processed["two_theta"], processed["intensity"],
-                    color=palette["exp_line"], lw=1.2, label="Processed",
+                    color=palette["exp_line"], lw=display_settings.line_width(),
+                    label="Processed",
+                )
+                self._draw_error_bars(
+                    ax, processed["two_theta"], processed["intensity"],
+                    processed.get("intensity_error"), palette["exp_line"],
                 )
             bg = self.session.background
             if bg is not None and raw is not None and self._visible("background"):
                 ax.plot(
                     raw["two_theta"], bg, color=palette["calc_line"],
-                    lw=1.0, ls="--", label="Background",
+                    lw=display_settings.line_width(0.85), ls="--", label="Background",
                 )
         peaks = self.session.peaks
         if peaks is not None and processed is not None and self._visible("peaks"):
             ax.plot(
                 peaks["two_theta"], peaks["intensity"], "o",
-                color=palette["calc_line"], ms=4, label="Peaks",
+                color=palette["calc_line"], ms=display_settings.marker_size(),
+                label="Peaks",
             )
+            self._draw_manual_peaks(ax, peaks, peaks["intensity"])
         ax.set_xlabel("2θ (degrees)")
         ax.set_ylabel("Intensity")
         ax.set_title("Processing Preview")
@@ -1060,7 +1340,12 @@ class AnalysisWorkspace(QWidget):
         if self._visible("processed"):
             ax.plot(
                 pattern["two_theta"], norm, color=palette["exp_line"],
-                lw=1.2, label="Experimental",
+                lw=display_settings.line_width(), label="Experimental",
+            )
+            # Errors ride the same 0-100 normalization as the pattern
+            self._draw_error_bars(
+                ax, pattern["two_theta"], norm, pattern.get("intensity_error"),
+                palette["exp_line"], scale=(100.0 / max_i) if max_i > 0 else 1.0,
             )
 
         raw = self.session.raw_pattern
@@ -1069,7 +1354,8 @@ class AnalysisWorkspace(QWidget):
             rmax = np.max(rint) if len(rint) else 1.0
             ax.plot(
                 raw["two_theta"], (rint / rmax * 100.0) if rmax > 0 else rint,
-                color=palette["diff_line"], lw=0.8, alpha=0.45, label="Raw",
+                color=palette["diff_line"], lw=display_settings.line_width(0.7),
+                alpha=0.45, label="Raw",
             )
 
         bg = self.session.background
@@ -1079,7 +1365,8 @@ class AnalysisWorkspace(QWidget):
             rmax = np.max(rint) if len(rint) else 1.0
             ax.plot(
                 raw["two_theta"], (bgn / rmax * 100.0) if rmax > 0 else bgn,
-                color=palette["calc_line"], lw=1.0, ls="--", label="Background",
+                color=palette["calc_line"], lw=display_settings.line_width(0.85),
+                ls="--", label="Background",
             )
 
         colors = ["#c45c26", "#7a5cff", "#2a7a4b", "#b33a3a", "#5a6a7a"]
@@ -1099,17 +1386,19 @@ class AnalysisWorkspace(QWidget):
             name = phase.get("mineral", f"Phase {i+1}")
             ax.vlines(
                 tt, 0, tnorm, colors=colors[i % len(colors)],
-                alpha=0.7, lw=1.0, label=name,
+                alpha=0.7, lw=display_settings.line_width(0.85), label=name,
             )
 
         peaks = self.session.peaks
         if peaks is not None and self._visible("peaks"):
             pi = np.asarray(peaks["intensity"], dtype=float)
             pmax = np.max(pi) if len(pi) else 1.0
+            heights = (pi / pmax * 100.0) if pmax > 0 else pi
             ax.plot(
-                peaks["two_theta"], (pi / pmax * 100.0) if pmax > 0 else pi,
-                "o", color=palette["calc_line"], ms=3, label="Peaks",
+                peaks["two_theta"], heights, "o", color=palette["calc_line"],
+                ms=display_settings.marker_size(0.75), label="Peaks",
             )
+            self._draw_manual_peaks(ax, peaks, heights)
 
         ax.set_xlabel("2θ (degrees)")
         ax.set_ylabel("Normalized Intensity")

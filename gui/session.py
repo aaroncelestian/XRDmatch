@@ -8,6 +8,8 @@ from typing import Any, Dict, List, Optional
 
 from PyQt5.QtCore import QObject, pyqtSignal
 
+from utils import emphasis
+
 
 class AnalysisSession(QObject):
     """Holds pattern, peaks, candidates, matches, and refinement state."""
@@ -17,6 +19,7 @@ class AnalysisSession(QObject):
     candidates_changed = pyqtSignal()
     matches_changed = pyqtSignal()
     refinement_changed = pyqtSignal()
+    emphasis_changed = pyqtSignal()
     stage_status_changed = pyqtSignal()  # rail enable/complete refresh
 
     def __init__(self, parent=None):
@@ -32,6 +35,8 @@ class AnalysisSession(QObject):
         self.lebail_results: Optional[Dict[str, Any]] = None
         self.rir_results: Optional[Dict[str, Any]] = None
         self.file_path: Optional[str] = None
+        # 2theta spans the user wants search/match to prioritise
+        self.emphasis_regions: List[Dict[str, float]] = []
 
     # --- stage completion helpers ---
 
@@ -61,9 +66,11 @@ class AnalysisSession(QObject):
         self.selected_phases = []
         self.lebail_results = None
         self.rir_results = None
+        self.emphasis_regions = []
         self.file_path = pattern.get("file_path")
         if "wavelength" in pattern:
             self.wavelength = float(pattern["wavelength"])
+        self.emphasis_changed.emit()
         self.pattern_changed.emit()
         self.peaks_changed.emit()
         self.candidates_changed.emit()
@@ -116,6 +123,29 @@ class AnalysisSession(QObject):
     def set_rir_results(self, results: Optional[Dict[str, Any]]) -> None:
         self.rir_results = results
         self.refinement_changed.emit()
+
+    # --- emphasised regions ---
+
+    def set_emphasis_regions(self, regions: List[Dict[str, float]]) -> None:
+        self.emphasis_regions = emphasis.normalize(regions)
+        self.emphasis_changed.emit()
+
+    def add_emphasis_region(self, lo: float, hi: float, weight: float) -> None:
+        self.set_emphasis_regions(
+            self.emphasis_regions + [emphasis.make_region(lo, hi, weight)]
+        )
+
+    def remove_emphasis_at(self, two_theta: float) -> bool:
+        """Drop the region under a 2theta. True when one was removed."""
+        hit = emphasis.region_at(self.emphasis_regions, two_theta)
+        if hit is None:
+            return False
+        self.set_emphasis_regions([r for r in self.emphasis_regions if r is not hit])
+        return True
+
+    def clear_emphasis_regions(self) -> None:
+        if self.emphasis_regions:
+            self.set_emphasis_regions([])
 
     def set_wavelength(self, wavelength: float) -> None:
         self.wavelength = float(wavelength)

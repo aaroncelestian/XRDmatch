@@ -6,6 +6,8 @@ from __future__ import annotations
 
 from typing import Optional
 
+import numpy as np
+
 # Plot palettes aligned with gui/theme.py
 PLOT_PALETTES = {
     "light": {
@@ -79,6 +81,24 @@ def apply_plot_style(figure, mode: str = "light", show_grid: bool = True) -> Non
             legend.get_frame().set_edgecolor(palette["legend_edgecolor"])
             for text in legend.get_texts():
                 text.set_color(palette["text"])
+
+
+def draw_error_bars(ax, x, y, errors, color, scale: float = 1.0) -> None:
+    """
+    Overlay σ whiskers from an XYE third column onto an already-plotted curve.
+
+    No-op when the file carried no usable errors. `scale` matches the errors to
+    a normalized curve.
+    """
+    if errors is None:
+        return
+    err = np.asarray(errors, dtype=float) * scale
+    if len(err) != len(y) or not np.any(err > 0):
+        return
+    ax.errorbar(
+        x, y, yerr=err, fmt="none", ecolor=color, elinewidth=0.5,
+        capsize=0, alpha=0.45, zorder=1,
+    )
 
 
 def style_new_figure(figsize=(8, 6), mode: str = "light", dpi: Optional[int] = None):

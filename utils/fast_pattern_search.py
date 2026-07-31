@@ -11,6 +11,7 @@ from scipy.fft import fft, ifft
 from scipy.signal import correlate
 from utils.ima_mineral_database import get_ima_database
 from utils.conditions import is_ambient
+from utils import search_debug
 from utils.two_theta_shift import DISPLACEMENT, remove_shift
 import time
 
@@ -444,14 +445,26 @@ class FastPatternSearchEngine:
             weights=weights, tolerance=tolerance, row_sums=self._row_sums,
         )
 
-        eligible = coverage >= min_coverage
+        above_floor = coverage >= min_coverage
+        eligible = above_floor.copy()
+        ambient = None
         if ambient_only:
-            eligible &= self._ambient_mask()
+            ambient = self._ambient_mask()
+            eligible &= ambient
         candidates = np.where(eligible)[0]
         if len(candidates) == 0:
             print(f"⚠️  No phases with line coverage above {min_coverage}")
+            search_debug.stage(
+                f"Line-coverage screen: nothing above min coverage {min_coverage:.2f} "
+                f"(best {float(np.max(coverage)):.3f})"
+            )
             return []
-        order = candidates[np.argsort(coverage[candidates])[::-1]][:top_n]
+        ranked = candidates[np.argsort(coverage[candidates])[::-1]]
+        order = ranked[:top_n]
+
+        if search_debug.enabled():
+            self._trace_screen(coverage, above_floor, ambient, ranked, order,
+                               min_coverage, top_n)
 
         results = []
         for idx in order:
@@ -478,6 +491,43 @@ class FastPatternSearchEngine:
         print(f"🔎 Line-coverage screen: {len(results)} candidates in {elapsed:.0f}ms "
               f"(best {coverage[order[0]]:.2f}, {len(tt)} peaks)")
         return results
+
+    def _trace_screen(self, coverage, above_floor, ambient, ranked, order,
+                      min_coverage, top_n):
+        """Report why each indexed phase did or did not enter the pool."""
+        kept = min(len(ranked), top_n)
+        cutoff = float(coverage[ranked[kept - 1]])
+        search_debug.stage(
+            f"Line-coverage screen: {int(np.sum(above_floor))} of {len(coverage)} "
+            f"phases above min coverage {min_coverage:.2f}, pool keeps the top "
+            f"{kept} (coverage ≥ {cutoff:.3f})"
+        )
+
+        # Fate of every indexed phase, so the totals cover the whole database
+        below_floor = ~above_floor
+        non_ambient = above_floor & ~ambient if ambient is not None else None
+        search_debug.bulk("screen_coverage", int(np.sum(below_floor)))
+        if non_ambient is not None:
+            search_debug.bulk("ambient", int(np.sum(non_ambient)))
+        search_debug.bulk("pool_size", len(ranked) - kept)
+
+        in_pool = set(int(i) for i in order)
+        for i, metadata in enumerate(self.mineral_metadata):
+            name = metadata.get('name')
+            if not search_debug.watching(name) or int(i) in in_pool:
+                continue  # scoring reports the fate of everything in the pool
+            if below_floor[i]:
+                fate = "screen_coverage"
+            elif non_ambient is not None and non_ambient[i]:
+                fate = "ambient"
+            else:
+                fate = "pool_size"
+            search_debug.follow(
+                fate, name, mineral_id=metadata.get('id'),
+                coverage=float(coverage[i]),
+                pressure_gpa=metadata.get('pressure_gpa'),
+                temperature_k=metadata.get('temperature_k'),
+            )
     
     def _fast_pattern_generation(self, peak_positions: np.ndarray, 
                                peak_intensities: np.ndarray,

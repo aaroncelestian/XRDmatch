@@ -10,6 +10,8 @@ from PyQt5.QtWidgets import (
     QMessageBox, QProgressBar, QPushButton, QSpinBox, QVBoxLayout, QWidget,
 )
 
+from utils import emphasis, search_debug
+from utils.emphasis import DEFAULT_WEIGHT as EMPHASIS_DEFAULT_WEIGHT
 from utils.fast_pattern_search import FastPatternSearchEngine
 from utils.pattern_search import PatternSearchEngine
 from utils.local_database import LocalCIFDatabase
@@ -41,6 +43,7 @@ from utils.two_theta_shift import (
     shift_pattern,
     unshift_pattern,
 )
+from gui.dialogs.search_report_dialog import SearchReportDialog
 from gui.matching_tab import PhaseMatchingThread
 from gui.widgets.control_bar import OptionsDialog, compact
 
@@ -68,6 +71,7 @@ class IdentifyStage(QWidget):
         self._kept_phases = []  # accepted across residual rounds
         self._theo_cache = {}
         self._options = None
+        self._report_dialog = None
 
         self.control_panel = self._build_controls()
         outer = QVBoxLayout(self)
@@ -125,9 +129,16 @@ class IdentifyStage(QWidget):
         self.add_mineral_btn = QPushButton("Add")
         self.add_mineral_btn.setToolTip("Search the local database and add a mineral as a candidate")
         self.add_mineral_btn.clicked.connect(self.add_mineral_by_name)
+        self.explain_btn = QPushButton("Why not?")
+        self.explain_btn.setToolTip(
+            "Run the search while following this mineral, and report which gate "
+            "rejected it and which setting controls that gate"
+        )
+        self.explain_btn.clicked.connect(self.explain_missing_phase)
         grid.addWidget(self._label("Add mineral:"), 1, 0)
-        grid.addWidget(self.mineral_search, 1, 1, 1, 4)
-        grid.addWidget(self.add_mineral_btn, 1, 5)
+        grid.addWidget(self.mineral_search, 1, 1, 1, 3)
+        grid.addWidget(self.add_mineral_btn, 1, 4)
+        grid.addWidget(self.explain_btn, 1, 5)
 
         # Rows 2-3 — search parameters, two label/field pairs per row
         self.method_combo = QComboBox()
@@ -151,14 +162,19 @@ class IdentifyStage(QWidget):
         self.fp_min_score.setSingleStep(0.05)
         self.fp_min_score.setValue(0.25)
         self.fp_min_score.setToolTip(
-            "Minimum fingerprint score to list a candidate. The score credits a "
-            "candidate only for matches beyond what its line count would hit by "
-            "chance, so it runs lower than a plain 'fraction of lines present'."
+            "Minimum fingerprint score to list a candidate. The score is driven by "
+            "how unlikely the match would be by chance (binomial evidence), so a "
+            "perfect line count in a dense peak list no longer saturates at 1.0."
         )
 
         self.max_results = QSpinBox()
         self.max_results.setRange(10, 500)
-        self.max_results.setValue(50)
+        self.max_results.setValue(100)
+        self.max_results.setToolTip(
+            "How many candidates to list. Minor phases in a mixture often land "
+            "between ranks 50 and 100 once the dominant phase's coincidences "
+            "fill the top of the list."
+        )
 
         self.tolerance = QDoubleSpinBox()
         self.tolerance.setRange(0.01, 2.0)
@@ -182,6 +198,7 @@ class IdentifyStage(QWidget):
         options_btn.clicked.connect(self._show_options)
 
         self._build_shift_widgets()
+        self._build_emphasis_widgets()
 
         grid.addWidget(self._label("Method:"), 2, 0)
         grid.addWidget(compact(self.method_combo, 170), 2, 1)
@@ -205,23 +222,31 @@ class IdentifyStage(QWidget):
         grid.addWidget(self.fit_shift_btn, 4, 4)
         grid.addWidget(self.clear_shift_btn, 4, 5)
 
-        # Row 5 — list actions, filled in by the workspace
+        # Row 5 — emphasised regions
+        grid.addWidget(self._label("Emphasis:"), 5, 0)
+        grid.addWidget(self.emphasis_btn, 5, 1)
+        grid.addWidget(self._label("Weight:"), 5, 2)
+        grid.addWidget(compact(self.emphasis_weight, 80), 5, 3)
+        grid.addWidget(self.clear_emphasis_btn, 5, 4)
+        grid.addWidget(self.emphasis_label, 5, 5, 1, 2)
+
+        # Row 6 — list actions, filled in by the workspace
         self.table_actions = QHBoxLayout()
         self.table_actions.setSpacing(6)
-        grid.addLayout(self.table_actions, 5, 0, 1, 7)
+        grid.addLayout(self.table_actions, 6, 0, 1, 7)
 
-        # Row 6 — status and progress
+        # Row 7 — status and progress
         self.status = QLabel("Load a pattern, find peaks, then search.")
         self.status.setObjectName("mutedLabel")
         self.status.setWordWrap(True)
-        grid.addWidget(self.status, 6, 0, 1, 5)
+        grid.addWidget(self.status, 7, 0, 1, 5)
         self.progress = QProgressBar()
         self.progress.setVisible(False)
         self.progress.setMaximumWidth(140)
-        grid.addWidget(self.progress, 6, 5, 1, 2)
+        grid.addWidget(self.progress, 7, 5, 1, 2)
 
         grid.setColumnStretch(6, 1)
-        grid.setRowStretch(7, 1)
+        grid.setRowStretch(8, 1)
 
         self._build_option_widgets()
         self._on_method_changed()
@@ -306,6 +331,71 @@ class IdentifyStage(QWidget):
 
         for spin in (self.shift, self.shift_span):
             spin.valueChanged.connect(self._on_shift_changed)
+
+    def _build_emphasis_widgets(self):
+        """
+        Priority 2θ ranges, drawn straight on the pattern.
+
+        The ranking is a whole-pattern statistic, so a phase whose evidence
+        lives in one narrow window competes against phases scattered over the
+        full range and loses. Emphasis lets the user say which window carries
+        the question, and the peaks in it are weighted up for both the coverage
+        screen and the final score.
+        """
+        self.emphasis_btn = QPushButton("Highlight on Plot")
+        self.emphasis_btn.setCheckable(True)
+        self.emphasis_btn.setToolTip(
+            "Drag across the plot to mark a 2θ range that search should treat as "
+            "the priority; right-click a shaded band to drop it.\n\n"
+            "Peaks inside a region are weighted up, so candidates that explain "
+            "them outrank candidates that explain the same number of lines "
+            "elsewhere. Emphasised peaks also survive the search peak cull.\n\n"
+            "Turn off to pan and zoom normally."
+        )
+        self.emphasis_btn.toggled.connect(self.workspace.set_emphasis_mode)
+
+        self.emphasis_weight = QDoubleSpinBox()
+        self.emphasis_weight.setRange(1.0, 50.0)
+        self.emphasis_weight.setDecimals(1)
+        self.emphasis_weight.setSingleStep(1.0)
+        self.emphasis_weight.setValue(EMPHASIS_DEFAULT_WEIGHT)
+        self.emphasis_weight.setPrefix("×")
+        self.emphasis_weight.setToolTip(
+            "How much more a peak inside a region counts than one outside it. "
+            "Applies to regions drawn from now on.\n\n"
+            "×1 is no emphasis. Around ×5 makes the region decisive without "
+            "discarding the rest of the pattern; very large values effectively "
+            "search the region alone."
+        )
+
+        self.clear_emphasis_btn = QPushButton("Clear")
+        self.clear_emphasis_btn.setToolTip("Remove every emphasised region")
+        self.clear_emphasis_btn.clicked.connect(self.clear_emphasis)
+
+        self.emphasis_label = QLabel("none")
+        self.emphasis_label.setObjectName("mutedLabel")
+        self.session.emphasis_changed.connect(self._on_emphasis_changed)
+        self.session.peaks_changed.connect(self._on_emphasis_changed)
+        self.method_combo.currentIndexChanged.connect(self._on_emphasis_changed)
+
+    def clear_emphasis(self):
+        self.session.clear_emphasis_regions()
+
+    def _on_emphasis_changed(self, *_args):
+        regions = self.session.emphasis_regions
+        text = emphasis.describe(regions)
+        if regions:
+            peaks = (self.session.peaks or {}).get("two_theta", [])
+            n = int(np.sum(emphasis.inside(peaks, regions)))
+            text += f", {n} peak{'' if n == 1 else 's'}"
+            if n < 3:
+                # Two or three lines coincide with hundreds of phases, so a
+                # region this thin ranks by luck rather than by evidence
+                text += " — too few to identify a phase, widen it"
+            if self._method_key() != "fingerprint":
+                text += " — only the Fingerprint method uses emphasis"
+        self.emphasis_label.setText(text)
+        self.emphasis_label.setToolTip(text)
 
     def _on_shift_changed(self, *_args):
         self.workspace.refresh_plot()
@@ -440,12 +530,12 @@ class IdentifyStage(QWidget):
         self.search_max_peaks = QSpinBox()
         self.search_max_peaks.setRange(0, 500)
         self.search_max_peaks.setSingleStep(5)
-        self.search_max_peaks.setValue(35)
+        self.search_max_peaks.setValue(0)
         self.search_max_peaks.setToolTip(
-            "Match on this many of the strongest peaks (0 = all). Every extra weak "
-            "peak widens the net of positions a phase can match by chance, so a "
-            "long list makes real phases harder to pick out, not easier. Residual "
-            "search boosts unexplained peaks, so they compete for these slots."
+            "Match on this many of the strongest peaks (0 = all). The coincidence "
+            "baseline is intensity-weighted, so weak peaks stay available for "
+            "minor phases without making every reference look present by luck. "
+            "Set a positive limit only if noise-level peaks are flooding the list."
         )
 
         self.search_min_int = QDoubleSpinBox()
@@ -839,6 +929,280 @@ class IdentifyStage(QWidget):
         self.workspace.set_results_candidates(existing)
         self.workspace.check_candidate_rows([key])
 
+    # --- diagnosis ---
+
+    def explain_missing_phase(self):
+        """
+        Follow one mineral through the search and report what rejected it.
+
+        A search silently discards candidates at a dozen thresholds, so "my
+        phase is not in the list" is otherwise unanswerable. This re-runs the
+        search with tracing on, names the gate that dropped the phase and the
+        setting that controls it, and scores the phase under a few alternative
+        settings so the fix is visible rather than guessed at.
+        """
+        query = self.mineral_search.text().strip()
+        if len(query) < 2:
+            QMessageBox.information(
+                self, "Why Not?",
+                "Type the mineral you expected to see in the Add mineral box, "
+                "then press Why not?",
+            )
+            return
+        if not self.session.has_peaks():
+            QMessageBox.warning(
+                self, "Peaks Required",
+                "Diagnosis compares peak positions. Find peaks in the Peaks tab first.",
+            )
+            return
+
+        with search_debug.tracing([query]) as trace:
+            results = self._fingerprint_search(self.session.active_pattern())
+
+        report = self._build_diagnosis(query, trace, results)
+        print("\n" + report["body"])
+        if self._report_dialog is None:
+            self._report_dialog = SearchReportDialog(self.workspace.window())
+        self._report_dialog.show_report(report["title"], report["verdict"], report["body"])
+
+    def _records_named(self, query: str) -> list:
+        """
+        Index records for this mineral.
+
+        Exact name matches win outright when they exist: asked about enstatite,
+        a report about clinoenstatite answers a different question.
+        """
+        needle = query.strip().lower()
+        exact, partial = [], []
+        for meta in self.fast_engine.mineral_metadata or []:
+            name = str(meta.get("name", "")).strip().lower()
+            if name == needle:
+                exact.append(meta)
+            elif needle in name:
+                partial.append(meta)
+        return exact or partial
+
+    def _build_diagnosis(self, query: str, trace, results: list) -> dict:
+        """Assemble the trace, the verdict, and a line-by-line fit into text."""
+        peaks = self.session.peaks
+        rng = self._measured_range()
+        tol = self.tolerance.value()
+        listed = [
+            r for r in results
+            if query.lower() in str(r.get("mineral_name", "")).lower()
+        ]
+
+        lines = [trace.report(query), ""]
+        records = self._records_named(query)
+        if not records:
+            return {
+                "title": query,
+                "verdict": f"No database record has a name containing “{query}”.",
+                "body": "\n".join(lines + [
+                    f"“{query}” matches no mineral name in the search index, so no "
+                    "search setting can bring it back. Check the spelling, or look "
+                    "for the polymorph name the database uses.",
+                ]),
+            }
+
+        # Score every matching record on the peaks the search actually used and
+        # on the full list, because the gap between them is itself a diagnosis
+        culled = self._significant_peaks(peaks)
+        scored = self._score_records(records, culled, rng)
+        scored_full = self._score_records(records, peaks, rng)
+        best = scored[0] if scored else None
+        best_full = scored_full[0] if scored_full else None
+
+        lines.append(f"Best-fitting record of {len(records)} named “{query}”")
+        lines.append("-" * 60)
+        for label, entry, peak_list in (
+            ("search peak list", best, culled),
+            ("all peaks", best_full, peaks),
+        ):
+            if not entry:
+                continue
+            info, meta = entry["info"], entry["meta"]
+            lines.append(
+                f"  on the {label} ({len(peak_list['two_theta'])} peaks): "
+                f"id={meta.get('id')} score={info['score']:.3f} "
+                f"lines {info['n_found']}/{info['n_expected']} "
+                f"strongest {'present' if info['top_found'] else 'MISSING'}"
+            )
+            lines.append(
+                f"      presence={info['presence']:.3f} chance={info['chance_match']:.3f} "
+                f"evidence={info.get('evidence', 0.0):.2f} (1 in "
+                f"{10 ** info.get('evidence', 0.0):,.0f}) "
+                f"position={info['position_quality']:.3f} "
+                f"consistency={info['intensity_consistency']:.3f}"
+            )
+        lines.append("")
+
+        if best_full:
+            lines += self._line_by_line(best_full, culled, peaks, tol)
+            lines.append("")
+        lines += self._sensitivity(records, peaks, culled, rng)
+
+        verdict = self._verdict_text(query, trace, listed, best, best_full)
+        return {
+            "title": f"{query} — {len(records)} database record(s)",
+            "verdict": verdict,
+            "body": "\n".join(lines),
+        }
+
+    def _score_records(self, records: list, peaks: dict, rng) -> list:
+        """Fingerprint every record against one peak list, best score first."""
+        chance = coincidence_fraction(peaks.get("two_theta", []),
+                                      self.tolerance.value(), rng)
+        scored = []
+        for meta in records:
+            theo = self.theoretical_peaks_for({"mineral_id": meta.get("id")})
+            if not theo:
+                continue
+            info = fingerprint_score(
+                peaks.get("two_theta", []),
+                peaks.get("intensity", []),
+                theo.get("two_theta", []),
+                theo.get("intensity", []),
+                tolerance=self.tolerance.value(),
+                n_peaks=self.fp_n_peaks.value(),
+                min_rel_intensity=self.fp_min_rel.value(),
+                exp_range=rng,
+                chance=chance,
+                shift=self.shift.value(),
+                shift_span=self.shift_span.value(),
+                shift_model=self.shift_model_key(),
+            )
+            scored.append({"info": info, "meta": meta, "theo": theo})
+        scored.sort(key=lambda e: -e["info"]["score"])
+        return scored
+
+    def _line_by_line(self, entry: dict, culled: dict, full: dict, tol: float) -> list:
+        """
+        Each fingerprint line against both peak lists.
+
+        A line that misses on the search list but hits on the full one was not
+        absent from the pattern — the peak it needed was culled before scoring.
+        """
+        theo = entry["theo"]
+        fp = select_fingerprint_peaks(
+            theo.get("two_theta", []),
+            theo.get("intensity", []),
+            n_peaks=self.fp_n_peaks.value(),
+            min_rel_intensity=self.fp_min_rel.value(),
+            two_theta_range=self._measured_range(),
+        )
+        ct = np.asarray(culled.get("two_theta", []), dtype=float)
+        ft = np.asarray(full.get("two_theta", []), dtype=float)
+        fi = np.asarray(full.get("intensity", []), dtype=float)
+        if len(fp["two_theta"]) == 0 or len(ft) == 0:
+            return ["No reference lines fall inside the measured range."]
+        imax = float(np.max(fi)) if np.max(fi) > 0 else 1.0
+
+        out = [
+            f"Fingerprint lines of id={entry['meta'].get('id')} "
+            f"(±{tol:.2f}° window)",
+            "-" * 60,
+            "  reference line     search list        all peaks          peak height",
+        ]
+        for t, rel in zip(fp["two_theta"], fp["intensity"]):
+            dc = np.abs(ct - t) if len(ct) else np.array([np.inf])
+            jc = int(np.argmin(dc))
+            df = np.abs(ft - t)
+            jf = int(np.argmin(df))
+            cull_hit = "hit " if dc[jc] <= tol else "MISS"
+            full_hit = "hit " if df[jf] <= tol else "MISS"
+            out.append(
+                f"  {t:7.3f}° I={rel:5.1f}   {cull_hit} {dc[jc]:+.3f}°     "
+                f"{full_hit} {ft[jf]:7.3f}° ({df[jf]:+.3f}°)   "
+                f"{fi[jf] / imax * 100:6.2f}% of max"
+            )
+        return out
+
+    def _sensitivity(self, records: list, full: dict, culled: dict, rng) -> list:
+        """Score the phase under the settings most likely to be holding it back."""
+        out = ["What changes the outcome", "-" * 60]
+        gate = self.fp_min_score.value()
+
+        def best_score(peaks, **overrides):
+            chance = coincidence_fraction(peaks.get("two_theta", []),
+                                          self.tolerance.value(), rng)
+            # Weighted runs are ranked on the weighted score, so compare that one
+            key = "residual_score" if overrides.get("exp_weights") is not None else "score"
+            best = 0.0
+            found = 0
+            for meta in records:
+                theo = self.theoretical_peaks_for({"mineral_id": meta.get("id")})
+                if not theo:
+                    continue
+                kwargs = dict(
+                    tolerance=self.tolerance.value(),
+                    n_peaks=self.fp_n_peaks.value(),
+                    min_rel_intensity=self.fp_min_rel.value(),
+                    exp_range=rng, chance=chance,
+                    shift=self.shift.value(),
+                    shift_span=self.shift_span.value(),
+                    shift_model=self.shift_model_key(),
+                )
+                kwargs.update(overrides)
+                info = fingerprint_score(
+                    peaks.get("two_theta", []), peaks.get("intensity", []),
+                    theo.get("two_theta", []), theo.get("intensity", []),
+                    **kwargs,
+                )
+                if info[key] > best:
+                    best, found = info[key], info["n_found"]
+            return best, found
+
+        n_culled = len(culled.get("two_theta", []))
+        n_full = len(full.get("two_theta", []))
+        variants = [
+            (f"as searched ({n_culled} peaks)", culled, {}),
+            (f"Search peak count 0, all {n_full} peaks", full, {}),
+            ("2θ tol 0.30°", culled, {"tolerance": 0.30}),
+            ("Auto fit ± 0.30°", culled, {"shift_span": 0.30}),
+            ("all peaks + Auto fit ± 0.30°", full, {"shift_span": 0.30}),
+        ]
+        regions = self.session.emphasis_regions
+        if regions:
+            weights = emphasis.peak_weights(culled.get("two_theta", []), regions)
+            if weights is not None:
+                variants.append(
+                    (f"emphasis {emphasis.describe(regions)}", culled,
+                     {"exp_weights": weights})
+                )
+        for label, peaks, overrides in variants:
+            if peaks is culled and n_culled == n_full and "all" in label:
+                continue
+            score, found = best_score(peaks, **overrides)
+            verdict = "listed" if score >= gate else "still dropped"
+            out.append(f"  {label:36s} score {score:.3f} ({found} lines) — {verdict}")
+        out.append(f"  (Min fingerprint is currently {gate:.2f})")
+        return out
+
+    def _verdict_text(self, query, trace, listed, best, best_full) -> str:
+        """One sentence naming the gate that decided the outcome."""
+        if listed:
+            top = max(listed, key=lambda r: r.get("fingerprint_score", 0))
+            return (f"{top['mineral_name']} IS in the results at score "
+                    f"{top['fingerprint_score']:.3f}.")
+
+        verdict = trace.verdict(query)
+        why = search_debug.GATES.get(verdict["gate"], "dropped") if verdict else None
+        gained = None
+        if best and best_full:
+            delta = best_full["info"]["score"] - best["info"]["score"]
+            if delta > 0.05 and best_full["info"]["score"] >= self.fp_min_score.value():
+                gained = (
+                    f"On the full peak list it scores {best_full['info']['score']:.3f} "
+                    f"({best_full['info']['n_found']}/"
+                    f"{best_full['info']['n_expected']} lines), so the peaks it needs "
+                    "are in the pattern but were removed by 'Search peak count'."
+                )
+        head = f"{query} was {why}." if why else (
+            f"{query} never reached scoring — no record of it entered the candidate pool."
+        )
+        return head if not gained else f"{head} {gained}"
+
     # --- search ---
 
     def start_search(self):
@@ -957,6 +1321,8 @@ class IdentifyStage(QWidget):
             self.update_action_states()
 
             label = "Residual search" if residual_mode else "Search"
+            if method == "fingerprint" and self.session.emphasis_regions:
+                label += f" emphasising {emphasis.describe(self.session.emphasis_regions)}"
             extra = f" (excluded {dropped} already-found)" if dropped else ""
             if candidates:
                 hint = " Click a row to preview its peaks; arrow keys step through."
@@ -1014,7 +1380,14 @@ class IdentifyStage(QWidget):
             keep = np.zeros(len(inten), dtype=bool)
             keep[strongest] = True
 
+        # An emphasised region is the user saying these peaks are the question,
+        # so intensity cuts must not be what removes them
+        protect = emphasis.inside(peaks.get("two_theta", []), self.session.emphasis_regions)
+        if len(protect) == len(keep):
+            keep |= protect
+
         if np.all(keep) or np.sum(keep) < 4:  # never strip the list bare
+            search_debug.stage(f"Search peak list: all {len(inten)} peaks kept")
             return peaks
 
         out = {}
@@ -1022,17 +1395,37 @@ class IdentifyStage(QWidget):
             arr = np.asarray(value) if isinstance(value, (list, np.ndarray)) else None
             out[key] = arr[keep] if arr is not None and arr.shape[:1] == keep.shape else value
         print(f"Search uses the strongest {int(np.sum(keep))} of {len(inten)} peaks")
+        search_debug.stage(
+            f"Search peak list: strongest {int(np.sum(keep))} of {len(inten)} peaks "
+            f"(weakest kept {float(np.min(inten[keep])) / imax * 100:.2f}% of max; "
+            f"'Search peak count' {limit}, floor {floor_pct:.2f}%)"
+        )
         return out
 
     def _fingerprint_search(self, pattern, residual_peaks=None):
         """Screen the database on peak positions, then score each candidate's own lines."""
         exp_peaks = residual_peaks if residual_peaks is not None else self.session.peaks
         exp_peaks = self._significant_peaks(exp_peaks)
+        exp_tt = exp_peaks.get("two_theta", [])
         exp_weights = None
         if residual_peaks is not None:
-            w = residual_peaks.get("residual_weights")
-            if w is not None and len(w) == len(residual_peaks.get("two_theta", [])):
+            # Read the culled copy: _significant_peaks slices every per-peak
+            # array, and the weights have to line up with the peaks that survived
+            w = exp_peaks.get("residual_weights")
+            if w is not None and len(w) == len(exp_tt):
                 exp_weights = np.asarray(w, dtype=float)
+
+        boost = emphasis.peak_weights(exp_tt, self.session.emphasis_regions)
+        if boost is not None:
+            exp_weights = boost if exp_weights is None else exp_weights * boost
+            # Only the ratio between weights carries meaning, and the coverage
+            # screen multiplies them in raw: left above 1.0 they push coverage
+            # past 1.0 and 'Screen min coverage' stops being a fraction.
+            exp_weights = exp_weights / float(np.max(exp_weights))
+            search_debug.stage(
+                f"Emphasis: {emphasis.describe(self.session.emphasis_regions)} — "
+                f"{int(np.sum(boost > 1.0))} of {len(boost)} search peaks weighted up"
+            )
 
         pool_size = self.pool_size.value()
         tol = self.tolerance.value()
@@ -1043,9 +1436,12 @@ class IdentifyStage(QWidget):
         pool = []
 
         # How much of the pattern a reference line can hit by luck; warned about
-        # in the status line because it decides whether matching means anything
+        # in the status line because it decides whether matching means anything.
+        # Intensity-weighted to match fingerprint_score's baseline.
+        exp_int = np.asarray(exp_peaks.get("intensity", []), dtype=float)
         self._last_chance = coincidence_fraction(
             exp_peaks.get("two_theta", []), tol, self._measured_range(),
+            np.sqrt(np.maximum(exp_int, 0.0)),
         )
 
         if self.fast_engine.search_index is not None:
@@ -1089,11 +1485,18 @@ class IdentifyStage(QWidget):
             exp_range=self._measured_range(),
             dedupe_by_name=self.fp_dedupe.isChecked(),
             exp_weights=exp_weights,
+            weights_rank_only=residual_peaks is None,
             shift=shift,
             shift_span=span,
             shift_model=model,
         )
-        mode = "residual-weighted" if exp_weights is not None else "presence"
+        parts = [
+            name for name, on in (
+                ("residual", residual_peaks is not None),
+                ("emphasis", boost is not None),
+            ) if on
+        ]
+        mode = "-".join(parts) + "-weighted" if parts else "presence"
         print(
             f"Fingerprint search ({mode}): pool={len(pool)} → {len(ranked)} candidates "
             f"(min score {self.fp_min_score.value():.2f})"

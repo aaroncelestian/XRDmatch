@@ -8,6 +8,7 @@ import sys
 from PyQt5.QtWidgets import QApplication
 from gui.main_window import XRDMainWindow
 from gui.theme import apply_theme
+from gui import display_settings
 
 
 def main():
@@ -19,6 +20,7 @@ def main():
 
     app.setStyle('Fusion')
     apply_theme(app)  # Light / Dark from QSettings
+    display_settings.load_saved()  # grid / legend / error bars / widths
 
     window = XRDMainWindow()
     window.show()

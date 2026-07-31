@@ -6,9 +6,8 @@ Implements proper crystallographic refinement with profile functions and unit ce
 import numpy as np
 import itertools
 
-from scipy.optimize import minimize, differential_evolution, nnls
-from scipy.interpolate import interp1d
-from scipy.special import eval_legendre, wofz
+from scipy.optimize import least_squares, nnls
+from scipy.special import eval_legendre
 from typing import Dict, List, Tuple, Optional
 import copy
 import warnings
@@ -40,24 +39,17 @@ class LeBailRefinement:
         self.peak_intensity_cutoff = 0.0  # fraction of Imax; trial uses ~0.02
         self.extract_iterations = 3
         self._profile_cache = {}  # (phase_idx, cache_key) -> sparse profile parts
+        self._mid_two_theta = 45.0  # anchor for angle-dependent corrections
+
+        # Experimental grid geometry, cached for windowed profile evaluation
         self._x0 = 0.0
         self._dx = 0.02
         self._n = 0
-        # Cap on peaks x window elements for the vectorised profile matrix
+        # Ceiling on reflections x window points in one profile array
         self._max_window_elements = 8_000_000
-
-    def _update_grid(self):
-        """Cache grid geometry used for windowed profile evaluation"""
-        x = self.experimental_data['two_theta'] if self.experimental_data else None
-        if x is None or len(x) == 0:
-            self._x0, self._dx, self._n = 0.0, 0.02, 0
-            return
-        self._x0 = float(x[0])
-        self._n = len(x)
-        self._dx = float(np.median(np.diff(x))) if len(x) > 1 else 0.02
-        if self._dx <= 0:
-            self._dx = 0.02
-        self._mid_two_theta = 45.0  # anchor for angle-dependent corrections
+        # While set, phases reuse their last partitioned intensities instead of
+        # re-partitioning. See _refine_single_phase.
+        self._freeze_extracted = False
 
         # Instrument terms shared by every phase. Fitting these per phase lets
         # one phase absorb an instrument error and drift off its true cell.
@@ -74,6 +66,18 @@ class LeBailRefinement:
         # 'fixed':   calculated intensities stay tied to the reference pattern and
         #            one scale per phase is refined. Required for quantification.
         self.intensity_model = 'extract'
+
+    def _update_grid(self):
+        """Cache grid geometry used for windowed profile evaluation"""
+        x = self.experimental_data['two_theta'] if self.experimental_data else None
+        if x is None or len(x) == 0:
+            self._x0, self._dx, self._n = 0.0, 0.02, 0
+            return
+        self._x0 = float(x[0])
+        self._n = len(x)
+        self._dx = float(np.median(np.diff(x))) if len(x) > 1 else 0.02
+        if self._dx <= 0:
+            self._dx = 0.02
 
     def set_global_parameters(self, **values):
         """Update shared instrument parameters and their refine flags."""
@@ -238,6 +242,7 @@ class LeBailRefinement:
         """Remove all phases and profile cache"""
         self.phases = []
         self._profile_cache = {}
+        self._freeze_extracted = False
         self.refinement_history = []
         self.r_factors = {}
         
@@ -382,6 +387,9 @@ class LeBailRefinement:
 
         self._profile_cache = {}
         self._global_scan_pass = 0
+        self._freeze_extracted = False
+        for phase in self.phases:
+            phase.pop('_extracted_intensities', None)
 
         # Update 2-theta range if provided
         if two_theta_range is not None and two_theta_range != self.two_theta_range:
@@ -597,38 +605,51 @@ class LeBailRefinement:
         saved = {name: self.global_parameters[name] for name in names}
         observed = self.experimental_data['intensity']
         errors = self.experimental_data['errors']
+        lower = np.array([b[0] for b in bounds], dtype=float)
+        upper = np.array([b[1] for b in bounds], dtype=float)
 
-        def objective(x):
+        def residuals(x):
             for name, value in zip(names, x):
                 self.global_parameters[name] = float(value)
-            residual = (observed - self._calculate_total_pattern()) / errors
-            return float(np.sum(residual ** 2))
+            return (observed - self._calculate_total_pattern()) / errors
 
+        def chi2(x):
+            return float(np.sum(residuals(x) ** 2))
+
+        # The scan below evaluates the whole pattern hundreds of times, so the
+        # partitioned intensities are fixed for the duration, as in a Le Bail step
+        self._refresh_extracted()
+        self._freeze_extracted = True
         try:
             scan_pass = getattr(self, '_global_scan_pass', 0)
             if scan_pass < len(self._GLOBAL_SCAN_SCHEDULE):
                 half_width = self._GLOBAL_SCAN_SCHEDULE[scan_pass]
+                # Eleven samples per axis is enough to find the valley; 21^n was
+                # spending most of the refinement budget on the scan alone
                 grids = [
                     np.clip(
-                        np.linspace(center - half_width, center + half_width, 21),
+                        np.linspace(center - half_width, center + half_width, 11),
                         low, high,
                     )
                     for center, (low, high) in zip(vector, bounds)
                 ]
-                best_value = objective(vector)
+                best_value = chi2(vector)
                 best_point = list(vector)
                 for point in itertools.product(*grids):
-                    value = objective(point)
+                    value = chi2(point)
                     if value < best_value:
                         best_value, best_point = value, list(point)
                 vector = best_point
                 self._global_scan_pass = scan_pass + 1
 
-            result = minimize(
-                objective, np.array(vector), bounds=bounds, method='L-BFGS-B',
-                options={'maxiter': 30, 'ftol': 1e-8},
+            result = least_squares(
+                residuals, np.asarray(vector, dtype=float),
+                bounds=(lower, upper), method='trf',
+                x_scale=np.maximum(upper - lower, 1e-8),
+                diff_step=1e-4, ftol=1e-10, xtol=1e-10, gtol=1e-8,
+                max_nfev=80,
             )
-            best = result.x if objective(result.x) <= objective(vector) else vector
+            best = result.x if chi2(result.x) <= chi2(vector) else vector
             for name, value in zip(names, best):
                 self.global_parameters[name] = float(value)
             self._log(
@@ -640,55 +661,56 @@ class LeBailRefinement:
             for name, value in saved.items():
                 self.global_parameters[name] = value
             self._log(f"Global parameter refinement failed: {e}")
+        finally:
+            self._freeze_extracted = False
+            self._refresh_extracted()
+
+    # Parameters that move peak positions. Fitting them in the same least-squares
+    # step as the profile widths makes the Jacobian so ill-conditioned that the
+    # trust-region SVD hangs; they are refined in a separate pass instead.
+    _POSITION_PARAM_NAMES = frozenset({'lattice_scale'})
 
     def _refine_single_phase(self, phase_idx: int):
         """Refine parameters for a single phase"""
         phase = self.phases[phase_idx]
         params = phase['parameters']
-        
+
         param_vector, param_bounds, param_names = self._create_parameter_vector(params)
         if len(param_vector) == 0:
             return
-        
+
         other_pattern = np.zeros_like(self.experimental_data['two_theta'])
         for i in range(len(self.phases)):
             if i != phase_idx:
                 other_pattern += self._calculate_phase_pattern(i, self.phases[i]['parameters'])
-        
-        maxiter = 8 if self.mode == 'trial' else 50
-        ftol = 1e-3 if self.mode == 'trial' else 1e-6
-        
-        def objective(x):
-            temp_params = self._vector_to_parameters(x, param_names, params)
-            # Merge with base params so non-refined keys remain
-            merged = dict(params)
-            merged.update(temp_params)
-            if 'unit_cell' in temp_params:
-                merged['unit_cell'] = temp_params['unit_cell']
-            phase_pattern = self._calculate_phase_pattern(phase_idx, merged)
-            total_pattern = phase_pattern + other_pattern
-            residual = (self.experimental_data['intensity'] - total_pattern) / self.experimental_data['errors']
-            return np.sum(residual ** 2)
-            
+
+        position_idx = [i for i, n in enumerate(param_names) if n in self._POSITION_PARAM_NAMES]
+        intensity_idx = [i for i, n in enumerate(param_names) if n not in self._POSITION_PARAM_NAMES]
+        # Position first so the profile fit starts with peaks already aligned
+        groups = [g for g in (position_idx, intensity_idx) if g]
+
         try:
-            initial_obj = objective(param_vector)
-            self._log(f"  Initial objective: {initial_obj:.2e}")
-            
-            result = minimize(
-                objective,
-                param_vector,
-                bounds=param_bounds,
-                method='L-BFGS-B',
-                options={'maxiter': maxiter, 'ftol': ftol, 'gtol': 1e-5}
-            )
-            
-            optimized_params = self._vector_to_parameters(result.x, param_names, params)
-            
+            # Le Bail step: partition once, then hold intensities fixed while the
+            # profile and lattice are fitted against them
+            self._refresh_extracted(phase_idx)
+            self._freeze_extracted = True
+            try:
+                working = np.asarray(param_vector, dtype=float)
+                for group in groups:
+                    working = self._fit_parameter_group(
+                        phase_idx, params, working, param_bounds, param_names,
+                        group, other_pattern,
+                    )
+            finally:
+                self._freeze_extracted = False
+
+            optimized_params = self._vector_to_parameters(working, param_names, params)
+
             if 'u_param' in optimized_params:
                 self._log(f"  Profile refined: U={optimized_params['u_param']:.6f}, "
                           f"V={optimized_params['v_param']:.6f}, W={optimized_params['w_param']:.6f}, "
                           f"η={optimized_params['eta_param']:.3f}")
-            
+
             if 'lattice_scale' in optimized_params:
                 cell = optimized_params.get('unit_cell', params.get('unit_cell', {}))
                 self._log(
@@ -703,17 +725,64 @@ class LeBailRefinement:
             if 'harmonic_coeffs' in optimized_params:
                 coeffs = ", ".join(f"{c:+.3f}" for c in optimized_params['harmonic_coeffs'])
                 self._log(f"  Harmonic coefficients: {coeffs}")
-            
+
             if 'scale_factor' in optimized_params:
                 final_scale = optimized_params['scale_factor']
                 initial_scale = params['scale_factor']
                 if final_scale < initial_scale * 0.2:
                     self._log(f"  WARNING: Scale collapsed from {initial_scale:.3f} to {final_scale:.3f}")
-            
+
             phase['parameters'].update(optimized_params)
-                
+            self._refresh_extracted(phase_idx)
+
         except Exception as e:
+            self._freeze_extracted = False
             self._log(f"Optimization failed for phase {phase_idx}: {e}")
+
+    def _fit_parameter_group(self, phase_idx: int, params: Dict,
+                             working: np.ndarray, param_bounds: List,
+                             param_names: List[str], group: List[int],
+                             other_pattern: np.ndarray) -> np.ndarray:
+        """least_squares on one disjoint subset of the free parameters."""
+        observed = self.experimental_data['intensity']
+        errors = self.experimental_data['errors']
+        x0 = working[group]
+        lower = np.array([param_bounds[i][0] for i in group], dtype=float)
+        upper = np.array([param_bounds[i][1] for i in group], dtype=float)
+        names = [param_names[i] for i in group]
+        max_nfev = 30 if self.mode == 'trial' else 80
+        ftol = 1e-4 if self.mode == 'trial' else 1e-10
+
+        def residuals(x):
+            trial = working.copy()
+            trial[group] = x
+            temp = self._vector_to_parameters(trial, param_names, params)
+            merged = dict(params)
+            merged.update(temp)
+            if 'unit_cell' in temp:
+                merged['unit_cell'] = temp['unit_cell']
+            total = self._calculate_phase_pattern(phase_idx, merged) + other_pattern
+            return (observed - total) / errors
+
+        if len(group) == 1 and names[0] == 'lattice_scale':
+            # A 1-D bracketed search is cheaper and more robust than TRF for the
+            # single lattice dilation; peak sliding makes the Jacobian noisy
+            best_x, best_val = float(x0[0]), float(np.sum(residuals(x0) ** 2))
+            for trial in np.linspace(lower[0], upper[0], 21):
+                value = float(np.sum(residuals(np.array([trial])) ** 2))
+                if value < best_val:
+                    best_x, best_val = float(trial), value
+            x0 = np.array([best_x])
+
+        result = least_squares(
+            residuals, x0, bounds=(lower, upper), method='trf',
+            x_scale=np.maximum(upper - lower, 1e-8),
+            diff_step=1e-4, ftol=ftol, xtol=ftol, gtol=1e-8,
+            max_nfev=max_nfev,
+        )
+        updated = working.copy()
+        updated[group] = result.x
+        return updated
             
     def _create_parameter_vector(self, params: Dict) -> Tuple[np.ndarray, List, List]:
         """Create parameter vector for optimization"""
@@ -939,10 +1008,9 @@ class LeBailRefinement:
             )
 
         if not is_pawley:
-            extracted_intensities = self._extract_lebail_intensities(
-                shifted_positions, peak_widths, eta
+            effective = self._partitioned_intensities(
+                phase, shifted_positions, peak_widths, eta
             )
-            effective = extracted_intensities
         else:
             # Need full peak list for Pawley multipliers — use unfiltered theo peaks
             all_pos = self._shift_positions(theo_peaks['two_theta'], parameters)
@@ -956,35 +1024,97 @@ class LeBailRefinement:
 
         return self._accumulate_pseudo_voigt(shifted_positions, peak_widths, effective, eta)
 
+    def _partitioned_intensities(self, phase: Dict, positions: np.ndarray,
+                                 widths: np.ndarray, eta: float) -> np.ndarray:
+        """
+        This phase's Le Bail intensities, re-partitioned unless they are frozen.
+
+        Le Bail alternates two steps: partition the observed intensity among the
+        reflections at the current profile, then fit the profile and lattice
+        against those intensities held fixed. Partitioning inside the objective
+        instead would run it once per finite-difference probe of the gradient,
+        hundreds of times per optimizer step, and would also let the intensities
+        chase the parameters so that a worse profile can still reproduce the
+        pattern, which flattens the very gradient being measured.
+        """
+        cached = phase.get('_extracted_intensities')
+        if self._freeze_extracted and cached is not None and len(cached) == len(positions):
+            return cached
+        extracted = self._extract_lebail_intensities(positions, widths, eta)
+        phase['_extracted_intensities'] = extracted
+        return extracted
+
+    def _refresh_extracted(self, phase_idx: Optional[int] = None):
+        """Re-partition intensities at the current parameters"""
+        targets = range(len(self.phases)) if phase_idx is None else [phase_idx]
+        frozen, self._freeze_extracted = self._freeze_extracted, False
+        try:
+            for index in targets:
+                self.phases[index].pop('_extracted_intensities', None)
+                self._calculate_phase_pattern(index, self.phases[index]['parameters'])
+        finally:
+            self._freeze_extracted = frozen
+
+    def _peak_windows(self, positions: np.ndarray, widths: np.ndarray,
+                      eta: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Unit-height pseudo-Voigt profiles for every reflection, in one array.
+
+        A peak only reaches a few tenths of a degree, so each is evaluated on a
+        window of grid points rather than the whole pattern. Giving every peak
+        the same window length in points lets all of them live in one
+        (reflections, window) array and be evaluated in a single pass, instead
+        of a Python loop that repeats the same handful of array operations
+        hundreds of times. The profile is rebuilt on every objective evaluation
+        during refinement, so this is the inner loop of the whole engine.
+
+        Returns the grid indices each window covers, the profiles, and the
+        number of grid points under each unit-height peak.
+        """
+        n = self._n
+        positions = np.asarray(positions, dtype=float)
+        if n == 0 or positions.size == 0:
+            return (np.zeros((0, 0), dtype=np.intp), np.zeros((0, 0)), np.zeros(0))
+
+        x = self.experimental_data['two_theta']
+        widths = np.maximum(np.asarray(widths, dtype=float), 1e-6)
+        cutoff = 5.0 * widths
+
+        half = int(np.ceil(float(np.max(cutoff)) / self._dx)) + 1
+        # Broad peaks on a fine grid would otherwise make the array enormous
+        budget = max(3, self._max_window_elements // (2 * positions.size))
+        half = int(min(half, budget, n))
+
+        centers = np.clip(np.searchsorted(x, positions), 0, n - 1).astype(np.intp)
+        indices = centers[:, None] + np.arange(-half, half + 1)[None, :]
+        # Windows near either end of the pattern run off the grid; those points
+        # are clamped to stay valid indices and then masked out of the profile
+        on_grid = (indices >= 0) & (indices < n)
+        np.clip(indices, 0, n - 1, out=indices)
+
+        offset = x[indices] - positions[:, None]
+        sigma = widths[:, None] / (2.0 * np.sqrt(2.0 * np.log(2.0)))
+        gamma = widths[:, None] / 2.0
+        profiles = (
+            (1.0 - eta) * np.exp(-0.5 * (offset / sigma) ** 2)
+            + eta / (1.0 + (offset / gamma) ** 2)
+        )
+        profiles *= on_grid & (np.abs(offset) <= cutoff[:, None])
+
+        return indices, profiles, profiles.sum(axis=1)
+
     def _accumulate_pseudo_voigt(self, positions: np.ndarray, widths: np.ndarray,
                                   intensities: np.ndarray, eta: float) -> np.ndarray:
         """Windowed accumulation of pseudo-Voigt peaks into a dense pattern"""
-        x = self.experimental_data['two_theta']
-        pattern = np.zeros_like(x)
-        if len(x) == 0:
-            return pattern
+        if self._n == 0 or len(positions) == 0:
+            return np.zeros(self._n)
 
-        # Approximate dx for index windowing
-        dx = float(np.median(np.diff(x))) if len(x) > 1 else 0.02
-        x0 = float(x[0])
-        n = len(x)
-
-        for pos, width, intensity in zip(positions, widths, intensities):
-            if width <= 0 or intensity <= 0:
-                continue
-            cutoff = 5.0 * width
-            i_lo = max(0, int((pos - cutoff - x0) / dx) - 1)
-            i_hi = min(n, int((pos + cutoff - x0) / dx) + 2)
-            if i_lo >= i_hi:
-                continue
-            x_local = x[i_lo:i_hi]
-            sigma_g = width / (2 * np.sqrt(2 * np.log(2)))
-            gaussian = np.exp(-0.5 * ((x_local - pos) / sigma_g) ** 2)
-            gamma_l = width / 2.0
-            lorentzian = 1.0 / (1.0 + ((x_local - pos) / gamma_l) ** 2)
-            pattern[i_lo:i_hi] += intensity * ((1.0 - eta) * gaussian + eta * lorentzian)
-
-        return pattern
+        indices, profiles, _ = self._peak_windows(positions, widths, eta)
+        heights = np.maximum(np.asarray(intensities, dtype=float), 0.0)
+        contributions = profiles * heights[:, None]
+        return np.bincount(
+            indices.ravel(), weights=contributions.ravel(), minlength=self._n
+        )
     
     def _extract_lebail_intensities(self, positions: np.ndarray, widths: np.ndarray, 
                                      eta: float) -> np.ndarray:
@@ -1001,69 +1131,40 @@ class LeBailRefinement:
         phases overlap both claim the same observed intensity. That is why this
         mode cannot be used for quantification.
         """
-        exp_2theta = self.experimental_data['two_theta']
-        exp_intensity = self.experimental_data['intensity']
+        observed = self.experimental_data['intensity']
         n_peaks = len(positions)
-        n_pts = len(exp_2theta)
-        extracted = np.zeros(n_peaks)
+        n_pts = self._n
 
         if n_peaks == 0 or n_pts == 0:
-            return extracted
+            return np.zeros(n_peaks)
 
-        dx = float(np.median(np.diff(exp_2theta))) if n_pts > 1 else 0.02
-        x0 = float(exp_2theta[0])
+        indices, profiles, areas = self._peak_windows(positions, widths, eta)
+        areas = np.maximum(areas, 1e-12)
+        unit_area = profiles / areas[:, None]
+        observed_window = observed[indices]
 
-        # Sparse storage: list of (i_lo, i_hi, normalized_local_profile)
-        sparse_profiles = []
-        areas = np.ones(n_peaks)  # points under a unit-height peak
-        for peak_idx, (pos, width) in enumerate(zip(positions, widths)):
-            if width <= 0:
-                sparse_profiles.append(None)
-                continue
-            cutoff = 5.0 * width
-            i_lo = max(0, int((pos - cutoff - x0) / dx) - 1)
-            i_hi = min(n_pts, int((pos + cutoff - x0) / dx) + 2)
-            if i_lo >= i_hi:
-                sparse_profiles.append(None)
-                continue
-            x_local = exp_2theta[i_lo:i_hi]
-            sigma_g = width / (2 * np.sqrt(2 * np.log(2)))
-            gaussian = np.exp(-0.5 * ((x_local - pos) / sigma_g) ** 2)
-            gamma_l = width / 2.0
-            lorentzian = 1.0 / (1.0 + ((x_local - pos) / gamma_l) ** 2)
-            profile = (1.0 - eta) * gaussian + eta * lorentzian
-            psum = float(np.sum(profile))
-            if psum > 0:
-                areas[peak_idx] = psum
-                profile = profile / psum
-            sparse_profiles.append((i_lo, i_hi, profile))
+        # Starting values only need the right relative sizes: one partitioning
+        # step is invariant to an overall rescaling of them
+        centers = np.clip(
+            np.searchsorted(self.experimental_data['two_theta'],
+                            np.asarray(positions, dtype=float)),
+            0, n_pts - 1,
+        )
+        extracted = np.maximum(observed[centers], 0.0) * areas
 
-        # Initial guess from the nearest observed point, as an integrated intensity
-        for idx, pos in enumerate(positions):
-            closest_idx = int(np.clip(round((pos - x0) / dx), 0, n_pts - 1))
-            extracted[idx] = max(0.0, float(exp_intensity[closest_idx])) * areas[idx]
+        for _ in range(max(1, int(self.extract_iterations))):
+            contribution = extracted[:, None] * unit_area
+            total = np.bincount(
+                indices.ravel(), weights=contribution.ravel(), minlength=n_pts
+            )
+            overlap = total[indices]
+            share = np.divide(
+                contribution, overlap,
+                out=np.zeros_like(contribution), where=overlap > 0,
+            )
+            extracted = np.sum(observed_window * share, axis=1)
 
-        n_iter = max(1, int(self.extract_iterations))
-        for _ in range(n_iter):
-            total_calc = np.zeros(n_pts)
-            for idx, sp in enumerate(sparse_profiles):
-                if sp is None:
-                    continue
-                i_lo, i_hi, profile = sp
-                total_calc[i_lo:i_hi] += extracted[idx] * profile
-
-            for idx, sp in enumerate(sparse_profiles):
-                if sp is None:
-                    continue
-                i_lo, i_hi, profile = sp
-                local_total = total_calc[i_lo:i_hi]
-                local_obs = exp_intensity[i_lo:i_hi]
-                contrib = extracted[idx] * profile
-                with np.errstate(divide='ignore', invalid='ignore'):
-                    fraction = np.where(local_total > 0, contrib / local_total, 0.0)
-                extracted[idx] = float(np.sum(local_obs * fraction))
-
-        return extracted / np.maximum(areas, 1e-12)
+        return extracted / areas
         
     def _calculate_peak_widths(self, two_theta: np.ndarray, parameters: Dict) -> np.ndarray:
         """Calculate peak widths using Caglioti function: FWHM² = U*tan²θ + V*tanθ + W"""

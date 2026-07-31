@@ -13,7 +13,9 @@ from __future__ import annotations
 from typing import Callable, Dict, List, Optional, Sequence
 
 import numpy as np
+from scipy.special import betainc
 
+from utils import search_debug
 from utils.two_theta_shift import DISPLACEMENT, apply_shift, fit_shift
 
 
@@ -24,10 +26,11 @@ DEFAULT_N_FINGERPRINT = 10
 # A phase cannot be present if its most intense line is absent
 MISSING_TOP_PENALTY = 0.45
 
-# Matching a handful of lines is weak evidence: in a 30-peak pattern a two- or
-# three-line reference can be satisfied by coincidence, so such candidates are
-# demoted rather than allowed to outrank a well-matched 10-line phase.
-INFORMATIVE_LINES = 5
+# Evidence is measured as -log10 of the probability that this many lines would
+# match by luck. These bracket "could easily be a coincidence" (one pattern in
+# ten) and "cannot plausibly be a coincidence" (one in a million).
+EVIDENCE_FLOOR = 1.0
+EVIDENCE_CEILING = 6.0
 
 
 def select_fingerprint_peaks(
@@ -37,8 +40,16 @@ def select_fingerprint_peaks(
     n_peaks: int = DEFAULT_N_FINGERPRINT,
     min_rel_intensity: float = DEFAULT_MIN_REL_INTENSITY,
     two_theta_range: Optional[tuple] = None,
+    merge_within: float = 0.05,
 ) -> Dict[str, np.ndarray]:
-    """Pick the strong lines that define a phase, normalized to I_max = 100."""
+    """
+    Pick the strong lines that define a phase, normalized to I_max = 100.
+
+    High-symmetry cells store the same Bragg angle many times (one entry per
+    equivalent reflection). Without merging them, a single experimental peak
+    can satisfy half the fingerprint and a cubic phase looks perfect against
+    any pattern that happens to have two peaks in the right places.
+    """
     tt = np.asarray(two_theta, dtype=float)
     inten = np.asarray(intensity, dtype=float)
     if len(tt) == 0 or len(tt) != len(inten):
@@ -51,6 +62,22 @@ def select_fingerprint_peaks(
     tt, inten = tt[keep], inten[keep]
     if len(tt) == 0:
         return {"two_theta": np.array([]), "intensity": np.array([])}
+
+    # Merge coincident reflections before ranking so multiplicity cannot inflate
+    # the line count. Intensity is the strongest contributor at that angle.
+    order = np.argsort(tt)
+    tt, inten = tt[order], inten[order]
+    merged_tt, merged_int = [float(tt[0])], [float(inten[0])]
+    for t, i in zip(tt[1:], inten[1:]):
+        if t - merged_tt[-1] <= merge_within:
+            if i > merged_int[-1]:
+                merged_tt[-1] = float(t)
+                merged_int[-1] = float(i)
+        else:
+            merged_tt.append(float(t))
+            merged_int.append(float(i))
+    tt = np.asarray(merged_tt)
+    inten = np.asarray(merged_int)
 
     norm = inten / np.max(inten) * 100.0
     strong = norm >= min_rel_intensity
@@ -108,12 +135,42 @@ def coincidence_fraction(
     return float(np.clip(np.mean(mask), 0.0, 0.95))
 
 
-def _enrichment(presence: float, chance: float) -> float:
-    """Presence rescaled so a chance-level match scores zero."""
-    chance = float(np.clip(chance, 0.0, 0.95))
-    if chance <= 0:
-        return float(np.clip(presence, 0.0, 1.0))
-    return float(np.clip((presence - chance) / (1.0 - chance), 0.0, 1.0))
+def match_evidence(presence: float, chance: float, n_expected: int) -> float:
+    """
+    How unlikely this many matching lines would be if the phase were absent.
+
+    Rescaling presence linearly against chance saturates: a candidate whose
+    every line lands on some peak scores a perfect 1.0 whether the match
+    windows cover a tenth of the pattern or two thirds of it. In a dense peak
+    list that ties hundreds of candidates at the top and buries any real phase
+    that misses a single line. The binomial tail keeps them apart because it
+    accounts for how many lines were tested as well as how much of the pattern
+    a line can hit by luck: ten of ten is overwhelming at 26% coverage and
+    barely worth mentioning at 68%.
+
+    `presence` is intensity-weighted, so `presence * n_expected` is the
+    effective number of lines found — missing the strongest line costs far more
+    than missing the weakest.
+
+    Returns -log10(p), so larger is stronger evidence and 0 means none.
+    """
+    n = int(n_expected)
+    if n <= 0:
+        return 0.0
+    p = float(np.clip(chance, 1e-6, 1.0 - 1e-9))
+    k = float(np.clip(presence, 0.0, 1.0)) * n
+    if k <= 0:
+        return 0.0
+    # P(at least k of n match by luck) = I_p(k, n - k + 1)
+    tail = float(betainc(k, max(n - k + 1.0, 1e-9), p))
+    return float(-np.log10(min(max(tail, 1e-300), 1.0)))
+
+
+def _evidence_score(presence: float, chance: float, n_expected: int) -> float:
+    """Evidence normalized onto 0-1 for use as a score factor."""
+    evidence = match_evidence(presence, chance, n_expected)
+    span = EVIDENCE_CEILING - EVIDENCE_FLOOR
+    return float(np.clip((evidence - EVIDENCE_FLOOR) / span, 0.0, 1.0))
 
 
 def _intensity_consistency(theo: np.ndarray, exp: np.ndarray) -> float:
@@ -182,9 +239,9 @@ def fingerprint_score(
         "score": 0.0,
         "presence": 0.0,
         "enrichment": 0.0,
+        "evidence": 0.0,
         "chance_match": 0.0,
         "residual_score": 0.0,
-        "specificity": 0.0,
         "intensity_consistency": 0.0,
         "n_expected": 0,
         "n_found": 0,
@@ -244,16 +301,26 @@ def fingerprint_score(
     match_weight = np.zeros(len(fp_tt), dtype=float)
     theo_found, exp_found = [], []
 
-    for i, tt in enumerate(obs_tt):
-        diffs = np.abs(exp_tt - tt)
-        j = int(np.argmin(diffs))
-        if diffs[j] <= tolerance:
-            found_mask[i] = True
-            offsets[i] = float(diffs[j])
-            exp_matched[i] = float(exp_tt[j])
-            match_weight[i] = float(weights[j]) if weights is not None else 1.0
-            theo_found.append(float(fp_int[i]))
-            exp_found.append(float(exp_int[j] / exp_max * 100.0))
+    # Strongest reference lines claim experimental peaks first, and a peak can
+    # only be claimed once. Without that, two close fingerprint lines (or a
+    # whole multiplet that escaped merging) all land on the same observed peak
+    # and invent a perfect presence score.
+    claim_order = np.argsort(fp_int)[::-1]
+    claimed = np.zeros(len(exp_tt), dtype=bool)
+    for i in claim_order:
+        diffs = np.abs(exp_tt - obs_tt[i])
+        # Prefer the closest unclaimed peak inside the tolerance
+        eligible = np.where((diffs <= tolerance) & ~claimed)[0]
+        if len(eligible) == 0:
+            continue
+        j = int(eligible[np.argmin(diffs[eligible])])
+        found_mask[i] = True
+        claimed[j] = True
+        offsets[i] = float(diffs[j])
+        exp_matched[i] = float(exp_tt[j])
+        match_weight[i] = float(weights[j]) if weights is not None else 1.0
+        theo_found.append(float(fp_int[i]))
+        exp_found.append(float(exp_int[j] / exp_max * 100.0))
 
     line_weights = fp_int.astype(float)
     total_weight = float(np.sum(line_weights))
@@ -263,13 +330,25 @@ def fingerprint_score(
     )
 
     if chance is None:
-        chance = coincidence_fraction(exp_tt, tolerance, exp_range)
+        # Intensity-weighted chance: weak peaks stay available for matching, but
+        # they barely inflate the coincidence baseline the way a flat count of
+        # 100 peaks would. Sqrt keeps the floor from collapsing onto only the
+        # tallest one or two lines.
+        chance_weights = np.sqrt(np.maximum(exp_int, 0.0))
+        chance = coincidence_fraction(exp_tt, tolerance, exp_range, chance_weights)
     if weights is None:
         chance_weighted = chance
     elif chance_weighted is None:
         chance_weighted = coincidence_fraction(exp_tt, tolerance, exp_range, weights)
-    enrichment = _enrichment(presence, chance)
-    residual_enrichment = _enrichment(residual_presence, chance_weighted)
+    n_expected = int(len(fp_tt))
+    n_found = int(np.sum(found_mask))
+
+    # The evidence term already accounts for how many lines were tested, so a
+    # short reference is demoted by the statistics rather than by a separate
+    # specificity factor that would penalize it twice
+    evidence = match_evidence(presence, chance, n_expected)
+    enrichment = _evidence_score(presence, chance, n_expected)
+    residual_enrichment = _evidence_score(residual_presence, chance_weighted, n_expected)
 
     pos_quality = 0.0
     if np.any(found_mask):
@@ -281,16 +360,7 @@ def fingerprint_score(
     top_found = bool(found_mask[strongest_idx])
     penalty = 1.0 if top_found else MISSING_TOP_PENALTY
 
-    n_expected = int(len(fp_tt))
-    n_found = int(np.sum(found_mask))
-    specificity = min(1.0, n_expected / INFORMATIVE_LINES) * (
-        0.6 + 0.4 * min(1.0, n_found / INFORMATIVE_LINES)
-    )
-    quality = (
-        (0.75 + 0.25 * pos_quality)
-        * (0.35 + 0.65 * consistency)
-        * specificity
-    )
+    quality = (0.75 + 0.25 * pos_quality) * (0.35 + 0.65 * consistency)
 
     score = enrichment * quality * penalty
     residual_score = residual_enrichment * quality * penalty
@@ -299,9 +369,9 @@ def fingerprint_score(
         "score": float(np.clip(score, 0.0, 1.0)),
         "presence": presence,
         "enrichment": enrichment,
+        "evidence": float(evidence),
         "chance_match": float(chance),
         "residual_score": float(np.clip(residual_score, 0.0, 1.0)),
-        "specificity": float(specificity),
         "intensity_consistency": float(consistency),
         "n_expected": n_expected,
         "n_found": n_found,
@@ -389,6 +459,7 @@ def rank_by_fingerprint(
     exp_range: Optional[tuple] = None,
     dedupe_by_name: bool = True,
     exp_weights: Optional[Sequence[float]] = None,
+    weights_rank_only: bool = False,
     shift: float = 0.0,
     shift_span: float = 0.0,
     shift_model: str = DISPLACEMENT,
@@ -401,21 +472,34 @@ def rank_by_fingerprint(
     caching. Databases hold many records per mineral, so by default only the
     best-scoring record per mineral name is kept — otherwise a dozen quartz
     entries bury the minor phases.
+
+    `weights_rank_only` keeps `min_score` on the unweighted score while still
+    ordering by the weighted one. That is what an emphasised region wants: it
+    says which phases to look at first, not that a phase whose lines all sit
+    outside the region has stopped being present. Residual search leaves it
+    off, because there dropping the already-explained phases is the point.
     """
     exp_tt = exp_peaks.get("two_theta", [])
     exp_int = exp_peaks.get("intensity", [])
     scored: List[Dict] = []
 
-    # Same for every candidate, and the dominant cost otherwise
-    chance = coincidence_fraction(exp_tt, tolerance, exp_range)
+    # Same for every candidate, and the dominant cost otherwise. Intensity
+    # weighting matches fingerprint_score's default so a long peak list does
+    # not make every phase look present by chance.
+    exp_int_arr = np.asarray(exp_int, dtype=float)
+    chance_weights = np.sqrt(np.maximum(exp_int_arr, 0.0))
+    chance = coincidence_fraction(exp_tt, tolerance, exp_range, chance_weights)
     chance_weighted = (
         coincidence_fraction(exp_tt, tolerance, exp_range, exp_weights)
         if exp_weights is not None else chance
     )
 
     for result in results:
+        name = result.get("mineral_name")
         theo = theo_lookup(result)
         if not theo:
+            search_debug.gate("no_reference", name,
+                              mineral_id=result.get("mineral_id"))
             continue
         info = fingerprint_score(
             exp_tt,
@@ -435,9 +519,22 @@ def rank_by_fingerprint(
         )
         # In residual mode rank on newly explained lines, not overall presence
         rank_score = info["residual_score"] if exp_weights is not None else info["score"]
-        if info["n_found"] < min_found or rank_score < min_score:
-            continue
-        if require_top_peak and not info["top_found"]:
+        gate_score = info["score"] if weights_rank_only else rank_score
+        fate = None
+        if info["n_expected"] == 0:
+            fate = "shifted_out" if info["shift"] else "no_lines_in_range"
+        elif info["n_found"] < min_found:
+            fate = "min_found"
+        elif gate_score < min_score:
+            fate = "min_score"
+        elif require_top_peak and not info["top_found"]:
+            fate = "require_top"
+        if fate:
+            search_debug.gate(
+                fate, name, mineral_id=result.get("mineral_id"),
+                score=float(rank_score), n_found=info["n_found"],
+                n_expected=info["n_expected"], fingerprint=info,
+            )
             continue
         enriched = dict(result)
         enriched["fingerprint"] = info
@@ -454,13 +551,37 @@ def rank_by_fingerprint(
                 key = f"__row{len(best)}"
             if key in best:
                 best[key]["duplicate_records"] = best[key].get("duplicate_records", 0) + 1
+                search_debug.gate(
+                    "duplicate_record", result.get("mineral_name"),
+                    mineral_id=result.get("mineral_id"),
+                    score=float(result["fingerprint_score"]),
+                )
                 continue
             result["duplicate_records"] = 0
             best[key] = result
         scored = list(best.values())
 
     if max_results is not None:
+        for result in scored[max_results:]:
+            search_debug.gate(
+                "max_results", result.get("mineral_name"),
+                mineral_id=result.get("mineral_id"),
+                score=float(result["fingerprint_score"]),
+            )
         scored = scored[:max_results]
+
+    if search_debug.enabled():
+        for result in scored:
+            search_debug.gate(
+                "kept", result.get("mineral_name"),
+                mineral_id=result.get("mineral_id"),
+                score=float(result["fingerprint_score"]),
+                fingerprint=result["fingerprint"],
+            )
+        search_debug.stage(
+            f"Fingerprint scoring: {len(results)} scored → {len(scored)} listed "
+            f"(min score {min_score:.2f}, min lines {min_found}, chance {chance:.2f})"
+        )
     return scored
 
 

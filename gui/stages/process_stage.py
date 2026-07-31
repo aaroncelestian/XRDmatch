@@ -158,6 +158,15 @@ class ProcessStage(QWidget):
         self.clear_peaks_btn.setToolTip("Discard the current peak list")
         self.clear_peaks_btn.clicked.connect(self.clear_peaks)
         row.add_widget(self.clear_peaks_btn)
+
+        self.edit_peaks_btn = QPushButton("Edit on Plot")
+        self.edit_peaks_btn.setCheckable(True)
+        self.edit_peaks_btn.setToolTip(
+            "Click the plot to add a peak, right-click a peak to remove it. "
+            "Turn off to pan and zoom normally."
+        )
+        self.edit_peaks_btn.toggled.connect(self.workspace.set_peak_edit_mode)
+        row.add_widget(self.edit_peaks_btn)
         row.add_separator()
 
         # Noise is the honest detection limit: a percent of the strongest peak

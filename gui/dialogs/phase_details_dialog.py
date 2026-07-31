@@ -123,8 +123,18 @@ class PhaseDetailsDialog(QDialog):
             ("Matched peaks", str(len(result.get("matches") or [])) if result.get("matches") else "—"),
         ]
         if fp:
+            evidence = fp.get("evidence")
+            if evidence is not None:
+                try:
+                    odds = f"1 in {10 ** float(evidence):,.0f}"
+                except (TypeError, ValueError, OverflowError):
+                    odds = "—"
+                evidence_text = f"{float(evidence):.2f} ({odds})"
+            else:
+                evidence_text = "—"
             rows.extend([
                 ("Fingerprint", _fmt(fp.get("score"), ".3f")),
+                ("Evidence", evidence_text),
                 ("Lines found", f"{fp.get('n_found', 0)}/{fp.get('n_expected', 0)}"),
                 ("Strongest line", "present" if fp.get("top_found") else "missing"),
                 ("Position quality", _fmt(fp.get("position_quality"), ".2f")),
