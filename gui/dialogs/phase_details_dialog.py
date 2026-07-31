@@ -2,16 +2,22 @@
 
 from __future__ import annotations
 
+import re
 from typing import Optional
+from urllib.parse import quote
 
 import numpy as np
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QUrl
+from PyQt5.QtGui import QDesktopServices, QGuiApplication, QKeySequence
 from PyQt5.QtWidgets import (
-    QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QLabel, QTableWidget,
-    QTableWidgetItem, QVBoxLayout, QWidget,
+    QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QLabel, QShortcut,
+    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from utils.two_theta_shift import DISPLACEMENT, describe as describe_shift
+
+MINDAT_SEARCH = "https://www.mindat.org/search.php?name={}"
+RRUFF_SEARCH = "https://rruff.net/{}"
 
 
 def _fmt(value, spec: str = "", dash: str = "—") -> str:
@@ -23,6 +29,22 @@ def _fmt(value, spec: str = "", dash: str = "—") -> str:
         except (TypeError, ValueError):
             return str(value)
     return str(value)
+
+
+def _mineral_query(name: Optional[str]) -> str:
+    """Reduce a database name like 'Quartz, low (syn)' to a searchable species name."""
+    if not name:
+        return ""
+    base = re.split(r"[,(\[]", str(name))[0]
+    base = re.sub(r"[_\s-]*(R\d{6}|AMCSD\s*\d+|\d{4,})\s*$", "", base, flags=re.I)
+    cleaned = " ".join(base.split()).strip()
+    return "" if cleaned.lower().startswith("unknown") else cleaned
+
+
+def _selectable(label: QLabel) -> QLabel:
+    label.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
+    label.setCursor(Qt.IBeamCursor)
+    return label
 
 
 class PhaseDetailsDialog(QDialog):
@@ -39,11 +61,13 @@ class PhaseDetailsDialog(QDialog):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
 
-        self.title = QLabel("—")
+        self._mineral = ""
+
+        self.title = _selectable(QLabel("—"))
         self.title.setStyleSheet("font-weight: 600; font-size: 15px;")
         layout.addWidget(self.title)
 
-        self.subtitle = QLabel("")
+        self.subtitle = _selectable(QLabel(""))
         self.subtitle.setObjectName("mutedLabel")
         self.subtitle.setWordWrap(True)
         layout.addWidget(self.subtitle)
@@ -62,7 +86,7 @@ class PhaseDetailsDialog(QDialog):
         columns.addWidget(score_wrap, 1)
         layout.addLayout(columns)
 
-        self.peaks_label = QLabel("Reference peaks")
+        self.peaks_label = _selectable(QLabel("Reference peaks"))
         self.peaks_label.setObjectName("mutedLabel")
         layout.addWidget(self.peaks_label)
 
@@ -77,7 +101,20 @@ class PhaseDetailsDialog(QDialog):
         close_btn = buttons.button(QDialogButtonBox.Close)
         if close_btn:
             close_btn.clicked.connect(self.hide)
+
+        self.mindat_btn = buttons.addButton("Mindat…", QDialogButtonBox.ActionRole)
+        self.mindat_btn.setToolTip("Look this mineral up on mindat.org")
+        self.mindat_btn.clicked.connect(lambda: self._open_lookup(MINDAT_SEARCH))
+        self.rruff_btn = buttons.addButton("RRUFF…", QDialogButtonBox.ActionRole)
+        self.rruff_btn.setToolTip("Look this mineral up on rruff.net")
+        self.rruff_btn.clicked.connect(lambda: self._open_lookup(RRUFF_SEARCH))
+        self.mindat_btn.setEnabled(False)
+        self.rruff_btn.setEnabled(False)
         layout.addWidget(buttons)
+
+        copy = QShortcut(QKeySequence.Copy, self.peaks_table)
+        copy.setContext(Qt.WidgetShortcut)
+        copy.activated.connect(self._copy_peaks)
 
     def show_phase(self, result: dict, theo: Optional[dict] = None):
         """Populate from a search hit or match result, plus optional peak data."""
@@ -95,6 +132,9 @@ class PhaseDetailsDialog(QDialog):
         )
         space_group = phase.get("space_group") or result.get("space_group")
         self.title.setText(str(name))
+        self._mineral = _mineral_query(name)
+        for btn in (self.mindat_btn, self.rruff_btn):
+            btn.setEnabled(bool(self._mineral))
         self.subtitle.setText(
             f"{_fmt(formula)}   ·   space group {_fmt(space_group)}   ·   "
             f"database id {_fmt(phase.get('id') or result.get('mineral_id'))}"
@@ -111,7 +151,7 @@ class PhaseDetailsDialog(QDialog):
             ("γ (°)", "cell_gamma", ".2f"),
             ("RIR", "rir", ".3f"),
         ):
-            self.cell_form.addRow(label, QLabel(_fmt(src.get(key), spec)))
+            self.cell_form.addRow(label, _selectable(QLabel(_fmt(src.get(key), spec))))
 
         self._clear_form(self.score_form)
         fp = result.get("fingerprint") or {}
@@ -151,7 +191,7 @@ class PhaseDetailsDialog(QDialog):
             model = (theo or {}).get("two_theta_shift_model") or fp.get("shift_model")
             rows.append(("2θ shift", describe_shift(shift, model or DISPLACEMENT)))
         for label, value in rows:
-            self.score_form.addRow(label, QLabel(value))
+            self.score_form.addRow(label, _selectable(QLabel(value)))
 
         self._fill_peaks(theo or result.get("theoretical_peaks"))
         self.show()
@@ -188,6 +228,25 @@ class PhaseDetailsDialog(QDialog):
             self.peaks_table.setItem(i, 1, QTableWidgetItem(f"{rel:.1f}"))
             dv = f"{d[i]:.4f}" if d is not None and i < len(d) else "—"
             self.peaks_table.setItem(i, 2, QTableWidgetItem(dv))
+
+    def _open_lookup(self, template: str):
+        if not self._mineral:
+            return
+        QDesktopServices.openUrl(QUrl(template.format(quote(self._mineral))))
+
+    def _copy_peaks(self):
+        ranges = self.peaks_table.selectedRanges()
+        if not ranges:
+            return
+        lines = []
+        for rng in ranges:
+            for row in range(rng.topRow(), rng.bottomRow() + 1):
+                cells = []
+                for col in range(rng.leftColumn(), rng.rightColumn() + 1):
+                    item = self.peaks_table.item(row, col)
+                    cells.append(item.text() if item else "")
+                lines.append("\t".join(cells))
+        QGuiApplication.clipboard().setText("\n".join(lines))
 
     @staticmethod
     def _clear_form(form: QFormLayout):

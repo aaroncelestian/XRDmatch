@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import textwrap
+
 import numpy as np
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
+    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
     QGridLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QMessageBox, QProgressBar, QPushButton, QSpinBox, QVBoxLayout, QWidget,
 )
@@ -46,6 +48,30 @@ from utils.two_theta_shift import (
 from gui.dialogs.search_report_dialog import SearchReportDialog
 from gui.matching_tab import PhaseMatchingThread
 from gui.widgets.control_bar import OptionsDialog, compact
+
+
+REPORT_WIDTH = 74
+
+
+def _prose(text: str, indent: str = "  ") -> list:
+    """Wrap explanatory text by hand — the report box does not wrap lines."""
+    return textwrap.wrap(text, width=REPORT_WIDTH,
+                         initial_indent=indent, subsequent_indent=indent)
+
+
+LABEL_WIDTH = 25
+
+
+def _defined(term: str, text: str) -> list:
+    """One glossary entry, its continuation lines hanging under the text."""
+    head = f"  {term:<{LABEL_WIDTH}s}"
+    return textwrap.wrap(text, width=REPORT_WIDTH, initial_indent=head,
+                         subsequent_indent=" " * len(head))
+
+
+# Fit to Row scans at least this far either side of zero, so a mount that is
+# badly displaced can still be measured from a phase the user recognizes
+FIT_TO_ROW_MIN_SPAN = 1.0
 
 
 SEARCH_METHODS = [
@@ -98,7 +124,15 @@ class IdentifyStage(QWidget):
 
         self.match_btn = QPushButton("Match Selected")
         self.match_btn.setObjectName("primaryButton")
-        self.match_btn.setToolTip("Run peak matching on the checked candidates")
+        self.match_btn.setToolTip(
+            "Score the checked candidates in full and turn them into your "
+            "phase list.\n\n"
+            "Search ranks the whole database quickly on each candidate's "
+            "strongest lines. This compares the complete reference pattern of "
+            "the few you believe against the measured peaks, then replaces the "
+            "list with those matches — which is what Search Residual, RIR "
+            "Quant, and the Quant window work from."
+        )
         self.match_btn.clicked.connect(self.start_matching)
         self.match_btn.setEnabled(False)
         run_row.addWidget(self.match_btn)
@@ -131,8 +165,11 @@ class IdentifyStage(QWidget):
         self.add_mineral_btn.clicked.connect(self.add_mineral_by_name)
         self.explain_btn = QPushButton("Why not?")
         self.explain_btn.setToolTip(
-            "Run the search while following this mineral, and report which gate "
-            "rejected it and which setting controls that gate"
+            "Explain why a mineral you expected is missing from the results.\n\n"
+            "Type its name in the box on the left, then press this. The search "
+            "runs again while following that one mineral, and the report says "
+            "which setting dropped it, how well it actually fits the pattern, "
+            "and which changes would bring it back."
         )
         self.explain_btn.clicked.connect(self.explain_missing_phase)
         grid.addWidget(self._label("Add mineral:"), 1, 0)
@@ -146,7 +183,11 @@ class IdentifyStage(QWidget):
             self.method_combo.addItem(label, key)
         self.method_combo.setToolTip(
             "Fingerprint scores each candidate on its own strong lines, so minor "
-            "phases in a mixture are not penalized for unexplained peaks."
+            "phases in a mixture are not penalized for unexplained peaks.\n\n"
+            "Fingerprint and Ultra-Fast Correlation return in seconds. Peak "
+            "Match, Pearson Correlation, Combined, and Ensemble compare every "
+            "stored pattern one at a time and take about a minute, during which "
+            "the window will not respond."
         )
         self.method_combo.currentIndexChanged.connect(self._on_method_changed)
 
@@ -204,7 +245,8 @@ class IdentifyStage(QWidget):
         grid.addWidget(compact(self.method_combo, 170), 2, 1)
         grid.addWidget(self._label("2θ tol:"), 2, 2)
         grid.addWidget(compact(self.tolerance, 80), 2, 3)
-        grid.addWidget(self._label("Min fingerprint:"), 2, 4)
+        self.fp_min_score_label = self._label("Min fingerprint:")
+        grid.addWidget(self.fp_min_score_label, 2, 4)
         grid.addWidget(compact(self.fp_min_score, 80), 2, 5)
 
         grid.addWidget(self._label("Max results:"), 3, 0)
@@ -249,7 +291,7 @@ class IdentifyStage(QWidget):
         grid.setRowStretch(8, 1)
 
         self._build_option_widgets()
-        self._on_method_changed()
+        self._sync_method_controls()
         return panel
 
     @staticmethod
@@ -286,6 +328,9 @@ class IdentifyStage(QWidget):
             "Positive shifts them to higher 2θ. With the displacement model the "
             "value is the shift extrapolated to 2θ = 0 and the actual shift is "
             "value × cos θ, so it fades out towards high angle.\n\n"
+            "With Auto fit above zero this is only the centre of each "
+            "candidate's own fitted shift; set Auto fit to 0 and every phase "
+            "follows this box.\n\n"
             "This corrects the reference positions only — the measured pattern "
             "is untouched. To correct the data itself use the 2θ offset in the "
             "Background tab."
@@ -319,9 +364,11 @@ class IdentifyStage(QWidget):
 
         self.fit_shift_btn = QPushButton("Fit to Row")
         self.fit_shift_btn.setToolTip(
-            "Fit the shift to the highlighted candidate's lines and put the "
-            "result in the box. Use it once you recognize a phase, then turn "
-            "auto fit off and search again with the displacement pinned down."
+            "Fit the shift to the highlighted phase's lines, put it in the box, "
+            "and move every listed phase onto it — the displacement belongs to "
+            "the mount, not to one mineral.\n\n"
+            "Use it once you recognize a phase, then search again so the "
+            "ranking is done with the displacement pinned down."
         )
         self.fit_shift_btn.clicked.connect(self.fit_shift_to_row)
 
@@ -411,21 +458,50 @@ class IdentifyStage(QWidget):
         """
         The 2θ shift that applies to one phase.
 
-        Phase dicts carry an already-resolved value. Search hits carry the
-        shift fitted while they were scored, which only counts while auto fit
-        is on; otherwise every phase uses the single manual setting.
+        While auto fit is on each phase keeps the shift it was scored with: a
+        value already resolved onto the phase dict, or the one fitted as it
+        ranked. With auto fit off there is a single displacement for the whole
+        mount, so the manual setting wins — otherwise a phase frozen during an
+        earlier auto-fit search would ignore the box for the rest of the session.
         """
-        if isinstance(result, dict):
+        if isinstance(result, dict) and self.shift_span.value() > 0:
             phase = result.get("phase")
             for src in (result, phase if isinstance(phase, dict) else {}):
                 resolved = src.get("two_theta_shift")
                 if resolved is not None:
                     return float(resolved)
-            if self.shift_span.value() > 0:
-                fitted = (result.get("fingerprint") or {}).get("shift")
-                if fitted is not None:
-                    return float(fitted)
+            fitted = (result.get("fingerprint") or {}).get("shift")
+            if fitted is not None:
+                return float(fitted)
         return float(self.shift.value())
+
+    def _pin_shift_on_results(self, value: float) -> int:
+        """
+        Overwrite the shift frozen onto every phase currently in play.
+
+        Search and matching each store the shift they scored a phase with, so
+        a shift fitted afterwards has to replace those copies or the lines stay
+        where the search happened to put them.
+        """
+        groups = [
+            getattr(self.workspace, "_candidate_results", None) or [],
+            self.session.matched_phases or [],
+            self.session.selected_phases or [],
+            self._kept_phases,
+        ]
+        seen, count = set(), 0
+        for group in groups:
+            for result in group:
+                if not isinstance(result, dict):
+                    continue
+                phase = result.get("phase")
+                for target in (result, phase if isinstance(phase, dict) else None):
+                    if target is None or id(target) in seen:
+                        continue
+                    seen.add(id(target))
+                    target["two_theta_shift"] = float(value)
+                count += 1
+        return count
 
     def fit_shift_to_row(self):
         """Pin the shift down from a phase the user has recognized."""
@@ -455,9 +531,10 @@ class IdentifyStage(QWidget):
             min_rel_intensity=self.fp_min_rel.value(),
             two_theta_range=self._measured_range(),
         )
-        # A generous window even when auto fit is off, since this is the step
-        # that tells the user how far off the mount actually is
-        span = self.shift_span.value() or 1.0
+        # A generous window whatever auto fit is set to, since this is the step
+        # that tells the user how far off the mount actually is — a narrow auto
+        # fit range must not stop a large displacement from being found
+        span = max(self.shift_span.value(), FIT_TO_ROW_MIN_SPAN)
         fitted, n_found = fit_shift(
             self.session.peaks["two_theta"],
             fp["two_theta"],
@@ -473,15 +550,24 @@ class IdentifyStage(QWidget):
                 self, "Not Enough Lines",
                 f"Only {n_found} of {name}'s strong lines land on a peak within "
                 f"±{span:.2f}°, which is too few to pin a shift down.\n\n"
-                "Widen the auto fit range or pick a phase you are surer of.",
+                "Widen the auto fit range, loosen the 2θ tolerance, or pick a "
+                "phase you are surer of.",
             )
             return
 
+        # The displacement belongs to the mount, not to one phase, so the fit
+        # replaces the shift on every listed phase as well as the manual box
+        n_phases = self._pin_shift_on_results(fitted)
+        self.shift.blockSignals(True)
         self.shift.setValue(fitted)
+        self.shift.blockSignals(False)
+        self.workspace.refresh_plot()
+
+        applied = f" Applied to {n_phases} listed phase(s)." if n_phases else ""
         self.status.setText(
             f"Fitted {describe_shift(fitted, self.shift_model_key())} from {name} "
-            f"({n_found} lines). Set Auto fit to 0 and search again to apply it "
-            "to every candidate."
+            f"({n_found} lines).{applied} Search again to rank every candidate "
+            "at this shift."
         )
         self.workspace.set_status(f"2θ shift {fitted:+.3f}° from {name}")
 
@@ -646,8 +732,34 @@ class IdentifyStage(QWidget):
         return self.method_combo.currentData() or "fingerprint"
 
     def _on_method_changed(self, *_args):
+        self._sync_method_controls(explain=True)
+
+    def _sync_method_controls(self, explain: bool = False):
+        """
+        Grey out Min fingerprint for the methods that do not read it.
+
+        A greyed threshold with no stated reason reads as a broken control, so
+        a change of method says in the status line which threshold the new
+        method uses instead. Only fingerprint scoring consults Min fingerprint;
+        Peak Match ranks on tolerance alone and the rest use Min corr.
+        """
         is_fp = self._method_key() == "fingerprint"
         self.fp_min_score.setEnabled(is_fp)
+        self.fp_min_score_label.setEnabled(is_fp)
+        if not explain:
+            return
+        if is_fp:
+            self.status.setText(
+                "Fingerprint method: 'Min fingerprint' is the score a candidate "
+                "needs to be listed."
+            )
+        else:
+            instead = ("'Peak tolerance' in Options" if self._method_key() == "peaks"
+                       else "'Min corr'")
+            self.status.setText(
+                f"{self.method_combo.currentText()} does not use 'Min fingerprint', "
+                f"so it is greyed out — this method is controlled by {instead}."
+            )
 
     # --- state ---
 
@@ -672,10 +784,11 @@ class IdentifyStage(QWidget):
         Checked candidates count as accepted, so residual and multi-phase work
         without having to run peak matching first. Phases kept from earlier
         residual rounds stay in the list even though the table now shows the
-        newest candidates.
+        newest candidates. Minerals checked on the Shortlist tab are added on
+        top, since that list is deliberately independent of the current search.
         """
         if getattr(self.workspace, "_results_mode", None) == "matches":
-            return self.workspace.get_selected_matches()
+            return self._with_shortlist(self.workspace.get_selected_matches())
 
         accepted = list(self._kept_phases)
         seen_ids, seen_names = exclusion_sets(accepted)
@@ -696,7 +809,25 @@ class IdentifyStage(QWidget):
             name = mineral_key(entry)
             if name:
                 seen_names.add(name)
-        return accepted
+        return self._with_shortlist(accepted)
+
+    def _with_shortlist(self, accepted: list) -> list:
+        """Append the checked shortlist minerals that are not already here."""
+        panel = getattr(self.workspace, "shortlist_panel", None)
+        if panel is None:
+            return accepted
+
+        merged = list(accepted)
+        seen_ids, seen_names = exclusion_sets(merged)
+        for entry in panel.checked_entries():
+            if is_excluded_hit(entry, seen_ids, seen_names):
+                continue
+            merged.append(entry)
+            seen_ids |= mineral_ids(entry)
+            name = mineral_key(entry)
+            if name:
+                seen_names.add(name)
+        return merged
 
     def update_action_states(self):
         """Keep buttons in step with what is checked in the list."""
@@ -708,11 +839,17 @@ class IdentifyStage(QWidget):
         accepted = self.accepted_phases()
 
         self.match_btn.setEnabled(bool(checked_candidates) and has_peaks)
-        self.match_btn.setToolTip(
-            "Run peak matching on the checked candidates"
-            if checked_candidates else
-            "Check one or more candidates in the list first"
-        )
+        if not checked_candidates:
+            self.match_btn.setToolTip("Check one or more candidates in the list first")
+        else:
+            self.match_btn.setToolTip(
+                f"Score the {len(checked_candidates)} checked candidate(s) in full "
+                "and turn them into your phase list.\n\n"
+                "Search ranks the whole database quickly on each candidate's "
+                "strongest lines. This compares their complete reference patterns "
+                "against the measured peaks, then replaces the list with those "
+                "matches."
+            )
 
         self.residual_btn.setEnabled(can and has_peaks and len(accepted) > 0)
         self.residual_btn.setToolTip(
@@ -724,9 +861,10 @@ class IdentifyStage(QWidget):
 
         self.rir_btn.setEnabled(can and len(accepted) > 0)
         self.rir_btn.setToolTip(
-            f"RIR weight percents for the {len(accepted)} checked phase(s)"
+            f"RIR weight percents for the {len(accepted)} checked phase(s), "
+            "counting anything checked on the Shortlist tab"
             if accepted else
-            "Check the phases you want quantified"
+            "Check the phases you want quantified, here or on the Shortlist tab"
         )
 
     def _measured_range(self):
@@ -944,15 +1082,19 @@ class IdentifyStage(QWidget):
         query = self.mineral_search.text().strip()
         if len(query) < 2:
             QMessageBox.information(
-                self, "Why Not?",
-                "Type the mineral you expected to see in the Add mineral box, "
-                "then press Why not?",
+                self, "Which mineral?",
+                "Type the name of the mineral you expected to see in the "
+                "'Add mineral' box, then press 'Why not?' again.\n\n"
+                "The search will run once more while following that mineral, "
+                "and the report will say what dropped it.",
             )
             return
         if not self.session.has_peaks():
             QMessageBox.warning(
                 self, "Peaks Required",
-                "Diagnosis compares peak positions. Find peaks in the Peaks tab first.",
+                "This report compares your peak positions against the "
+                "database, so it needs a peak list. Find peaks in the Peaks "
+                "tab first, then try again.",
             )
             return
 
@@ -983,7 +1125,15 @@ class IdentifyStage(QWidget):
         return exact or partial
 
     def _build_diagnosis(self, query: str, trace, results: list) -> dict:
-        """Assemble the trace, the verdict, and a line-by-line fit into text."""
+        """
+        Assemble the report, plainest and most actionable part first.
+
+        The order matters more than the content: the answer to "why is my phase
+        missing" comes first, then the settings that would change it, and only
+        then the numbers and the raw trace that back both up. Reading the trace
+        to reach the verdict, as an unordered dump would demand, is the whole
+        difficulty this report is meant to remove.
+        """
         peaks = self.session.peaks
         rng = self._measured_range()
         tol = self.tolerance.value()
@@ -992,17 +1142,25 @@ class IdentifyStage(QWidget):
             if query.lower() in str(r.get("mineral_name", "")).lower()
         ]
 
-        lines = [trace.report(query), ""]
         records = self._records_named(query)
         if not records:
             return {
-                "title": query,
-                "verdict": f"No database record has a name containing “{query}”.",
-                "body": "\n".join(lines + [
-                    f"“{query}” matches no mineral name in the search index, so no "
-                    "search setting can bring it back. Check the spelling, or look "
-                    "for the polymorph name the database uses.",
-                ]),
+                "title": f"“{query}” is not a name in the database",
+                "verdict": f"No database record has a name containing “{query}”, "
+                           "so the search never had a record of it to accept or "
+                           "reject, and no setting can bring it back.",
+                "body": "\n".join(
+                    ["WHAT HAPPENED", "-" * 60]
+                    + _prose(
+                        f"“{query}” matches no mineral name in the search index. "
+                        "Check the spelling first. Failing that, the database may "
+                        "index the phase under a different name — a structural or "
+                        "polymorph name rather than the common one, or a solid "
+                        "solution end member. Try a shorter fragment of the name "
+                        "to see what is there."
+                    )
+                    + ["", trace.report(query)]
+                ),
             }
 
         # Score every matching record on the peaks the search actually used and
@@ -1013,41 +1171,123 @@ class IdentifyStage(QWidget):
         best = scored[0] if scored else None
         best_full = scored_full[0] if scored_full else None
 
-        lines.append(f"Best-fitting record of {len(records)} named “{query}”")
-        lines.append("-" * 60)
-        for label, entry, peak_list in (
-            ("search peak list", best, culled),
-            ("all peaks", best_full, peaks),
-        ):
-            if not entry:
-                continue
-            info, meta = entry["info"], entry["meta"]
-            lines.append(
-                f"  on the {label} ({len(peak_list['two_theta'])} peaks): "
-                f"id={meta.get('id')} score={info['score']:.3f} "
-                f"lines {info['n_found']}/{info['n_expected']} "
-                f"strongest {'present' if info['top_found'] else 'MISSING'}"
-            )
-            lines.append(
-                f"      presence={info['presence']:.3f} chance={info['chance_match']:.3f} "
-                f"evidence={info.get('evidence', 0.0):.2f} (1 in "
-                f"{10 ** info.get('evidence', 0.0):,.0f}) "
-                f"position={info['position_quality']:.3f} "
-                f"consistency={info['intensity_consistency']:.3f}"
-            )
-        lines.append("")
-
-        if best_full:
-            lines += self._line_by_line(best_full, culled, peaks, tol)
-            lines.append("")
-        lines += self._sensitivity(records, peaks, culled, rng)
-
         verdict = self._verdict_text(query, trace, listed, best, best_full)
+
+        lines = ["1. WHAT HAPPENED", "-" * 60]
+        lines += _prose(verdict)
+        lines.append("")
+        lines += self._sensitivity(records, peaks, culled, rng)
+        lines.append("")
+        lines += self._fit_summary(query, records, best, best_full, culled, peaks)
+        if best_full:
+            lines.append("")
+            lines += self._line_by_line(best_full, culled, peaks, tol)
+        lines.append("")
+        lines.append(trace.report(query, heading="5. SEARCH INTERNALS"))
+
+        if listed:
+            title = f"“{query}” is in the results"
+        else:
+            title = f"Why “{query}” is not in the results"
         return {
-            "title": f"{query} — {len(records)} database record(s)",
+            "title": f"{title} — {len(records)} database record(s) named it",
             "verdict": verdict,
             "body": "\n".join(lines),
         }
+
+    def _fit_summary(self, query, records, best, best_full, culled, full) -> list:
+        """
+        The winning record's numbers, side by side on both peak lists.
+
+        Two columns rather than one because the difference between them is a
+        diagnosis on its own: a phase that fits the full peak list but not the
+        searched one was never absent from the pattern, it just needed peaks
+        that 'Search peak count' discarded before scoring.
+        """
+        head = ["3. HOW WELL IT ACTUALLY FITS", "-" * 60]
+        columns = [
+            (label, entry["info"], entry["meta"], len(peaks.get("two_theta", [])))
+            for label, entry, peaks in (("search list", best, culled),
+                                        ("all peaks", best_full, full))
+            if entry
+        ]
+        if not columns:
+            return head + _prose(
+                f"None of the {len(records)} record(s) named “{query}” has a "
+                "calculated pattern, so there is nothing to score against your "
+                "peaks."
+            )
+
+        n_culled = len(culled.get("two_theta", []))
+        n_full = len(full.get("two_theta", []))
+        if len(columns) == 2 and n_culled == n_full:
+            # Nothing was culled, so the two columns would be identical
+            columns = [("your peaks", *columns[0][1:])]
+            out = head + _prose(
+                f"The best fitting of {len(records)} record(s) named “{query}”, "
+                f"scored against all {n_full} of your peaks."
+            )
+        else:
+            out = head + _prose(
+                f"The best fitting of {len(records)} record(s) named “{query}”, "
+                "scored twice: against the peaks the search actually used, and "
+                "against your full peak list. A large gap between the two "
+                "columns means 'Search peak count' threw away peaks this phase "
+                "needed."
+            )
+        out.append("")
+
+        def row(label, *cells):
+            body = "".join(f"{c:<24s}" for c in cells)
+            out.append(f"  {label:<{LABEL_WIDTH}s}{body}".rstrip())
+
+        row("", *[f"{label} ({n} peaks)" for label, _, _, n in columns])
+        row("database record", *[f"id {meta.get('id')}" for _, _, meta, _ in columns])
+        row("fingerprint score", *[f"{i['score']:.3f}" for _, i, _, _ in columns])
+        row("needed to be listed", f"{self.fp_min_score.value():.2f}")
+        row("reference lines found",
+            *[f"{i['n_found']} of {i['n_expected']}" for _, i, _, _ in columns])
+        row("strongest line",
+            *["found" if i["top_found"] else "MISSING" for _, i, _, _ in columns])
+        row("line intensity explained",
+            *[f"{i['presence'] * 100:.0f}%" for _, i, _, _ in columns])
+        row("odds of a lucky hit",
+            *[f"{i['chance_match'] * 100:.0f}% per line" for _, i, _, _ in columns])
+        row("evidence",
+            *[f"1 in {10 ** i.get('evidence', 0.0):,.0f}" for _, i, _, _ in columns])
+        row("2θ agreement",
+            *[f"{i['position_quality'] * 100:.0f}%" for _, i, _, _ in columns])
+        row("intensity pattern",
+            *[f"{i['intensity_consistency'] * 100:.0f}%" for _, i, _, _ in columns])
+
+        out.append("")
+        out += _defined("fingerprint score",
+                        "the overall 0–1 match, combining everything below. "
+                        "Compared against 'Min fingerprint' to decide listing.")
+        out += _defined("reference lines found",
+                        "how many of this phase's fingerprint lines landed on "
+                        "one of your peaks, within the 2θ tolerance.")
+        out += _defined("line intensity explained",
+                        "the same thing weighted by line strength: 100% means "
+                        "every line is accounted for, and missing one strong "
+                        "line costs far more than missing a weak one.")
+        out += _defined("odds of a lucky hit",
+                        "how much of the pattern the match windows cover. At "
+                        "50% a reference line has a coin-flip chance of hitting "
+                        "a peak by accident, so matches prove little.")
+        out += _defined("evidence",
+                        "the chance of getting this many matches from a phase "
+                        "that is not there. 1 in 10 is nothing; 1 in 10,000 is "
+                        "hard to explain away.")
+        out += _defined("2θ agreement",
+                        "how centred the matched lines are in the tolerance "
+                        "window. Low values with many matches mean a shifted "
+                        "pattern — try 'Auto fit ±'.")
+        out += _defined("intensity pattern",
+                        "whether your peak heights rise and fall like the "
+                        "reference. Low is normal for preferred orientation or "
+                        "a heavily overlapped mixture.")
+        return out
 
     def _score_records(self, records: list, peaks: dict, rng) -> list:
         """Fingerprint every record against one peak list, best score first."""
@@ -1091,36 +1331,55 @@ class IdentifyStage(QWidget):
             min_rel_intensity=self.fp_min_rel.value(),
             two_theta_range=self._measured_range(),
         )
+        head = ["4. LINE BY LINE", "-" * 60]
         ct = np.asarray(culled.get("two_theta", []), dtype=float)
         ft = np.asarray(full.get("two_theta", []), dtype=float)
         fi = np.asarray(full.get("intensity", []), dtype=float)
         if len(fp["two_theta"]) == 0 or len(ft) == 0:
-            return ["No reference lines fall inside the measured range."]
+            return head + _prose(
+                "None of this phase's reference lines fall inside the 2θ range "
+                "you measured, so there was nothing to match."
+            )
         imax = float(np.max(fi)) if np.max(fi) > 0 else 1.0
 
-        out = [
-            f"Fingerprint lines of id={entry['meta'].get('id')} "
-            f"(±{tol:.2f}° window)",
-            "-" * 60,
-            "  reference line     search list        all peaks          peak height",
-        ]
+        out = head + _prose(
+            f"Every fingerprint line of record id {entry['meta'].get('id')} and "
+            f"the nearest peak to it. A line counts as found when that peak is "
+            f"within ±{tol:.2f}° ('2θ tol'). Lines marked MISS on the search "
+            "list but found in your full peak list were not missing from the "
+            "pattern — the peak they needed was culled before scoring. "
+            "Offsets are signed: a column of them with the same sign is a "
+            "displaced sample, which 'Auto fit ±' can absorb."
+        )
+        out += ["",
+                "  reference line     on search list   nearest of all peaks"
+                "          its height",
+                "  " + "-" * 76]
         for t, rel in zip(fp["two_theta"], fp["intensity"]):
-            dc = np.abs(ct - t) if len(ct) else np.array([np.inf])
-            jc = int(np.argmin(dc))
-            df = np.abs(ft - t)
-            jf = int(np.argmin(df))
-            cull_hit = "hit " if dc[jc] <= tol else "MISS"
-            full_hit = "hit " if df[jf] <= tol else "MISS"
+            # Signed, so the offset says which side of the reference line the
+            # peak sits on — a column of same-sign offsets is a shifted pattern
+            dc = (ct - t) if len(ct) else np.array([np.inf])
+            jc = int(np.argmin(np.abs(dc)))
+            df = ft - t
+            jf = int(np.argmin(np.abs(df)))
+            cull_hit = "found" if abs(dc[jc]) <= tol else "MISS "
+            full_hit = "found" if abs(df[jf]) <= tol else "MISS "
             out.append(
-                f"  {t:7.3f}° I={rel:5.1f}   {cull_hit} {dc[jc]:+.3f}°     "
-                f"{full_hit} {ft[jf]:7.3f}° ({df[jf]:+.3f}°)   "
-                f"{fi[jf] / imax * 100:6.2f}% of max"
+                f"  {t:7.3f}° I={rel:5.1f}   {cull_hit} {dc[jc]:+.3f}°    "
+                f"{full_hit} at {ft[jf]:7.3f}° ({df[jf]:+.3f}°)   "
+                f"{fi[jf] / imax * 100:5.1f}% of max"
             )
         return out
 
     def _sensitivity(self, records: list, full: dict, culled: dict, rng) -> list:
-        """Score the phase under the settings most likely to be holding it back."""
-        out = ["What changes the outcome", "-" * 60]
+        """
+        Score the phase under the settings most likely to be holding it back.
+
+        Naming the gate that rejected a phase still leaves the user guessing at
+        how far off it was. Rescoring under a handful of loosened settings turns
+        that guess into a decision: either one of these rows lists the phase, or
+        none does and the phase genuinely is not a good match for the pattern.
+        """
         gate = self.fp_min_score.value()
 
         def best_score(peaks, **overrides):
@@ -1156,52 +1415,121 @@ class IdentifyStage(QWidget):
         n_culled = len(culled.get("two_theta", []))
         n_full = len(full.get("two_theta", []))
         variants = [
-            (f"as searched ({n_culled} peaks)", culled, {}),
-            (f"Search peak count 0, all {n_full} peaks", full, {}),
-            ("2θ tol 0.30°", culled, {"tolerance": 0.30}),
-            ("Auto fit ± 0.30°", culled, {"shift_span": 0.30}),
-            ("all peaks + Auto fit ± 0.30°", full, {"shift_span": 0.30}),
+            (f"leave everything as it is ({n_culled} peaks)", None, culled, {}),
+            (f"score on all {n_full} of your peaks",
+             "set 'Search peak count' to 0 in Options",
+             full, {}),
+            (f"widen the 2θ window to 0.30° (now {self.tolerance.value():.2f}°)",
+             "set '2θ tol' to 0.30°",
+             culled, {"tolerance": 0.30}),
+            ("let the reference lines shift by up to 0.30°",
+             "set 'Auto fit ±' to 0.30°",
+             culled, {"shift_span": 0.30}),
+            ("all your peaks and a 0.30° shift together",
+             "set 'Search peak count' to 0 and 'Auto fit ±' to 0.30°",
+             full, {"shift_span": 0.30}),
         ]
         regions = self.session.emphasis_regions
         if regions:
             weights = emphasis.peak_weights(culled.get("two_theta", []), regions)
             if weights is not None:
                 variants.append(
-                    (f"emphasis {emphasis.describe(regions)}", culled,
-                     {"exp_weights": weights})
+                    (f"weight your emphasis on {emphasis.describe(regions)}",
+                     None, culled, {"exp_weights": weights})
                 )
-        for label, peaks, overrides in variants:
-            if peaks is culled and n_culled == n_full and "all" in label:
-                continue
+
+        out = ["2. WHAT WOULD CHANGE THE ANSWER", "-" * 60]
+        out += _prose(
+            "The same phase rescored under settings you can change. 'Min "
+            f"fingerprint' is {gate:.2f}, so any row reaching that score would "
+            "put the phase in the results list."
+        )
+        out.append("")
+        remedy = None
+        passes_as_is = False
+        for label, action, peaks, overrides in variants:
+            if peaks is full and n_culled == n_full:
+                continue  # nothing was culled, so this repeats the row above
             score, found = best_score(peaks, **overrides)
-            verdict = "listed" if score >= gate else "still dropped"
-            out.append(f"  {label:36s} score {score:.3f} ({found} lines) — {verdict}")
-        out.append(f"  (Min fingerprint is currently {gate:.2f})")
+            listed = score >= gate
+            out.append(f"  {label:45s} {score:.3f} ({found} lines)  "
+                       f"{'WOULD BE LISTED' if listed else 'still dropped'}")
+            if not listed:
+                continue
+            if action is None:
+                passes_as_is = True
+            elif remedy is None:
+                remedy = (action, score)
+        out.append("")
+        if passes_as_is:
+            out += _prose(
+                "It already scores well enough on the settings in use, so the "
+                "score is not what kept it out — section 1 names the gate that "
+                "did, and section 5 has the counts behind it."
+            )
+        elif remedy:
+            out += _prose(f"Try this first: {remedy[0]}, then search again. That "
+                          f"change alone takes the score to {remedy[1]:.3f}.")
+        else:
+            out += _prose(
+                "No single change above is enough. Either the peaks this phase "
+                "needs are genuinely absent from the pattern, or this record is "
+                "the wrong polymorph or cell for your sample. Section 4 shows "
+                "which individual lines are missing."
+            )
         return out
 
     def _verdict_text(self, query, trace, listed, best, best_full) -> str:
-        """One sentence naming the gate that decided the outcome."""
+        """
+        The outcome in plain sentences: what happened, and what to do about it.
+
+        This is the only part of the report most users will read, so it has to
+        stand on its own — the gate that decided the outcome, how close the
+        phase came to passing it, and the control that would change it.
+        """
         if listed:
             top = max(listed, key=lambda r: r.get("fingerprint_score", 0))
-            return (f"{top['mineral_name']} IS in the results at score "
-                    f"{top['fingerprint_score']:.3f}.")
+            return (f"{top['mineral_name']} IS in the results, at fingerprint "
+                    f"score {top['fingerprint_score']:.3f}. Nothing rejected it — "
+                    "if you cannot see it, sort the list by score or scroll "
+                    "further down it.")
 
-        verdict = trace.verdict(query)
-        why = search_debug.GATES.get(verdict["gate"], "dropped") if verdict else None
-        gained = None
+        record = trace.verdict(query)
+        gate = record["gate"] if record else None
+        reason = search_debug.GATE_REASONS.get(gate)
+        named = query[:1].upper() + query[1:]
+        parts = []
+        if reason:
+            parts.append(reason.format(phase=named))
+        else:
+            parts.append(f"No record of {named} ever reached scoring: nothing "
+                         "named it entered the candidate pool, so none of the "
+                         "match thresholds is responsible.")
+
+        if gate == "min_score":
+            score = record.get("score")
+            if score is None and best:
+                score = best["info"]["score"]
+            if score is not None:
+                parts.append(f"Its best record scored {score:.3f} where "
+                             f"{self.fp_min_score.value():.2f} was needed.")
+
         if best and best_full:
             delta = best_full["info"]["score"] - best["info"]["score"]
             if delta > 0.05 and best_full["info"]["score"] >= self.fp_min_score.value():
-                gained = (
-                    f"On the full peak list it scores {best_full['info']['score']:.3f} "
-                    f"({best_full['info']['n_found']}/"
-                    f"{best_full['info']['n_expected']} lines), so the peaks it needs "
-                    "are in the pattern but were removed by 'Search peak count'."
+                parts.append(
+                    f"Against your full peak list it scores "
+                    f"{best_full['info']['score']:.3f} "
+                    f"({best_full['info']['n_found']} of "
+                    f"{best_full['info']['n_expected']} lines found), so the "
+                    "peaks it needs are in the pattern — 'Search peak count' "
+                    "discarded them before scoring."
                 )
-        head = f"{query} was {why}." if why else (
-            f"{query} never reached scoring — no record of it entered the candidate pool."
-        )
-        return head if not gained else f"{head} {gained}"
+
+        fix = search_debug.GATE_FIXES.get(gate)
+        if fix:
+            parts.append(fix)
+        return " ".join(parts)
 
     # --- search ---
 
@@ -1531,7 +1859,7 @@ class IdentifyStage(QWidget):
             f"and {agree} of the top {len(fitted)} agree."
         )
         if agree >= 3:
-            note += " Fit to Row on a phase you trust, then set Auto fit to 0 to lock it in."
+            note += " Fit to Row on a phase you trust to lock that shift in for every phase."
         else:
             note += " Little agreement — treat the fitted shifts as guesses for now."
         return note
@@ -1553,6 +1881,21 @@ class IdentifyStage(QWidget):
         )
 
     def _legacy_search(self, pattern, method: str, peaks_override=None):
+        """
+        The pre-fingerprint search methods, run straight on the UI thread.
+
+        Correlation compares every stored pattern point by point, so these
+        take on the order of a minute over the full database and the window
+        stops responding while they do. The wait cursor is there to say the
+        application is working rather than wedged.
+        """
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            return self._legacy_search_run(pattern, method, peaks_override)
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def _legacy_search_run(self, pattern, method: str, peaks_override=None):
         peaks = peaks_override if peaks_override is not None else self.session.peaks
         peak_data = pattern
         if peaks is not None:
@@ -1577,19 +1920,25 @@ class IdentifyStage(QWidget):
                 pattern, min_correlation=min_c, max_results=max_r,
                 ambient_only=ambient_only,
             )
+        # The peak half wants the peak list, the correlation half wants the
+        # measured profile — handing either one both makes its score meaningless
         if method == "combined":
             return self.search_engine.combined_search(
-                peak_data if peaks is not None else pattern,
+                peak_data,
                 peak_tolerance=ptol,
                 min_correlation=min_c,
                 max_results=max_r,
+                full_pattern=pattern,
+                ambient_only=ambient_only,
             )
         return self.search_engine.ensemble_search(
-            peak_data if peaks is not None else pattern,
+            peak_data,
             methods=["peaks", "correlation", "ultrafast"],
             max_results=max_r,
             peak_tolerance=ptol,
             min_correlation=min_c,
+            full_pattern=pattern,
+            ambient_only=ambient_only,
             fast_search_engine=self.fast_engine,
         )
 

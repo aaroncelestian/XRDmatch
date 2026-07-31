@@ -729,6 +729,30 @@ class LocalCIFDatabase:
         conn.close()
         return None
     
+    def get_mineral_by_amcsd_id(self, amcsd_id) -> Optional[Dict]:
+        """
+        Get mineral by AMCSD id, the identifier that survives a rebuild.
+
+        The stored codes are zero-padded to seven characters, so a bare number
+        has to be padded before it will match.
+        """
+        from utils.cif_repository import normalize_amcsd_id
+
+        padded = normalize_amcsd_id(amcsd_id)
+        if not padded:
+            return None
+
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            'SELECT * FROM minerals WHERE amcsd_id = ? OR amcsd_id = ? LIMIT 1',
+            (padded, padded.lstrip('0') or '0'),
+        )
+        row = cursor.fetchone()
+        result = self._row_to_dict(cursor, row) if row else None
+        conn.close()
+        return result
+
     def bulk_import_amcsd_dif(self, dif_file_path: str, progress_callback=None) -> int:
         """
         Import entire AMCSD bulk DIF file with all minerals

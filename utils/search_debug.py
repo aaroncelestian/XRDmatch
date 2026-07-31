@@ -42,6 +42,72 @@ GATES: Dict[str, str] = {
 }
 
 
+# The same fates as whole sentences, for reporting one phase's outcome. The
+# labels above are written to be read down a column of counts, which makes them
+# unreadable in a sentence: "quartz was strongest line missing".
+GATE_REASONS: Dict[str, str] = {
+    "not_indexed": "{phase} is in the database, but no diffraction pattern has "
+                   "ever been calculated for it, so the search had nothing to "
+                   "compare against your peaks.",
+    "ambient": "{phase} is in the database, but the 'Ambient only' filter set "
+               "it aside before scoring as a high-pressure or high-temperature "
+               "structure.",
+    "screen_coverage": "{phase} reached the first quick screening pass and was "
+                       "dropped there: too few of its lines landed on your "
+                       "peaks to clear 'Screen min coverage'.",
+    "pool_size": "{phase} cleared screening but never made the shortlist that "
+                 "gets scored in full — other candidates screened better and "
+                 "filled 'Pool size' first.",
+    "no_reference": "{phase} was picked for scoring, but its reference pattern "
+                    "could not be loaded from the database.",
+    "no_lines_in_range": "{phase} was scored, but none of its lines above "
+                         "'Min line intensity' fall inside the 2θ range you "
+                         "measured.",
+    "shifted_out": "{phase} was scored, but the '2θ shift' in use moved every "
+                   "one of its lines outside your scan range.",
+    "min_found": "{phase} was scored, and too few of its lines found a peak to "
+                 "satisfy 'Min lines found'.",
+    "min_score": "{phase} was scored against your peaks and came out below "
+                 "'Min fingerprint'.",
+    "require_top": "{phase} was scored, but its strongest line found no peak "
+                   "and 'Require strongest line present' is switched on.",
+    "duplicate_record": "{phase} was found and scored, but another database "
+                        "record of the same mineral scored higher and took its "
+                        "place in the list.",
+    "max_results": "{phase} passed every threshold and was then cut for list "
+                   "length alone: 'Max results' filled up before it.",
+    "kept": "{phase} passed every gate in the search.",
+}
+
+
+# The control to reach for once a gate has been named. A user who has just been
+# told which gate rejected their phase still has to guess what to do about it,
+# and guessing at a dozen interacting thresholds is exactly the problem this
+# module exists to remove.
+GATE_FIXES: Dict[str, str] = {
+    "not_indexed": "No search setting can bring it back — the record needs a "
+                   "pattern calculated for it first.",
+    "ambient": "Uncheck 'Ambient only' if that is really how your sample was "
+               "measured.",
+    "screen_coverage": "Lower 'Screen min coverage' in Options.",
+    "pool_size": "Raise 'Pool size' in Options.",
+    "no_reference": "Try another database record of the same mineral.",
+    "no_lines_in_range": "Lower 'Min line intensity' in Options, or collect a "
+                         "wider 2θ range.",
+    "shifted_out": "Reduce '2θ shift' towards zero.",
+    "min_found": "Lower 'Min lines found' in Options, or widen '2θ tol' so "
+                 "more reference lines reach a peak.",
+    "min_score": "Either lower 'Min fingerprint' or improve the fit: widen "
+                 "'2θ tol', or set 'Auto fit ±' to 0.30° if the pattern is "
+                 "displaced.",
+    "require_top": "Turn that setting off, or check whether peak finding "
+                   "missed the peak it wanted.",
+    "duplicate_record": "Nothing to change — look for that other record in the "
+                        "results instead.",
+    "max_results": "Raise 'Max results' and search again.",
+}
+
+
 def phase_key(name) -> str:
     """Normalized mineral name, matching the dedupe key used when ranking."""
     return str(name or "").strip().lower()
@@ -102,7 +168,7 @@ class SearchTrace:
         for gate, why in GATES.items():
             n = self.gates.get(gate, 0)
             if n:
-                lines.append(f"  {n:6d}  {why}")
+                lines.append(f"    {n:6d}  {why}")
         return lines
 
     def verdict(self, name) -> Optional[dict]:
@@ -115,16 +181,24 @@ class SearchTrace:
         return max(records, key=lambda r: order.index(r["gate"])
                    if r["gate"] in order else -1)
 
-    def report(self, name=None) -> str:
-        lines = ["Search trace", "=" * 60]
-        lines += [f"  {s}" for s in self.stages]
+    def report(self, name=None, heading: str = "SEARCH INTERNALS") -> str:
+        """Raw stage log and per-gate funnel, for checking the summary above."""
+        lines = [heading, "-" * 60,
+                 "  What the search did, stage by stage:"]
+        lines += [f"    {s}" for s in self.stages]
         if self.gates:
-            lines += ["", "Candidate fates:"] + self.gate_summary()
+            total = sum(self.gates.values())
+            lines += ["",
+                      f"  Where all {total:,} candidates considered ended up:"]
+            lines += self.gate_summary()
         for key in sorted(self.followed):
             records = self.followed[key]
             best = self.verdict(key)
-            lines += ["", f"{records[0]['name']} — {len(records)} record(s) seen"]
-            lines.append(f"  furthest: {GATES.get(best['gate'], best['gate'])}")
+            lines += ["",
+                      f"  Database records named {records[0]['name']} that the "
+                      f"search touched: {len(records)}"]
+            lines.append("    furthest any of them got: "
+                         f"{GATES.get(best['gate'], best['gate'])}")
             for r in sorted(records, key=lambda r: -(r.get("score") or 0))[:8]:
                 bits = [f"id={r.get('mineral_id', '?')}"]
                 for field in ("coverage", "score", "n_found", "n_expected"):
@@ -134,9 +208,11 @@ class SearchTrace:
                     shown = f"{value:.3f}" if isinstance(value, float) else value
                     bits.append(f"{field}={shown}")
                 bits.append(GATES.get(r["gate"], r["gate"]))
-                lines.append("    " + "  ".join(bits))
+                lines.append("      " + "  ".join(bits))
         if name and not self.followed.get(phase_key(name)):
-            lines += ["", f"{name}: never reached the search index."]
+            lines += ["",
+                      f"  No record named {name} ever entered the search index, "
+                      "so no gate had a chance to reject it."]
         return "\n".join(lines)
 
 

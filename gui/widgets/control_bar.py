@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import QEvent, QObject, Qt
 from PyQt5.QtWidgets import (
     QDialog, QDialogButtonBox, QFormLayout, QFrame, QHBoxLayout, QLabel,
     QSizePolicy, QVBoxLayout, QWidget,
@@ -18,11 +18,44 @@ from PyQt5.QtWidgets import (
 FIELD_WIDTH = 96
 
 
+class _WheelGuard(QObject):
+    """Swallow wheel events on controls that do not hold keyboard focus.
+
+    Qt lets the wheel change a combo box or spin box the pointer merely passes
+    over. These rows are dense and sit beside scrollable lists, so a scroll
+    aimed elsewhere silently rewrites a search parameter — switching Method
+    away from Fingerprint, for one, which disables Min fingerprint with no
+    action the user remembers taking.
+    """
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Wheel and not obj.hasFocus():
+            event.ignore()
+            return True
+        return False
+
+
+# One filter shared by every guarded control; the module reference keeps it
+# alive, since installEventFilter does not take ownership.
+_wheel_guard = None
+
+
+def no_wheel(widget: QWidget) -> QWidget:
+    """Require focus before the wheel can change this control's value."""
+    global _wheel_guard
+    if _wheel_guard is None:
+        _wheel_guard = _WheelGuard()
+    widget.installEventFilter(_wheel_guard)
+    if widget.focusPolicy() == Qt.WheelFocus:
+        widget.setFocusPolicy(Qt.StrongFocus)
+    return widget
+
+
 def compact(widget: QWidget, width: int = FIELD_WIDTH) -> QWidget:
     """Stop spin boxes and combos from stretching across a wide row."""
     widget.setMaximumWidth(width)
     widget.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-    return widget
+    return no_wheel(widget)
 
 
 def separator() -> QFrame:
@@ -100,6 +133,7 @@ class OptionsDialog(QDialog):
         layout.addWidget(buttons)
 
     def add_row(self, label: str, widget: QWidget):
+        no_wheel(widget)
         if label:
             self.form.addRow(label, widget)
         else:

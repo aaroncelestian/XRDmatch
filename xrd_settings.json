@@ -25,12 +25,12 @@
     "peak_distance": 5
   },
   "display": {
-    "plot_dpi": 150,
-    "line_width": 0.5,
-    "marker_size": 6,
-    "color_scheme": "Light",
-    "show_grid": true,
+    "plot_dpi": 300,
+    "line_width": 1.2,
+    "marker_size": 4,
+    "show_grid": false,
     "show_legend": true,
-    "show_error_bars": true
+    "show_error_bars": false,
+    "color_scheme": "Light"
   }
 }

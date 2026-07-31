@@ -45,6 +45,7 @@ class AnalysisWorkspace(QWidget):
     TAB_BACKGROUND = 0
     TAB_PEAKS = 1
     TAB_PHASES = 2
+    TAB_SHORTLIST = 3
 
     def __init__(self, session, parent=None):
         super().__init__(parent)
@@ -96,6 +97,12 @@ class AnalysisWorkspace(QWidget):
         self.bottom_tabs.addTab(self._build_background_tab(), "Background")
         self.bottom_tabs.addTab(self._build_peaks_tab(), "Peaks")
         self.bottom_tabs.addTab(self._build_phases_tab(), "Phases")
+        self.bottom_tabs.addTab(self._build_shortlist_tab(), "Shortlist")
+        self.bottom_tabs.setTabToolTip(
+            self.TAB_SHORTLIST,
+            "Minerals you have kept, saved between sessions and carried from one "
+            "pattern to the next",
+        )
         self.right_splitter.addWidget(self.bottom_tabs)
 
         self.main_splitter.addWidget(self.right_splitter)
@@ -103,7 +110,7 @@ class AnalysisWorkspace(QWidget):
         self.main_splitter.setStretchFactor(1, 1)
         root.addWidget(self.main_splitter)
 
-        session.pattern_changed.connect(self._on_session_changed)
+        session.pattern_changed.connect(self._on_pattern_loaded)
         session.peaks_changed.connect(self._on_session_changed)
         session.candidates_changed.connect(self._on_session_changed)
         session.matches_changed.connect(self._on_session_changed)
@@ -216,6 +223,12 @@ class AnalysisWorkspace(QWidget):
         layout.addWidget(splitter)
         return tab
 
+    def _build_shortlist_tab(self) -> QWidget:
+        from gui.widgets.shortlist_panel import ShortlistPanel
+
+        self.shortlist_panel = ShortlistPanel(self.session, self)
+        return self.shortlist_panel
+
     def _add_phase_table_actions(self):
         """List-related buttons, placed inside the controls grid."""
         stage = self.identify_stage
@@ -224,6 +237,16 @@ class AnalysisWorkspace(QWidget):
         self.details_btn.setToolTip("Show details for the highlighted phase (or right-click a row)")
         self.details_btn.clicked.connect(self.show_selected_phase_details)
         stage.add_action_widget(self.details_btn)
+
+        self.shortlist_btn = QPushButton("Add to Shortlist")
+        self.shortlist_btn.setToolTip(
+            "Keep the checked phases — or the highlighted one — on the Shortlist "
+            "tab.\n\n"
+            "The shortlist is saved between sessions and survives loading another "
+            "pattern, so a mineral only has to be found once."
+        )
+        self.shortlist_btn.clicked.connect(self.add_selection_to_shortlist)
+        stage.add_action_widget(self.shortlist_btn)
 
         self.clear_unselected_btn = QPushButton("Clear Unselected")
         self.clear_unselected_btn.setToolTip(
@@ -261,6 +284,7 @@ class AnalysisWorkspace(QWidget):
             "peaks": self.TAB_PEAKS,
             "identify": self.TAB_PHASES,
             "phases": self.TAB_PHASES,
+            "shortlist": self.TAB_SHORTLIST,
         }
         idx = mapping.get(key, self.TAB_BACKGROUND)
         self.bottom_tabs.setCurrentIndex(idx)
@@ -270,6 +294,8 @@ class AnalysisWorkspace(QWidget):
             self.process_stage.on_enter()
         elif idx == self.TAB_PHASES:
             self.identify_stage.on_enter()
+        elif idx == self.TAB_SHORTLIST:
+            self.shortlist_panel.reload()
 
     def set_stage(self, key: str):
         """Compatibility shim for older call sites."""
@@ -331,6 +357,19 @@ class AnalysisWorkspace(QWidget):
 
     def _on_session_changed(self):
         self.refresh_plot()
+
+    def _on_pattern_loaded(self):
+        """
+        A different pattern invalidates the candidate list but not the shortlist.
+
+        The session has already dropped candidates, matches, and the selection,
+        so the table has to be emptied to match — otherwise phases found in the
+        previous file stay checked against the new data. The shortlist is then
+        re-applied, which is what carries a curated set of minerals from one
+        pattern to the next.
+        """
+        self.clear_phase_results()
+        self.sync_selected_phases()
 
     def on_theme_changed(self, mode: str):
         apply_plot_style(self.figure, mode, show_grid=display_settings.show_grid())
@@ -982,6 +1021,8 @@ class AnalysisWorkspace(QWidget):
         menu.addAction("Details…", lambda: self.show_phase_details(row))
         menu.addAction("Preview peaks", lambda: self._on_results_row_changed(row))
         menu.addAction("Clear preview", self.clear_preview)
+        menu.addSeparator()
+        menu.addAction("Add to Shortlist", lambda: self.add_row_to_shortlist(row))
         if cb is not None:
             label = "Uncheck" if cb.isChecked() else "Check"
             menu.addSeparator()
@@ -1018,6 +1059,16 @@ class AnalysisWorkspace(QWidget):
             self.set_results_matches(matches, preselect=kept_selected)
             self.set_status("Removed phase")
 
+    def clear_phase_results(self):
+        """Empty the candidate / match table. The shortlist is left alone."""
+        self._candidate_results = []
+        self._results_mode = None
+        self._preview = None
+        self.identify_stage.reset_results()
+        self.results_table.clearContents()
+        self.results_table.setRowCount(0)
+        self.phases_label.setText("Phases — run a search or add a known mineral")
+
     def clear_all_phases(self):
         """Wipe candidates, matches, and selections."""
         if self.results_table.rowCount() == 0 and not self.session.matched_phases:
@@ -1026,23 +1077,18 @@ class AnalysisWorkspace(QWidget):
         if (
             QMessageBox.question(
                 self, "Clear All Minerals",
-                "Remove all minerals from the list, including matched and selected phases?",
+                "Remove all minerals from the list, including matched and selected "
+                "phases?\n\nThe Shortlist tab is not affected.",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
             )
             != QMessageBox.Yes
         ):
             return
 
-        self._candidate_results = []
-        self._results_mode = None
-        self._preview = None
-        self.identify_stage.reset_results()
+        self.clear_phase_results()
         self.session.set_candidates([])
         self.session.set_matched_phases([])
-        self.session.set_selected_phases([])
-        self.results_table.clearContents()
-        self.results_table.setRowCount(0)
-        self.phases_label.setText("Phases — run a search or add a known mineral")
+        self.sync_selected_phases()
         self.identify_stage.on_enter()
         self.set_status("Cleared all minerals")
         self.refresh_plot()
@@ -1096,24 +1142,68 @@ class AnalysisWorkspace(QWidget):
     def _sync_selected_from_table(self):
         if self._results_mode != "matches":
             return
-        selected = []
-        matches = self.session.matched_phases
-        for i in range(self.results_table.rowCount()):
-            cb = self.results_table.cellWidget(i, MATCH_SELECT_COL)
-            if cb and cb.isChecked() and i < len(matches):
-                selected.append(matches[i])
-        self.session.set_selected_phases(selected)
-        self.identify_stage.update_action_states()
-        self.refresh_plot()
+        self.sync_selected_phases()
 
     def _on_candidate_checked(self, *_):
         """Checked candidates count as accepted phases: plot them and enable actions."""
         if self._results_mode != "candidates":
             return
-        accepted = self.identify_stage.accepted_phases()
-        self.session.set_selected_phases(accepted)
+        self.sync_selected_phases()
+
+    def sync_selected_phases(self):
+        """
+        Recompute what is under analysis from every place phases can be checked.
+
+        The results table and the shortlist are two views onto the same
+        question, so the selection is the union of both rather than whichever
+        was clicked last.
+        """
+        self.session.set_selected_phases(self.identify_stage.accepted_phases())
         self.identify_stage.update_action_states()
         self.refresh_plot()
+
+    # --- shortlist ---
+
+    def add_row_to_shortlist(self, row: int):
+        result = self._result_at_row(row)
+        if result is None:
+            return
+        added = self.shortlist_panel.add_result(result)
+        name = result.get("phase", result).get("mineral") or result.get("mineral_name") or "phase"
+        self.set_status(
+            f"Added {name} to the shortlist" if added
+            else f"{name} is already on the shortlist"
+        )
+        self.sync_selected_phases()
+
+    def add_selection_to_shortlist(self):
+        """Shortlist everything checked, falling back to the highlighted row."""
+        results = []
+        if self._results_mode == "candidates":
+            for i, r in enumerate(self._candidate_results):
+                cb = self.results_table.cellWidget(i, CAND_SELECT_COL)
+                if cb is not None and cb.isChecked():
+                    results.append(r)
+        elif self._results_mode == "matches":
+            results = self.get_selected_matches()
+        if not results:
+            current = self.current_result()
+            results = [current] if current is not None else []
+
+        if not results:
+            QMessageBox.information(
+                self, "Nothing to Keep",
+                "Check the phases you want to keep, or click one, then press Keep.",
+            )
+            return
+
+        added = sum(1 for r in results if self.shortlist_panel.add_result(r))
+        self.shortlist_panel.reload()
+        self.sync_selected_phases()
+        self.set_status(
+            f"Shortlisted {added} mineral(s)" if added
+            else "Those minerals are already on the shortlist"
+        )
 
     # --- plotting ---
 

@@ -193,6 +193,13 @@ QTextEdit:focus, QPlainTextEdit:focus {
     border: 1px solid #4ECDC4;
 }
 
+QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, QComboBox:disabled,
+QTextEdit:disabled, QPlainTextEdit:disabled {
+    background-color: #222831;
+    color: #5A6A7A;
+    border-color: #2A313C;
+}
+
 QComboBox::drop-down {
     border: none;
     width: 22px;
