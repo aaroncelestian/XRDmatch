@@ -125,7 +125,11 @@ class PhaseDetailsDialog(QDialog):
                 ("Fingerprint", _fmt(fp.get("score"), ".3f")),
                 ("Lines found", f"{fp.get('n_found', 0)}/{fp.get('n_expected', 0)}"),
                 ("Strongest line", "present" if fp.get("top_found") else "missing"),
+                ("Position quality", _fmt(fp.get("position_quality"), ".2f")),
+                ("Intensity consistency", _fmt(fp.get("intensity_consistency"), ".2f")),
             ])
+            if fp.get("residual_score") is not None and fp.get("residual_score") != fp.get("score"):
+                rows.append(("Residual score", _fmt(fp.get("residual_score"), ".3f")))
             missing = fp.get("missing_strong") or []
             if missing:
                 preview = ", ".join(f"{m:.2f}°" for m in missing[:6])

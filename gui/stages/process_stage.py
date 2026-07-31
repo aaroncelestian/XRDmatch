@@ -14,6 +14,7 @@ from scipy.sparse import diags
 from scipy.sparse.linalg import spsolve
 
 from gui.widgets.control_bar import ControlRow, OptionsDialog
+from utils.kalpha_filter import strip_alpha2_peaks
 
 
 def als_baseline(y, lam=1e5, p=0.01, niter=10):
@@ -159,23 +160,45 @@ class ProcessStage(QWidget):
         row.add_widget(self.clear_peaks_btn)
         row.add_separator()
 
-        self.sensitivity = QComboBox()
-        self.sensitivity.addItems(["High", "Medium", "Low"])
-        self.sensitivity.setCurrentIndex(1)
-        self.sensitivity.setToolTip(
-            "High/Medium/Low sets relative prominence to ~1% / 2.5% / 5% of max intensity"
+        # Noise is the honest detection limit: a percent of the strongest peak
+        # means very different things at 100 counts and at 100,000 counts
+        self.snr_min = QDoubleSpinBox()
+        self.snr_min.setRange(0.0, 20.0)
+        self.snr_min.setDecimals(1)
+        self.snr_min.setSingleStep(0.5)
+        self.snr_min.setValue(3.0)
+        self.snr_min.setSuffix("σ")
+        self.snr_min.setToolTip(
+            "How far a peak must stand above the noise measured next to it. "
+            "3σ is a safe default; drop to 2σ to chase very weak lines, raise to "
+            "5σ to keep only the obvious ones. Set 0 to disable."
         )
-        row.add_field("Sensitivity:", self.sensitivity, 92)
+        row.add_field("Min S/N:", self.snr_min, 84)
 
-        self.min_height = QSpinBox()
-        self.min_height.setRange(1, 100000)
-        self.min_height.setValue(50)
-        row.add_field("Min height:", self.min_height, 88)
+        # Percent of max keeps detection scale-free across normalized and raw counts
+        self.min_height = QDoubleSpinBox()
+        self.min_height.setRange(0.0, 100.0)
+        self.min_height.setDecimals(2)
+        self.min_height.setSingleStep(0.10)
+        self.min_height.setValue(0.10)
+        self.min_height.setSuffix("%")
+        self.min_height.setToolTip(
+            "Extra height floor as a percent of the strongest peak. Left low, the "
+            "S/N test decides; raise it to ignore weak lines you do not care about."
+        )
+        row.add_field("Min height:", self.min_height, 92)
 
-        self.min_prominence = QSpinBox()
-        self.min_prominence.setRange(1, 100000)
-        self.min_prominence.setValue(20)
-        row.add_field("Prominence:", self.min_prominence, 88)
+        self.min_prominence = QDoubleSpinBox()
+        self.min_prominence.setRange(0.0, 100.0)
+        self.min_prominence.setDecimals(2)
+        self.min_prominence.setSingleStep(0.10)
+        self.min_prominence.setValue(0.10)
+        self.min_prominence.setSuffix("%")
+        self.min_prominence.setToolTip(
+            "Extra prominence floor above the local baseline, as a percent of the "
+            "strongest peak. Nothing else raises this."
+        )
+        row.add_field("Prominence:", self.min_prominence, 92)
 
         self.min_sep = QDoubleSpinBox()
         self.min_sep.setRange(0.02, 2.0)
@@ -213,6 +236,22 @@ class ProcessStage(QWidget):
             "Light smoothing before find_peaks to suppress shoulder false positives; "
             "reported intensities still use the unsmoothed pattern"
         )
+
+        self.reject_alpha2 = QCheckBox("Reject Kα2 satellites")
+        self.reject_alpha2.setChecked(True)
+        self.reject_alpha2.setToolTip(
+            "Drop peaks that sit at the Kα2 position of a stronger peak with a "
+            "consistent intensity ratio"
+        )
+
+        self.alpha2_ratio_max = QDoubleSpinBox()
+        self.alpha2_ratio_max.setRange(0.2, 1.0)
+        self.alpha2_ratio_max.setDecimals(2)
+        self.alpha2_ratio_max.setSingleStep(0.05)
+        self.alpha2_ratio_max.setValue(0.75)
+        self.alpha2_ratio_max.setToolTip(
+            "Maximum satellite/parent intensity ratio treated as Kα2 (nominal 0.5)"
+        )
         return panel
 
     def _show_peak_options(self):
@@ -224,6 +263,8 @@ class ProcessStage(QWidget):
             )
             dlg.add_row("Peak min width (pts):", self.min_width)
             dlg.add_row("", self.detect_smooth)
+            dlg.add_row("", self.reject_alpha2)
+            dlg.add_row("Max Kα2/Kα1 ratio:", self.alpha2_ratio_max)
             self._peak_options = dlg
         self._peak_options.show_centered()
 
@@ -233,14 +274,17 @@ class ProcessStage(QWidget):
         return self.peak_status
 
     def on_enter(self):
-        if self.session.has_pattern():
-            self.bg_status.setText("Adjust background, then Apply Processing.")
-            self.peak_status.setText("Apply background/smoothing, then Find Peaks.")
-            if self.session.processed_pattern is None:
-                self.apply_processing(silent=True)
-        else:
+        if not self.session.has_pattern():
             self.bg_status.setText("Load a pattern first.")
             self.peak_status.setText("Load a pattern first.")
+            return
+
+        self.bg_status.setText("Adjust background, then Apply Processing.")
+        if self.session.processed_pattern is None:
+            self.apply_processing(silent=True)
+        # Entering the tab must not overwrite the result of a completed run
+        if not self.session.has_peaks():
+            self.peak_status.setText("Apply background/smoothing, then Find Peaks.")
 
     def apply_processing(self, silent=False):
         raw = self.session.raw_pattern
@@ -316,7 +360,7 @@ class ProcessStage(QWidget):
         min_prominence = self.min_prominence.value()
         min_width = self.min_width.value()
         min_sep = self.min_sep.value()
-        sensitivity = self.sensitivity.currentIndex()
+        snr_min = self.snr_min.value()
 
         detect = intensity.copy()
         if self.detect_smooth.isChecked():
@@ -328,21 +372,36 @@ class ProcessStage(QWidget):
         imax = float(np.max(detect)) if len(detect) else 1.0
         noise = self._estimate_noise(detect)
 
-        rel_frac = (0.01, 0.025, 0.05)[sensitivity]
-        prominence_threshold = max(float(min_prominence), rel_frac * imax, 3.0 * noise)
-        height_threshold = max(float(min_height), 2.0 * noise)
+        prominence_threshold = min_prominence / 100.0 * imax
+        height_threshold = min_height / 100.0 * imax
 
         step = self._median_step(two_theta)
         dist_pts = max(2, int(np.ceil(min_sep / max(step, 1e-6))))
 
-        peaks_idx, _ = find_peaks(
+        # Detect permissively, then apply the user's limits and a local noise
+        # test explicitly, so nothing silently overrides the typed thresholds
+        peaks_idx, props = find_peaks(
             detect,
-            height=height_threshold,
             distance=dist_pts,
-            prominence=prominence_threshold,
+            prominence=max(0.5 * noise, 1e-12),
             width=max(1, min_width),
         )
-        peaks_idx = [int(i) for i in peaks_idx if two_theta[int(i)] >= 3.0]
+        prominences = np.asarray(props.get("prominences", []), dtype=float)
+        local_noise = self._local_noise(detect, dist_pts)
+        keep = []
+        for k, i in enumerate(peaks_idx):
+            i = int(i)
+            if two_theta[i] < 3.0:
+                continue
+            if detect[i] < height_threshold:
+                continue
+            prom = float(prominences[k]) if k < len(prominences) else 0.0
+            if prom < prominence_threshold:
+                continue
+            if snr_min > 0 and prom < snr_min * float(local_noise[i]):
+                continue
+            keep.append(i)
+        peaks_idx = keep
 
         peaks_idx = [
             self._refine_to_local_max(intensity, i, half_window=max(2, dist_pts // 2))
@@ -354,7 +413,8 @@ class ProcessStage(QWidget):
         if not peaks_idx:
             QMessageBox.warning(
                 self, "No Peaks",
-                "No peaks found. Try High sensitivity, lower prominence, or smaller 2θ separation.",
+                "No peaks found. Lower Min height and Prominence, reduce Min local S/N "
+                "in Options, or use a smaller 2θ separation.",
             )
             return
 
@@ -372,14 +432,32 @@ class ProcessStage(QWidget):
             "d_spacing": d_spacing,
             "wavelength": self.session.wavelength,
         }
+
+        alpha2_note = ""
+        if self.reject_alpha2.isChecked():
+            peaks, satellites = strip_alpha2_peaks(
+                peaks, wl, max_intensity_ratio=self.alpha2_ratio_max.value()
+            )
+            if satellites:
+                alpha2_note = f", removed {len(satellites)} Kα2"
+                for s in satellites:
+                    print(
+                        f"   Kα2 satellite at {s['two_theta']:.3f}° "
+                        f"(parent {s['parent_two_theta']:.3f}°, "
+                        f"Δ{s['separation']:.3f}°, I/I₁={s['intensity_ratio']:.2f})"
+                    )
+
+        n_kept = len(peaks["two_theta"])
         self.session.set_peaks(peaks)
+        limit = f"≥{snr_min:.1f}σ local noise" if snr_min > 0 else "no S/N limit"
+        weakest = float(np.min(peaks["intensity"])) / max(imax, 1e-9) * 100 if n_kept else 0.0
         self.peak_status.setText(
-            f"Found {len(peaks_idx)} peaks "
-            f"(sep≥{min_sep:.2f}°, prom≥{prominence_threshold:.0f})."
+            f"Found {n_kept} peaks ({limit}, height≥{min_height:.2f}%, "
+            f"sep≥{min_sep:.2f}°{alpha2_note}). Weakest kept: {weakest:.2f}% of max."
         )
         self.workspace.refresh_plot()
         self.workspace.set_results_peaks(peaks)
-        self.workspace.set_status(f"Found {len(peaks_idx)} peaks")
+        self.workspace.set_status(f"Found {n_kept} peaks")
 
     @staticmethod
     def _median_step(two_theta: np.ndarray) -> float:
@@ -389,14 +467,51 @@ class ProcessStage(QWidget):
 
     @staticmethod
     def _estimate_noise(intensity: np.ndarray) -> float:
+        """
+        Robust point-to-point noise over the whole pattern.
+
+        Differencing removes the baseline and the median shrugs off peaks, so a
+        strong line near the start no longer inflates the estimate and bury the
+        weak lines of a minor phase.
+        """
         y = np.asarray(intensity, dtype=float)
+        y = y[np.isfinite(y)]
         n = len(y)
         if n < 10:
             return float(np.std(y)) if n else 1.0
-        chunk = y[: max(20, min(200, n // 8))]
-        med = np.median(chunk)
-        mad = np.median(np.abs(chunk - med))
-        return float(max(1.4826 * mad, np.std(chunk) * 0.5, 1.0))
+
+        d = np.diff(y)
+        mad = float(np.median(np.abs(d - np.median(d))))
+        sigma = 1.4826 * mad / np.sqrt(2.0)
+        if sigma <= 0:
+            sigma = float(np.std(d)) / np.sqrt(2.0)
+        span = float(np.max(y)) if len(y) else 1.0
+        return float(max(sigma, 1e-4 * max(span, 1.0)))
+
+    @staticmethod
+    def _local_noise(intensity: np.ndarray, peak_pts: int) -> np.ndarray:
+        """
+        Point-to-point noise measured in a window around every channel.
+
+        A single global sigma is set by the noisiest part of the pattern, which
+        is usually the low-angle end; measuring locally lets a weak line in a
+        quiet high-angle region pass on its own merits.
+        """
+        y = np.asarray(intensity, dtype=float)
+        if len(y) < 8:
+            return np.full(len(y), 1e-9)
+
+        # Window a good deal wider than a peak, so peaks stay a minority
+        window = int(np.clip(max(peak_pts * 12, 51), 21, max(21, len(y) // 4)))
+        if window % 2 == 0:
+            window += 1
+
+        steps = np.abs(np.diff(y, prepend=y[0]))
+        med = median_filter(steps, size=window, mode="nearest")
+        # median(|Δ|) = 0.6745 σ_Δ for Gaussian noise, and σ_Δ = √2 σ_point
+        sigma = 1.4826 * med / np.sqrt(2.0)
+        floor = 1e-6 * max(float(np.max(y)), 1.0)
+        return np.maximum(sigma, floor)
 
     @staticmethod
     def _refine_to_local_max(intensity: np.ndarray, idx: int, half_window: int = 3) -> int:

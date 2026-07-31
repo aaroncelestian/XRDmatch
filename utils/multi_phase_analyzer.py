@@ -30,13 +30,19 @@ class MultiPhaseAnalyzer:
                                           residual_threshold: float = 0.05,
                                           fast_search_engine=None,
                                           residual_research: bool = True,
-                                          polish: bool = True) -> Dict:
+                                          polish: bool = True,
+                                          min_proposal_score: float = 0.1,
+                                          min_proposal_correlation: float = 0.05) -> Dict:
         """
         Multi-phase ID using trial joint Le Bail for accept/reject.
 
         Residual correlation is used only to propose the next candidate.
         A candidate is accepted only if trial joint refinement improves Rwp
         enough and the phase scale is significant. Optional final polish refine.
+
+        The proposal score scales with a phase's share of the residue, so minor
+        phases score low; drop `min_proposal_score` to zero when the caller has
+        already vetted the candidates and wants every one trialled.
         """
         exp_two_theta = np.asarray(experimental_data['two_theta'], dtype=float)
         exp_intensity = np.asarray(experimental_data['intensity'], dtype=float)
@@ -83,9 +89,10 @@ class MultiPhaseAnalyzer:
 
             proposal, score, _ = self._find_best_phase_for_residue(
                 exp_two_theta, current_residue, remaining, wavelength,
-                excluded_names=excluded_names
+                excluded_names=excluded_names,
+                min_correlation=min_proposal_correlation,
             )
-            if proposal is None or score < 0.1:
+            if proposal is None or score < min_proposal_score:
                 print(f"No suitable proposal (score={score:.3f}); stopping")
                 break
 
@@ -498,7 +505,8 @@ class MultiPhaseAnalyzer:
                                    current_residue: np.ndarray,
                                    candidate_phases: List[Dict],
                                    wavelength: float,
-                                   excluded_names: Optional[set] = None) -> Tuple[Optional[Dict], float, float]:
+                                   excluded_names: Optional[set] = None,
+                                   min_correlation: float = 0.05) -> Tuple[Optional[Dict], float, float]:
         """
         Find the phase that best explains the current residue.
         Score is residual-weighted: correlation × fraction of residue intensity explained.
@@ -528,7 +536,7 @@ class MultiPhaseAnalyzer:
             correlation, optimal_scaling = self._calculate_residue_correlation(
                 exp_two_theta, current_residue, theoretical_pattern
             )
-            if correlation < 0.05:
+            if correlation < min_correlation:
                 continue
 
             # How much residual intensity would this phase remove (non-negative clamp)

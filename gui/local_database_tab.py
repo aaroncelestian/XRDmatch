@@ -8,9 +8,14 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QLabel, QTableWidget, QTableWidgetItem, QGroupBox,
                              QProgressBar, QTextEdit, QFileDialog, QMessageBox,
                              QSplitter, QLineEdit, QComboBox, QSpinBox, QRadioButton,
-                             QDoubleSpinBox)
+                             QDoubleSpinBox, QMenu, QApplication, QCheckBox)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtGui import QBrush, QColor
 from utils.local_database import LocalCIFDatabase
+from utils.cif_repository import get_cif_repository
+from utils.conditions import (AMBIENT_MAX_PRESSURE_GPA, AMBIENT_MAX_TEMPERATURE_K,
+                              AMBIENT_MIN_TEMPERATURE_K, Conditions)
+from gui.dialogs.cif_dialog import CifViewerDialog
 
 class DatabaseImportThread(QThread):
     """Thread for importing CIF files to local database"""
@@ -157,6 +162,7 @@ class LocalDatabaseTab(QWidget):
     def __init__(self):
         super().__init__()
         self.db_manager = LocalCIFDatabase()
+        self.cif_repo = get_cif_repository()
         self.search_results = []
         self.init_ui()
         self.update_database_stats()
@@ -296,6 +302,17 @@ class LocalDatabaseTab(QWidget):
         options_layout.addStretch()
         layout.addLayout(options_layout)
 
+        self.ambient_only_check = QCheckBox("Ambient conditions only")
+        self.ambient_only_check.setChecked(True)
+        self.ambient_only_check.setToolTip(
+            f"Hide structures measured above {AMBIENT_MAX_PRESSURE_GPA:g} GPa or outside "
+            f"{AMBIENT_MIN_TEMPERATURE_K:.0f}–{AMBIENT_MAX_TEMPERATURE_K:.0f} K.\n"
+            "Their compressed or expanded cells put lines at shifted 2θ, which\n"
+            "produces false matches during phase identification."
+        )
+        self.ambient_only_check.toggled.connect(lambda _: self.perform_search())
+        layout.addWidget(self.ambient_only_check)
+
         return group
 
     def create_results_section(self):
@@ -304,13 +321,17 @@ class LocalDatabaseTab(QWidget):
         layout = QVBoxLayout(group)
 
         self.results_table = QTableWidget()
-        self.results_table.setColumnCount(8)
+        self.results_table.setColumnCount(9)
         self.results_table.setHorizontalHeaderLabels([
-            'Mineral', 'Formula', 'Space Group', 'a (Å)', 'b (Å)', 'c (Å)', 'Authors', 'AMCSD ID'
+            'Mineral', 'Formula', 'Space Group', 'a (Å)', 'b (Å)', 'c (Å)',
+            'Conditions', 'Authors', 'AMCSD ID'
         ])
         self.results_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.results_table.setAlternatingRowColors(True)
         self.results_table.itemSelectionChanged.connect(self.show_mineral_details)
+        self.results_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.results_table.customContextMenuRequested.connect(self.show_results_context_menu)
+        self.results_table.setToolTip("Right-click a row for CIF actions")
         layout.addWidget(self.results_table, 1)
 
         details_layout = QHBoxLayout()
@@ -671,110 +692,285 @@ class LocalDatabaseTab(QWidget):
         
         search_type = self.search_type.currentText()
         max_results = self.max_results.value()
+        ambient_only = self.ambient_only_check.isChecked()
         
         try:
             if search_type == "Mineral Name":
-                results = self.db_manager.search_by_mineral_name(search_term, max_results)
+                results = self.db_manager.search_by_mineral_name(
+                    search_term, max_results, ambient_only=ambient_only)
             elif search_type == "Chemical Formula":
-                results = self.db_manager.search_by_formula(search_term, max_results)
+                results = self.db_manager.search_by_formula(
+                    search_term, max_results, ambient_only=ambient_only)
             elif search_type == "Elements":
                 elements = [e.strip() for e in search_term.split(',')]
-                results = self.db_manager.search_by_elements(elements, exact_match=False, limit=max_results)
+                results = self.db_manager.search_by_elements(
+                    elements, exact_match=False, limit=max_results,
+                    ambient_only=ambient_only)
             elif search_type == "Space Group":
                 # Use formula search for space group (could be improved)
-                results = self.db_manager.search_by_formula(search_term, max_results)
+                results = self.db_manager.search_by_formula(
+                    search_term, max_results, ambient_only=ambient_only)
             else:
                 results = []
             
             self.display_search_results(results)
-            self.status_label.setText(f"Found {len(results)} results for '{search_term}'")
+            status = f"Found {len(results)} results for '{search_term}'"
+            if ambient_only:
+                status += " (ambient conditions only)"
+            self.status_label.setText(status)
             
         except Exception as e:
             QMessageBox.critical(self, "Search Error", f"Error performing search: {e}")
             self.status_label.setText(f"Search error: {e}")
     
+    def _cif_metadata_for(self, mineral):
+        """CIF-derived fields for a result row, or {} when no CIF is available."""
+        if not mineral:
+            return {}
+        return self.cif_repo.get_metadata(mineral.get('amcsd_id')) or {}
+
     def display_search_results(self, results):
         """Display search results in table"""
         self.search_results = results
         self.results_table.setRowCount(len(results))
-        
+
         for i, result in enumerate(results):
-            self.results_table.setItem(i, 0, QTableWidgetItem(result.get('mineral_name', 'Unknown')))
-            self.results_table.setItem(i, 1, QTableWidgetItem(result.get('chemical_formula', 'Unknown')))
-            self.results_table.setItem(i, 2, QTableWidgetItem(result.get('space_group', 'Unknown')))
-            self.results_table.setItem(i, 3, QTableWidgetItem(f"{result.get('cell_a', 0):.3f}" if result.get('cell_a') else 'N/A'))
-            self.results_table.setItem(i, 4, QTableWidgetItem(f"{result.get('cell_b', 0):.3f}" if result.get('cell_b') else 'N/A'))
-            self.results_table.setItem(i, 5, QTableWidgetItem(f"{result.get('cell_c', 0):.3f}" if result.get('cell_c') else 'N/A'))
-            self.results_table.setItem(i, 6, QTableWidgetItem(result.get('authors', 'Unknown')))
-            self.results_table.setItem(i, 7, QTableWidgetItem(result.get('amcsd_id', 'N/A')))
-        
+            # The DIF-built database leaves formula/authors empty; fill from CIF
+            meta = self._cif_metadata_for(result)
+
+            def value(key, fallback='Unknown'):
+                return result.get(key) or meta.get(key) or fallback
+
+            authors = result.get('authors') or ', '.join(meta.get('authors') or [])
+
+            def cell(key):
+                number = result.get(key) or meta.get(key)
+                return f"{number:.3f}" if number else 'N/A'
+
+            self.results_table.setItem(i, 0, QTableWidgetItem(value('mineral_name')))
+            self.results_table.setItem(i, 1, QTableWidgetItem(value('chemical_formula')))
+            self.results_table.setItem(i, 2, QTableWidgetItem(value('space_group')))
+            conditions = Conditions(
+                pressure_gpa=result.get('pressure_gpa', meta.get('pressure_gpa')),
+                temperature_k=result.get('temperature_k', meta.get('temperature_k')),
+            )
+            conditions_item = QTableWidgetItem(conditions.describe() or 'ambient')
+            if not conditions.is_ambient:
+                conditions_item.setForeground(QBrush(QColor('#B3541E')))
+                conditions_item.setToolTip(
+                    "Measured off-ambient: this cell is compressed or expanded, "
+                    "so its lines sit at shifted 2θ"
+                )
+
+            self.results_table.setItem(i, 3, QTableWidgetItem(cell('cell_a')))
+            self.results_table.setItem(i, 4, QTableWidgetItem(cell('cell_b')))
+            self.results_table.setItem(i, 5, QTableWidgetItem(cell('cell_c')))
+            self.results_table.setItem(i, 6, conditions_item)
+            self.results_table.setItem(i, 7, QTableWidgetItem(authors or 'Unknown'))
+            self.results_table.setItem(i, 8, QTableWidgetItem(result.get('amcsd_id', 'N/A')))
+
         self.results_table.resizeColumnsToContents()
+
+    def _selected_mineral(self):
+        """Mineral dict for the current row, or None."""
+        row = self.results_table.currentRow()
+        if row < 0 or row >= len(self.search_results):
+            return None
+        return self.search_results[row]
+
+    def show_results_context_menu(self, position):
+        """Right-click menu for the results table."""
+        mineral = self._selected_mineral()
+        if mineral is None:
+            index = self.results_table.indexAt(position)
+            if not index.isValid():
+                return
+            self.results_table.selectRow(index.row())
+            mineral = self._selected_mineral()
+            if mineral is None:
+                return
+
+        amcsd_id = mineral.get('amcsd_id')
+        has_cif = self.cif_repo.has(amcsd_id)
+
+        menu = QMenu(self)
+
+        view_action = menu.addAction("View CIF…")
+        view_action.setEnabled(has_cif)
+        if not has_cif:
+            view_action.setToolTip(f"No CIF in archive for AMCSD {amcsd_id}")
+
+        copy_cif_action = menu.addAction("Copy CIF to Clipboard")
+        copy_cif_action.setEnabled(has_cif)
+
+        save_cif_action = menu.addAction("Save CIF As…")
+        save_cif_action.setEnabled(has_cif)
+
+        menu.addSeparator()
+        match_action = menu.addAction("Use for Phase Matching")
+        copy_name_action = menu.addAction("Copy Mineral Name")
+
+        chosen = menu.exec_(self.results_table.viewport().mapToGlobal(position))
+        if chosen is None:
+            return
+
+        if chosen == view_action:
+            self.view_cif_content()
+        elif chosen == copy_cif_action:
+            text = self.cif_repo.get_cif_text(amcsd_id)
+            if text:
+                QApplication.clipboard().setText(text)
+                self.status_label.setText(
+                    f"Copied CIF for {mineral.get('mineral_name', 'mineral')}"
+                )
+        elif chosen == save_cif_action:
+            self.save_cif_as(mineral)
+        elif chosen == match_action:
+            self.use_for_matching()
+        elif chosen == copy_name_action:
+            QApplication.clipboard().setText(str(mineral.get('mineral_name', '')))
+
+    def save_cif_as(self, mineral=None):
+        """Write the selected mineral's CIF to a chosen path."""
+        mineral = mineral or self._selected_mineral()
+        if mineral is None:
+            return
+
+        amcsd_id = mineral.get('amcsd_id')
+        text = self.cif_repo.get_cif_text(amcsd_id)
+        if not text:
+            QMessageBox.warning(
+                self, "No CIF",
+                f"No CIF available in the archive for AMCSD ID {amcsd_id}."
+            )
+            return
+
+        suggested = self.cif_repo.source_name(amcsd_id) or f"{amcsd_id}.cif"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save CIF", suggested, "CIF files (*.cif);;All files (*.*)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, 'w', encoding='utf-8') as handle:
+                handle.write(text)
+            self.status_label.setText(f"Saved CIF to {path}")
+        except OSError as exc:
+            QMessageBox.critical(self, "Save Error", str(exc))
+
     
     def show_mineral_details(self):
-        """Show details for selected mineral"""
-        current_row = self.results_table.currentRow()
-        if current_row < 0 or current_row >= len(self.search_results):
+        """Show details for selected mineral, filling gaps from its CIF."""
+        mineral = self._selected_mineral()
+        if mineral is None:
             return
-        
-        mineral = self.search_results[current_row]
-        
-        details = f"""
-Mineral: {mineral.get('mineral_name', 'Unknown')}
-Formula: {mineral.get('chemical_formula', 'Unknown')}
-Space Group: {mineral.get('space_group', 'Unknown')}
-Crystal System: {mineral.get('crystal_system', 'Unknown')}
 
-Unit Cell:
-  a = {mineral.get('cell_a', 'N/A')} Å
-  b = {mineral.get('cell_b', 'N/A')} Å  
-  c = {mineral.get('cell_c', 'N/A')} Å
-  α = {mineral.get('cell_alpha', 'N/A')}°
-  β = {mineral.get('cell_beta', 'N/A')}°
-  γ = {mineral.get('cell_gamma', 'N/A')}°
-  Volume = {mineral.get('cell_volume', 'N/A')} Å³
+        meta = self._cif_metadata_for(mineral)
+        amcsd_id = mineral.get('amcsd_id')
+        has_cif = self.cif_repo.has(amcsd_id)
 
-Publication:
-  Authors: {mineral.get('authors', 'Unknown')}
-  Journal: {mineral.get('journal', 'Unknown')}
-  Year: {mineral.get('year', 'N/A')}
-  DOI: {mineral.get('doi', 'N/A')}
+        def value(key, fallback='Unknown'):
+            return mineral.get(key) or meta.get(key) or fallback
 
-Database:
-  AMCSD ID: {mineral.get('amcsd_id', 'N/A')}
-  Local ID: {mineral.get('id', 'N/A')}
-        """.strip()
-        
-        self.details_text.setText(details)
+        def cell(key):
+            number = mineral.get(key) or meta.get(key)
+            return f"{number:g}" if number else 'N/A'
+
+        authors = mineral.get('authors') or ', '.join(meta.get('authors') or [])
+        volume = mineral.get('cell_volume') or meta.get('cell_volume')
+        density = mineral.get('density') or meta.get('density')
+        system = mineral.get('crystal_system') or meta.get('crystal_system')
+        system_text = f"{system} (from cell metric)" if system and not mineral.get('crystal_system') else (system or 'Unknown')
+
+        journal_bits = [b for b in (
+            meta.get('journal'),
+            f"v{meta['journal_volume']}" if meta.get('journal_volume') else '',
+            f"p{meta['journal_page']}" if meta.get('journal_page') else '',
+            meta.get('year'),
+        ) if b]
+
+        lines = [
+            f"Mineral: {value('mineral_name')}",
+            f"Formula: {value('chemical_formula')}",
+            f"Space Group: {value('space_group')}",
+            f"Crystal System: {system_text}",
+            "",
+            "Unit Cell:",
+            f"  a = {cell('cell_a')} Å   b = {cell('cell_b')} Å   c = {cell('cell_c')} Å",
+            f"  α = {cell('cell_alpha')}°   β = {cell('cell_beta')}°   γ = {cell('cell_gamma')}°",
+            f"  Volume = {f'{volume:g} Å³' if volume else 'N/A'}"
+            f"   Density = {f'{density:g} g/cm³' if density else 'N/A'}",
+            "",
+            "Publication:",
+            f"  Authors: {authors or 'Unknown'}",
+            f"  Journal: {' '.join(journal_bits) if journal_bits else 'Unknown'}",
+        ]
+
+        if meta.get('locality'):
+            lines.append(f"  Locality: {meta['locality']}")
+
+        conditions = Conditions(
+            pressure_gpa=mineral.get('pressure_gpa', meta.get('pressure_gpa')),
+            temperature_k=mineral.get('temperature_k', meta.get('temperature_k')),
+        )
+        lines += [
+            "",
+            "Measurement Conditions:",
+            f"  {conditions.describe() or 'not annotated (assumed ambient)'}",
+        ]
+        if not conditions.is_ambient:
+            lines.append(
+                "  Off-ambient: cell parameters are shifted, so this entry is"
+            )
+            lines.append(
+                "  excluded from matching unless high P/T entries are enabled."
+            )
+        if meta.get('title'):
+            lines.append(f"  Source study: {meta['title']}")
+
+        lines += [
+            "",
+            "Database:",
+            f"  AMCSD ID: {amcsd_id or 'N/A'}   Local ID: {mineral.get('id', 'N/A')}",
+            f"  CIF: {self.cif_repo.source_name(amcsd_id) if has_cif else 'not in archive'}",
+        ]
+
+        self.details_text.setText("\n".join(lines))
         self.use_for_matching_btn.setEnabled(True)
-        self.view_cif_btn.setEnabled(True)
+        self.view_cif_btn.setEnabled(has_cif)
+        self.view_cif_btn.setToolTip(
+            "" if has_cif else f"No CIF in archive for AMCSD {amcsd_id}"
+        )
     
     def use_for_matching(self):
         """Use selected mineral for phase matching"""
-        current_row = self.results_table.currentRow()
-        if current_row < 0 or current_row >= len(self.search_results):
+        mineral = self._selected_mineral()
+        if mineral is None:
             return
-        
-        mineral = self.search_results[current_row]
-        
+
+        meta = self._cif_metadata_for(mineral)
+        authors = mineral.get('authors') or ', '.join(meta.get('authors') or []) or 'Unknown'
+        journal = mineral.get('journal') or meta.get('journal') or 'Unknown'
+
         # Convert to format expected by matching tab
         phase_data = {
             'id': mineral.get('id'),  # Include database ID for pre-calculated patterns
-            'mineral': mineral.get('mineral_name', 'Unknown'),
-            'formula': mineral.get('chemical_formula', 'Unknown'),
-            'space_group': mineral.get('space_group', 'Unknown'),
+            'mineral': mineral.get('mineral_name') or meta.get('mineral_name') or 'Unknown',
+            'formula': mineral.get('chemical_formula') or meta.get('chemical_formula') or 'Unknown',
+            'space_group': mineral.get('space_group') or meta.get('space_group') or 'Unknown',
             'cell_params': {
-                'a': mineral.get('cell_a'),
-                'b': mineral.get('cell_b'),
-                'c': mineral.get('cell_c'),
-                'alpha': mineral.get('cell_alpha'),
-                'beta': mineral.get('cell_beta'),
-                'gamma': mineral.get('cell_gamma')
+                'a': mineral.get('cell_a') or meta.get('cell_a'),
+                'b': mineral.get('cell_b') or meta.get('cell_b'),
+                'c': mineral.get('cell_c') or meta.get('cell_c'),
+                'alpha': mineral.get('cell_alpha') or meta.get('cell_alpha'),
+                'beta': mineral.get('cell_beta') or meta.get('cell_beta'),
+                'gamma': mineral.get('cell_gamma') or meta.get('cell_gamma')
             },
             'amcsd_id': mineral.get('amcsd_id'),
-            'cif_content': mineral.get('cif_content'),
-            'reference': f"{mineral.get('authors', 'Unknown')} - {mineral.get('journal', 'Unknown')}",
-            'authors': mineral.get('authors', 'Unknown'),
-            'journal': mineral.get('journal', 'Unknown'),
+            'cif_content': self.cif_repo.get_cif_text(mineral.get('amcsd_id')),
+            'reference': f"{authors} - {journal}",
+            'authors': authors,
+            'journal': journal,
             'local_db': True  # Mark as from local database
         }
         
@@ -786,19 +982,22 @@ Database:
     
     def view_cif_content(self):
         """View CIF content for selected mineral"""
-        current_row = self.results_table.currentRow()
-        if current_row < 0 or current_row >= len(self.search_results):
+        mineral = self._selected_mineral()
+        if mineral is None:
             return
-        
-        mineral = self.search_results[current_row]
-        cif_content = mineral.get('cif_content', 'No CIF content available')
-        
-        # Create dialog to show CIF content
-        dialog = QMessageBox(self)
-        dialog.setWindowTitle(f"CIF Content - {mineral.get('mineral_name', 'Unknown')}")
-        dialog.setText("CIF file content:")
-        dialog.setDetailedText(cif_content)
-        dialog.exec()
+
+        amcsd_id = mineral.get('amcsd_id')
+        if not self.cif_repo.has(amcsd_id):
+            QMessageBox.information(
+                self, "No CIF",
+                f"No CIF available in the archive for AMCSD ID {amcsd_id}."
+            )
+            return
+
+        dialog = CifViewerDialog(
+            amcsd_id, mineral.get('mineral_name', 'Unknown'), parent=self
+        )
+        dialog.exec_()
     
     def calculate_all_diffraction_patterns(self):
         """Calculate diffraction patterns for all minerals in the database"""

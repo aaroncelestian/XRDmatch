@@ -22,6 +22,11 @@ DEFAULT_N_FINGERPRINT = 10
 # A phase cannot be present if its most intense line is absent
 MISSING_TOP_PENALTY = 0.45
 
+# Matching a handful of lines is weak evidence: in a 30-peak pattern a two- or
+# three-line reference can be satisfied by coincidence, so such candidates are
+# demoted rather than allowed to outrank a well-matched 10-line phase.
+INFORMATIVE_LINES = 5
+
 
 def select_fingerprint_peaks(
     two_theta: Sequence[float],
@@ -67,6 +72,74 @@ def _spearman(a: np.ndarray, b: np.ndarray) -> Optional[float]:
     return float(np.corrcoef(ra, rb)[0, 1])
 
 
+def coincidence_fraction(
+    exp_two_theta: Sequence[float],
+    tolerance: float,
+    exp_range: Optional[tuple] = None,
+    weights: Optional[Sequence[float]] = None,
+) -> float:
+    """
+    Fraction of the measured range that sits within tolerance of some peak.
+
+    This is the chance that an arbitrary reference line lands on a peak by luck.
+    A dense peak list or a wide tolerance can cover most of the pattern, at
+    which point "all its lines are present" says nothing, so scores have to be
+    judged against this baseline.
+    """
+    tt = np.asarray(exp_two_theta, dtype=float)
+    if len(tt) == 0:
+        return 0.0
+    lo, hi = exp_range or (float(np.min(tt)) - tolerance, float(np.max(tt)) + tolerance)
+    span = float(hi - lo)
+    if span <= 0:
+        return 0.0
+
+    w = np.ones(len(tt)) if weights is None else np.asarray(weights, dtype=float)
+    if len(w) != len(tt) or not np.any(w > 0):
+        w = np.ones(len(tt))
+    w = w / float(np.max(w))
+
+    # Highest weight wins where windows overlap, matching build_peak_mask
+    step = max(tolerance / 4.0, 1e-3)
+    grid = np.arange(lo, hi + step, step)
+    mask = build_peak_mask(grid, tt, w, tolerance)
+    return float(np.clip(np.mean(mask), 0.0, 0.95))
+
+
+def _enrichment(presence: float, chance: float) -> float:
+    """Presence rescaled so a chance-level match scores zero."""
+    chance = float(np.clip(chance, 0.0, 0.95))
+    if chance <= 0:
+        return float(np.clip(presence, 0.0, 1.0))
+    return float(np.clip((presence - chance) / (1.0 - chance), 0.0, 1.0))
+
+
+def _intensity_consistency(theo: np.ndarray, exp: np.ndarray) -> float:
+    """
+    How well the observed intensities can support this phase's line pattern.
+
+    In a mixture other phases only ever *add* intensity, so once a scale factor
+    is fitted every reference line needs at least its share of the observed
+    peak. A candidate whose strongest lines land on tiny peaks cannot be
+    present, however well its positions happen to line up.
+    """
+    if len(theo) == 0 or len(theo) != len(exp):
+        return 0.0
+    theo = np.asarray(theo, dtype=float)
+    exp = np.asarray(exp, dtype=float)
+    valid = theo > 0
+    if not np.any(valid):
+        return 0.0
+    theo, exp = theo[valid], exp[valid]
+
+    scale = float(np.median(exp / theo))
+    if scale <= 0:
+        return 0.0
+    required = scale * theo
+    deficit = np.clip((required - exp) / np.maximum(required, 1e-9), 0.0, 1.0)
+    return float(1.0 - np.average(deficit, weights=theo))
+
+
 def fingerprint_score(
     exp_two_theta: Sequence[float],
     exp_intensity: Sequence[float],
@@ -77,6 +150,9 @@ def fingerprint_score(
     n_peaks: int = DEFAULT_N_FINGERPRINT,
     min_rel_intensity: float = DEFAULT_MIN_REL_INTENSITY,
     exp_range: Optional[tuple] = None,
+    exp_weights: Optional[Sequence[float]] = None,
+    chance: Optional[float] = None,
+    chance_weighted: Optional[float] = None,
 ) -> Dict:
     """
     Score a candidate by how many of its own strong lines are present.
@@ -85,12 +161,21 @@ def fingerprint_score(
     mixture are scored on equal footing with the dominant phase. `exp_range`
     should be the measured 2θ range; reference lines outside it are ignored,
     while lines inside it with no matching peak count as missing.
+
+    `exp_weights` (residual search) down-weights peaks already claimed by
+    accepted phases, giving a `residual_score` that rewards candidates which
+    explain what is still unaccounted for.
     """
     exp_tt = np.asarray(exp_two_theta, dtype=float)
     exp_int = np.asarray(exp_intensity, dtype=float)
     empty = {
         "score": 0.0,
         "presence": 0.0,
+        "enrichment": 0.0,
+        "chance_match": 0.0,
+        "residual_score": 0.0,
+        "specificity": 0.0,
+        "intensity_consistency": 0.0,
         "n_expected": 0,
         "n_found": 0,
         "top_found": False,
@@ -101,6 +186,14 @@ def fingerprint_score(
     }
     if len(exp_tt) == 0:
         return empty
+
+    weights = None
+    if exp_weights is not None:
+        weights = np.asarray(exp_weights, dtype=float)
+        if len(weights) != len(exp_tt) or not np.any(weights > 0):
+            weights = None
+        else:
+            weights = weights / float(np.max(weights))
 
     window = exp_range or (float(np.min(exp_tt)) - tolerance, float(np.max(exp_tt)) + tolerance)
     fp = select_fingerprint_peaks(
@@ -120,6 +213,7 @@ def fingerprint_score(
     found_mask = np.zeros(len(fp_tt), dtype=bool)
     offsets = np.zeros(len(fp_tt), dtype=float)
     exp_matched = np.full(len(fp_tt), np.nan)
+    match_weight = np.zeros(len(fp_tt), dtype=float)
     theo_found, exp_found = [], []
 
     for i, tt in enumerate(fp_tt):
@@ -129,37 +223,125 @@ def fingerprint_score(
             found_mask[i] = True
             offsets[i] = float(diffs[j])
             exp_matched[i] = float(exp_tt[j])
+            match_weight[i] = float(weights[j]) if weights is not None else 1.0
             theo_found.append(float(fp_int[i]))
             exp_found.append(float(exp_int[j] / exp_max * 100.0))
 
-    weights = fp_int.astype(float)
-    presence = float(np.sum(weights[found_mask]) / np.sum(weights))
+    line_weights = fp_int.astype(float)
+    total_weight = float(np.sum(line_weights))
+    presence = float(np.sum(line_weights[found_mask]) / total_weight)
+    residual_presence = float(
+        np.sum(line_weights[found_mask] * match_weight[found_mask]) / total_weight
+    )
+
+    if chance is None:
+        chance = coincidence_fraction(exp_tt, tolerance, exp_range)
+    if weights is None:
+        chance_weighted = chance
+    elif chance_weighted is None:
+        chance_weighted = coincidence_fraction(exp_tt, tolerance, exp_range, weights)
+    enrichment = _enrichment(presence, chance)
+    residual_enrichment = _enrichment(residual_presence, chance_weighted)
 
     pos_quality = 0.0
     if np.any(found_mask):
         pos_quality = float(np.mean(1.0 - offsets[found_mask] / max(tolerance, 1e-6)))
 
     agreement = _spearman(np.asarray(theo_found), np.asarray(exp_found))
+    consistency = _intensity_consistency(np.asarray(theo_found), np.asarray(exp_found))
 
-    score = presence * (0.85 + 0.15 * pos_quality)
-    if agreement is not None:
-        # Only nudge the score when there are enough lines to rank meaningfully
-        score *= 0.9 + 0.1 * max(0.0, agreement)
     top_found = bool(found_mask[strongest_idx])
-    if not top_found:
-        score *= MISSING_TOP_PENALTY
+    penalty = 1.0 if top_found else MISSING_TOP_PENALTY
+
+    n_expected = int(len(fp_tt))
+    n_found = int(np.sum(found_mask))
+    specificity = min(1.0, n_expected / INFORMATIVE_LINES) * (
+        0.6 + 0.4 * min(1.0, n_found / INFORMATIVE_LINES)
+    )
+    quality = (
+        (0.75 + 0.25 * pos_quality)
+        * (0.35 + 0.65 * consistency)
+        * specificity
+    )
+
+    score = enrichment * quality * penalty
+    residual_score = residual_enrichment * quality * penalty
 
     return {
         "score": float(np.clip(score, 0.0, 1.0)),
         "presence": presence,
-        "n_expected": int(len(fp_tt)),
-        "n_found": int(np.sum(found_mask)),
+        "enrichment": enrichment,
+        "chance_match": float(chance),
+        "residual_score": float(np.clip(residual_score, 0.0, 1.0)),
+        "specificity": float(specificity),
+        "intensity_consistency": float(consistency),
+        "n_expected": n_expected,
+        "n_found": n_found,
         "top_found": top_found,
         "position_quality": pos_quality,
         "intensity_agreement": float(agreement) if agreement is not None else None,
         "missing_strong": [float(t) for t in fp_tt[~found_mask]],
         "matched_two_theta": [float(t) for t in exp_matched[found_mask]],
     }
+
+
+def build_peak_mask(
+    grid: np.ndarray,
+    peak_two_theta: Sequence[float],
+    weights: Optional[Sequence[float]] = None,
+    tolerance: float = DEFAULT_TOLERANCE,
+) -> np.ndarray:
+    """
+    Indicator over a 2θ grid marking where experimental peaks were observed.
+
+    Values are peak weights (1.0 by default), so a weighted mask can favour
+    peaks that no accepted phase explains yet.
+    """
+    grid = np.asarray(grid, dtype=float)
+    mask = np.zeros(len(grid), dtype=np.float32)
+    tt = np.asarray(peak_two_theta, dtype=float)
+    if len(grid) == 0 or len(tt) == 0:
+        return mask
+
+    w = np.ones(len(tt), dtype=float) if weights is None else np.asarray(weights, dtype=float)
+    if len(w) != len(tt):
+        w = np.ones(len(tt), dtype=float)
+
+    step = float(np.mean(np.diff(grid))) if len(grid) > 1 else 0.02
+    half = max(1, int(np.ceil(tolerance / max(step, 1e-9))))
+    centers = np.searchsorted(grid, tt)
+    for center, weight in zip(centers, w):
+        lo = max(0, int(center) - half)
+        hi = min(len(grid), int(center) + half + 1)
+        if lo < hi:
+            np.maximum(mask[lo:hi], np.float32(weight), out=mask[lo:hi])
+    return mask
+
+
+def line_coverage(
+    pattern_matrix: np.ndarray,
+    grid: np.ndarray,
+    peak_two_theta: Sequence[float],
+    *,
+    weights: Optional[Sequence[float]] = None,
+    tolerance: float = DEFAULT_TOLERANCE,
+    row_sums: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """
+    Fraction of each indexed phase's own intensity that lands on observed peaks.
+
+    One matrix-vector product screens the whole database on peak positions
+    rather than whole-pattern similarity, which is what lets a minor phase in a
+    mixture survive to detailed scoring.
+    """
+    mask = build_peak_mask(grid, peak_two_theta, weights, tolerance)
+    if not np.any(mask):
+        return np.zeros(pattern_matrix.shape[0], dtype=float)
+
+    explained = pattern_matrix @ mask
+    totals = pattern_matrix.sum(axis=1) if row_sums is None else row_sums
+    totals = np.where(totals > 0, totals, np.inf)
+    return np.asarray(explained / totals, dtype=float)
 
 
 def rank_by_fingerprint(
@@ -175,16 +357,27 @@ def rank_by_fingerprint(
     require_top_peak: bool = False,
     max_results: Optional[int] = None,
     exp_range: Optional[tuple] = None,
+    dedupe_by_name: bool = True,
+    exp_weights: Optional[Sequence[float]] = None,
 ) -> List[Dict]:
     """
     Rescore search hits by fingerprint presence and drop weak ones.
 
     `theo_lookup` maps a result dict to its theoretical peaks (or None); the
-    caller owns any database access and caching.
+    caller owns any database access and caching. Databases hold many records
+    per mineral, so by default only the best-scoring record per mineral name is
+    kept — otherwise a dozen quartz entries bury the minor phases.
     """
     exp_tt = exp_peaks.get("two_theta", [])
     exp_int = exp_peaks.get("intensity", [])
     scored: List[Dict] = []
+
+    # Same for every candidate, and the dominant cost otherwise
+    chance = coincidence_fraction(exp_tt, tolerance, exp_range)
+    chance_weighted = (
+        coincidence_fraction(exp_tt, tolerance, exp_range, exp_weights)
+        if exp_weights is not None else chance
+    )
 
     for result in results:
         theo = theo_lookup(result)
@@ -199,17 +392,36 @@ def rank_by_fingerprint(
             n_peaks=n_peaks,
             min_rel_intensity=min_rel_intensity,
             exp_range=exp_range,
+            exp_weights=exp_weights,
+            chance=chance,
+            chance_weighted=chance_weighted,
         )
-        if info["n_found"] < min_found or info["score"] < min_score:
+        # In residual mode rank on newly explained lines, not overall presence
+        rank_score = info["residual_score"] if exp_weights is not None else info["score"]
+        if info["n_found"] < min_found or rank_score < min_score:
             continue
         if require_top_peak and not info["top_found"]:
             continue
         enriched = dict(result)
         enriched["fingerprint"] = info
-        enriched["fingerprint_score"] = info["score"]
+        enriched["fingerprint_score"] = rank_score
         scored.append(enriched)
 
     scored.sort(key=lambda r: r["fingerprint_score"], reverse=True)
+
+    if dedupe_by_name:
+        best: Dict[str, Dict] = {}
+        for result in scored:
+            key = str(result.get("mineral_name", "")).strip().lower()
+            if not key:
+                key = f"__row{len(best)}"
+            if key in best:
+                best[key]["duplicate_records"] = best[key].get("duplicate_records", 0) + 1
+                continue
+            result["duplicate_records"] = 0
+            best[key] = result
+        scored = list(best.values())
+
     if max_results is not None:
         scored = scored[:max_results]
     return scored

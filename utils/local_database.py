@@ -16,6 +16,7 @@ import re
 import signal
 import time
 from utils.cif_parser import CIFParser
+from utils.conditions import ambient_sql_filter
 
 class LocalCIFDatabase:
     """Local database for CIF files with SQLite backend"""
@@ -99,6 +100,11 @@ class LocalCIFDatabase:
         mineral_cols = {row[1] for row in cursor.fetchall()}
         if 'rir' not in mineral_cols:
             cursor.execute('ALTER TABLE minerals ADD COLUMN rir REAL')
+        # Migrate: measurement conditions, NULL meaning "not annotated" (see utils/conditions.py)
+        if 'pressure_gpa' not in mineral_cols:
+            cursor.execute('ALTER TABLE minerals ADD COLUMN pressure_gpa REAL')
+        if 'temperature_k' not in mineral_cols:
+            cursor.execute('ALTER TABLE minerals ADD COLUMN temperature_k REAL')
         
         # Create search indices
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_mineral_name ON minerals (mineral_name)')
@@ -108,6 +114,7 @@ class LocalCIFDatabase:
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_elements ON mineral_elements (element)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_diffraction_mineral ON diffraction_patterns (mineral_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_diffraction_wavelength ON diffraction_patterns (wavelength)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_conditions ON minerals (pressure_gpa, temperature_k)')
         
         conn.commit()
         conn.close()
@@ -541,17 +548,87 @@ class LocalCIFDatabase:
         
         return added_count
     
-    def search_by_mineral_name(self, mineral_name: str, limit: int = 100) -> List[Dict]:
+    def conditions_coverage(self) -> Dict[str, int]:
+        """Count how many rows carry parsed P/T annotations."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        clause, params = ambient_sql_filter()
+        stats = {
+            'total': cursor.execute('SELECT COUNT(*) FROM minerals').fetchone()[0],
+            'with_pressure': cursor.execute(
+                'SELECT COUNT(*) FROM minerals WHERE pressure_gpa IS NOT NULL'
+            ).fetchone()[0],
+            'with_temperature': cursor.execute(
+                'SELECT COUNT(*) FROM minerals WHERE temperature_k IS NOT NULL'
+            ).fetchone()[0],
+            'ambient': cursor.execute(
+                f'SELECT COUNT(*) FROM minerals WHERE {clause}', params
+            ).fetchone()[0],
+        }
+        stats['non_ambient'] = stats['total'] - stats['ambient']
+        conn.close()
+        return stats
+
+    def populate_conditions(self, progress_callback=None) -> Dict[str, int]:
+        """Fill pressure_gpa/temperature_k from the CIF archive's title annotations.
+
+        Cheap enough to re-run at will (a few seconds for the whole archive), so
+        it simply rewrites every row rather than tracking what has been done.
+        """
+        from utils.cif_repository import get_cif_repository
+
+        repo = get_cif_repository()
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        rows = cursor.execute(
+            'SELECT id, amcsd_id FROM minerals ORDER BY id'
+        ).fetchall()
+
+        updates = []
+        missing = 0
+        for index, (mineral_id, amcsd_id) in enumerate(rows):
+            meta = repo.get_metadata(amcsd_id) if amcsd_id else None
+            if meta is None:
+                missing += 1
+                continue
+            updates.append(
+                (meta.get('pressure_gpa'), meta.get('temperature_k'), mineral_id)
+            )
+            if progress_callback and index % 500 == 0:
+                progress_callback(index, len(rows))
+
+        cursor.executemany(
+            'UPDATE minerals SET pressure_gpa = ?, temperature_k = ? WHERE id = ?',
+            updates,
+        )
+        conn.commit()
+        conn.close()
+
+        stats = self.conditions_coverage()
+        stats['updated'] = len(updates)
+        stats['no_cif'] = missing
+        return stats
+
+    def search_by_mineral_name(self, mineral_name: str, limit: int = 100,
+                               ambient_only: bool = False) -> List[Dict]:
         """Search minerals by name"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        cursor.execute('''
+        where = ['mineral_name LIKE ?']
+        params: List = [f'%{mineral_name}%']
+        if ambient_only:
+            clause, clause_params = ambient_sql_filter()
+            where.append(clause)
+            params.extend(clause_params)
+        params.append(limit)
+        
+        cursor.execute(f'''
             SELECT * FROM minerals 
-            WHERE mineral_name LIKE ? 
+            WHERE {' AND '.join(where)}
             ORDER BY mineral_name 
             LIMIT ?
-        ''', (f'%{mineral_name}%', limit))
+        ''', params)
         
         results = []
         for row in cursor.fetchall():
@@ -560,10 +637,17 @@ class LocalCIFDatabase:
         conn.close()
         return results
     
-    def search_by_elements(self, elements: List[str], exact_match: bool = False, limit: int = 100) -> List[Dict]:
+    def search_by_elements(self, elements: List[str], exact_match: bool = False, limit: int = 100,
+                           ambient_only: bool = False) -> List[Dict]:
         """Search minerals by chemical elements"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
+        
+        if ambient_only:
+            ambient_clause, ambient_params = ambient_sql_filter('m')
+            ambient_clause = f' AND {ambient_clause}'
+        else:
+            ambient_clause, ambient_params = '', []
         
         if exact_match:
             # Find minerals that contain exactly these elements
@@ -579,20 +663,20 @@ class LocalCIFDatabase:
                         SELECT mineral_id FROM mineral_elements 
                         WHERE element NOT IN ({placeholders})
                     )
-                )
+                ){ambient_clause}
                 ORDER BY m.mineral_name
                 LIMIT ?
-            ''', elements + [len(elements)] + elements + [limit])
+            ''', elements + [len(elements)] + elements + ambient_params + [limit])
         else:
             # Find minerals that contain any of these elements
             placeholders = ','.join(['?' for _ in elements])
             cursor.execute(f'''
                 SELECT DISTINCT m.* FROM minerals m
                 JOIN mineral_elements me ON m.id = me.mineral_id
-                WHERE me.element IN ({placeholders})
+                WHERE me.element IN ({placeholders}){ambient_clause}
                 ORDER BY m.mineral_name
                 LIMIT ?
-            ''', elements + [limit])
+            ''', elements + ambient_params + [limit])
         
         results = []
         for row in cursor.fetchall():
@@ -601,17 +685,26 @@ class LocalCIFDatabase:
         conn.close()
         return results
     
-    def search_by_formula(self, formula: str, limit: int = 100) -> List[Dict]:
+    def search_by_formula(self, formula: str, limit: int = 100,
+                          ambient_only: bool = False) -> List[Dict]:
         """Search minerals by chemical formula"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        cursor.execute('''
+        where = ['chemical_formula LIKE ?']
+        params: List = [f'%{formula}%']
+        if ambient_only:
+            clause, clause_params = ambient_sql_filter()
+            where.append(clause)
+            params.extend(clause_params)
+        params.append(limit)
+        
+        cursor.execute(f'''
             SELECT * FROM minerals 
-            WHERE chemical_formula LIKE ? 
+            WHERE {' AND '.join(where)}
             ORDER BY mineral_name 
             LIMIT ?
-        ''', (f'%{formula}%', limit))
+        ''', params)
         
         results = []
         for row in cursor.fetchall():

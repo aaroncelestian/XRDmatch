@@ -94,3 +94,6 @@ temp/
 
 # Data (databases, AMCSD dumps, indexes)
 data/
+
+# Docs
+docs/

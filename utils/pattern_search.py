@@ -12,6 +12,7 @@ from scipy.stats import pearsonr
 from scipy.interpolate import interp1d
 from utils.local_database import LocalCIFDatabase
 from utils.ima_mineral_database import get_ima_database
+from utils.conditions import ambient_sql_filter
 import time
 
 class PatternSearchEngine:
@@ -29,7 +30,8 @@ class PatternSearchEngine:
                        tolerance: float = 0.2, 
                        min_matches: int = 3,
                        intensity_weight: float = 0.3,
-                       max_results: int = 50) -> List[Dict]:
+                       max_results: int = 50,
+                       ambient_only: bool = True) -> List[Dict]:
         """
         Search for phases based on peak positions and intensities
         
@@ -39,6 +41,8 @@ class PatternSearchEngine:
             min_matches: Minimum number of peak matches required
             intensity_weight: Weight for intensity similarity (0-1, 0=position only)
             max_results: Maximum number of results to return
+            ambient_only: Exclude structures measured at high P/T, whose shifted
+                cells put lines at shifted 2θ
             
         Returns:
             List of matching phases with scores
@@ -62,14 +66,20 @@ class PatternSearchEngine:
         conn = sqlite3.connect(self.local_db.db_path)
         cursor = conn.cursor()
         
-        cursor.execute('''
+        ambient_clause, ambient_params = '', []
+        if ambient_only:
+            clause, ambient_params = ambient_sql_filter('m')
+            ambient_clause = f'AND {clause}'
+        
+        cursor.execute(f'''
             SELECT DISTINCT m.id, m.mineral_name, m.chemical_formula, m.space_group,
                    m.cell_a, m.cell_b, m.cell_c, m.cell_alpha, m.cell_beta, m.cell_gamma,
                    dp.two_theta, dp.intensities, dp.d_spacings
             FROM minerals m
             JOIN diffraction_patterns dp ON m.id = dp.mineral_id
             WHERE dp.wavelength = 1.5406  -- Cu Kα reference patterns
-        ''')
+            {ambient_clause}
+        ''', ambient_params)
         
         results = []
         total_minerals = cursor.rowcount if cursor.rowcount else 0
@@ -147,7 +157,8 @@ class PatternSearchEngine:
     def search_by_correlation(self, experimental_pattern: Dict,
                             min_correlation: float = 0.5,
                             max_results: int = 50,
-                            two_theta_range: Tuple[float, float] = None) -> List[Dict]:
+                            two_theta_range: Tuple[float, float] = None,
+                            ambient_only: bool = True) -> List[Dict]:
         """
         Search for phases using correlation analysis of full diffraction patterns
         
@@ -156,6 +167,7 @@ class PatternSearchEngine:
             min_correlation: Minimum correlation coefficient (0-1)
             max_results: Maximum number of results to return
             two_theta_range: Optional (min, max) 2θ range for comparison
+            ambient_only: Exclude structures measured at high P/T
             
         Returns:
             List of matching phases with correlation scores
@@ -188,14 +200,20 @@ class PatternSearchEngine:
         conn = sqlite3.connect(self.local_db.db_path)
         cursor = conn.cursor()
         
-        cursor.execute('''
+        ambient_clause, ambient_params = '', []
+        if ambient_only:
+            clause, ambient_params = ambient_sql_filter('m')
+            ambient_clause = f'AND {clause}'
+        
+        cursor.execute(f'''
             SELECT DISTINCT m.id, m.mineral_name, m.chemical_formula, m.space_group,
                    m.cell_a, m.cell_b, m.cell_c, m.cell_alpha, m.cell_beta, m.cell_gamma,
                    dp.two_theta, dp.intensities, dp.d_spacings
             FROM minerals m
             JOIN diffraction_patterns dp ON m.id = dp.mineral_id
             WHERE dp.wavelength = 1.5406  -- Cu Kα reference patterns
-        ''')
+            {ambient_clause}
+        ''', ambient_params)
         
         results = []
         processed = 0

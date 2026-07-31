@@ -25,8 +25,12 @@ LEFT_MIN_WIDTH = 220
 LEFT_DEFAULT = 280
 BOTTOM_DEFAULT = 280
 
+PHASE_CONTROLS_MIN = 520
+PHASE_LIST_MIN = 260
+PHASE_LIST_DEFAULT = 380
+
 # Checkbox column indices differ between the two result table layouts
-CAND_SELECT_COL = 5
+CAND_SELECT_COL = 3
 MATCH_SELECT_COL = 0
 
 
@@ -47,6 +51,7 @@ class AnalysisWorkspace(QWidget):
         self._database_dialog = None
         self._details_dialog = None
         self._preview = None  # {"name", "two_theta", "intensity"}
+        self._peak_highlight = None  # {"two_theta", "intensity", "d_spacing"}
 
         self.process_stage = ProcessStage(session, self)
         self.identify_stage = IdentifyStage(session, self)
@@ -141,25 +146,37 @@ class AnalysisWorkspace(QWidget):
         self.peaks_table.setAlternatingRowColors(True)
         self.peaks_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.peaks_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.peaks_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.peaks_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.peaks_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.peaks_table.customContextMenuRequested.connect(self._show_peaks_menu)
+        self.peaks_table.currentCellChanged.connect(self._on_peak_row_changed)
         layout.addWidget(self.peaks_table, 1)
         return tab
 
     def _build_phases_tab(self) -> QWidget:
+        """Controls grid on the left, a compact mineral list on the right."""
         tab = QWidget()
-        layout = QVBoxLayout(tab)
+        layout = QHBoxLayout(tab)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
+        layout.setSpacing(0)
 
-        layout.addWidget(self.identify_stage.control_panel)
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+
+        controls = self.identify_stage.control_panel
+        controls.setMinimumWidth(PHASE_CONTROLS_MIN)
         self._add_phase_table_actions()
+        splitter.addWidget(controls)
 
-        header = QHBoxLayout()
-        header.setContentsMargins(8, 0, 8, 0)
+        list_wrap = QWidget()
+        lw = QVBoxLayout(list_wrap)
+        lw.setContentsMargins(4, 6, 6, 6)
+        lw.setSpacing(3)
         self.phases_label = QLabel("Phases")
         self.phases_label.setObjectName("mutedLabel")
-        header.addWidget(self.phases_label, 1)
-        layout.addLayout(header)
+        self.phases_label.setWordWrap(True)
+        lw.addWidget(self.phases_label)
 
         # Back-compat: results_table / results_label used by older helpers
         self.results_label = self.phases_label
@@ -168,38 +185,48 @@ class AnalysisWorkspace(QWidget):
         self.results_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.results_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.results_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.results_table.verticalHeader().setDefaultSectionSize(20)
         self.results_table.horizontalHeader().setStretchLastSection(True)
         self.results_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.results_table.customContextMenuRequested.connect(self._show_results_menu)
         self.results_table.currentCellChanged.connect(self._on_results_row_changed)
-        layout.addWidget(self.results_table, 1)
+        lw.addWidget(self.results_table, 1)
+        list_wrap.setMinimumWidth(PHASE_LIST_MIN)
+        splitter.addWidget(list_wrap)
+
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        splitter.setSizes([620, PHASE_LIST_DEFAULT])
+        self.phases_splitter = splitter
+        layout.addWidget(splitter)
         return tab
 
     def _add_phase_table_actions(self):
-        """Right-hand buttons on the Phases parameter row."""
-        row = self.identify_stage.actions_row
+        """List-related buttons, placed inside the controls grid."""
+        stage = self.identify_stage
 
         self.details_btn = QPushButton("Details…")
         self.details_btn.setToolTip("Show details for the highlighted phase (or right-click a row)")
         self.details_btn.clicked.connect(self.show_selected_phase_details)
-        row.add_widget(self.details_btn)
+        stage.add_action_widget(self.details_btn)
 
         self.clear_unselected_btn = QPushButton("Clear Unselected")
         self.clear_unselected_btn.setToolTip(
             "Remove unchecked phases from the list; keep only your selections"
         )
         self.clear_unselected_btn.clicked.connect(self.clear_unselected_phases)
-        row.add_widget(self.clear_unselected_btn)
+        stage.add_action_widget(self.clear_unselected_btn)
 
         self.clear_all_btn = QPushButton("Clear All")
         self.clear_all_btn.setToolTip("Remove every mineral from the list and start over")
         self.clear_all_btn.clicked.connect(self.clear_all_phases)
-        row.add_widget(self.clear_all_btn)
+        stage.add_action_widget(self.clear_all_btn)
 
         self.quant_btn = QPushButton("Open Quant…")
         self.quant_btn.setToolTip("Open Le Bail / quantitative analysis window")
         self.quant_btn.clicked.connect(self.open_quant)
-        row.add_widget(self.quant_btn)
+        stage.add_action_widget(self.quant_btn)
+        stage.finish_action_row()
 
     def _apply_default_sizes(self):
         total_w = max(self.main_splitter.width(), 1200)
@@ -322,6 +349,7 @@ class AnalysisWorkspace(QWidget):
                 pattern["wavelength"] = wl
 
             self.session.set_raw_pattern(pattern)
+            self.clear_peaks_table()
             name = os.path.basename(path)
             n = len(pattern["two_theta"])
             t0, t1 = float(pattern["two_theta"][0]), float(pattern["two_theta"][-1])
@@ -341,10 +369,13 @@ class AnalysisWorkspace(QWidget):
 
     # --- results helpers ---
 
-    def set_results_peaks(self, peaks: dict):
+    def set_results_peaks(self, peaks: dict, select_row: Optional[int] = None):
         self.show_bottom_tab("peaks")
         n = len(peaks.get("two_theta", []))
-        self.peaks_label.setText(f"Peaks ({n})")
+        self.peaks_label.setText(
+            f"Peaks ({n}) — click a row to mark it on the plot, right-click to delete"
+        )
+        self.peaks_table.blockSignals(True)
         self.peaks_table.clear()
         self.peaks_table.setColumnCount(3)
         self.peaks_table.setHorizontalHeaderLabels(["2θ (°)", "Intensity", "d (Å)"])
@@ -355,20 +386,141 @@ class AnalysisWorkspace(QWidget):
         for i in range(len(tt)):
             self.peaks_table.setItem(i, 0, QTableWidgetItem(f"{tt[i]:.3f}"))
             self.peaks_table.setItem(i, 1, QTableWidgetItem(f"{inten[i]:.0f}"))
-            self.peaks_table.setItem(i, 2, QTableWidgetItem(f"{d[i]:.4f}"))
+            dv = f"{d[i]:.4f}" if i < len(d) and np.isfinite(d[i]) else "—"
+            self.peaks_table.setItem(i, 2, QTableWidgetItem(dv))
+        self.peaks_table.blockSignals(False)
+
+        self._peak_highlight = None
+        if select_row is not None and n:
+            row = int(np.clip(select_row, 0, n - 1))
+            self.peaks_table.setCurrentCell(row, 0)
+        else:
+            self.refresh_plot()
 
     def clear_peaks_table(self):
         self.peaks_label.setText("Peaks")
         self.peaks_table.clearContents()
         self.peaks_table.setRowCount(0)
+        self._peak_highlight = None
+
+    # --- peak row interaction ---
+
+    def _on_peak_row_changed(self, row: int, _col=0, _prow=-1, _pcol=0):
+        """Mark the highlighted peak on the plot (clicks and arrow keys)."""
+        peaks = self.session.peaks
+        if peaks is None or row < 0:
+            return
+        tt = np.asarray(peaks.get("two_theta", []), dtype=float)
+        if row >= len(tt):
+            return
+        inten = np.asarray(peaks.get("intensity", []), dtype=float)
+        d = peaks.get("d_spacing")
+        self._peak_highlight = {
+            "two_theta": float(tt[row]),
+            "intensity": float(inten[row]) if row < len(inten) else None,
+            "d_spacing": float(d[row]) if d is not None and row < len(d) else None,
+        }
+        self.refresh_plot()
+
+    def clear_peak_highlight(self):
+        self._peak_highlight = None
+        self.refresh_plot()
+
+    def _show_peaks_menu(self, pos):
+        row = self.peaks_table.rowAt(pos.y())
+        if row < 0 or not self.session.has_peaks():
+            return
+        rows = sorted({idx.row() for idx in self.peaks_table.selectionModel().selectedRows()})
+        if row not in rows:
+            self.peaks_table.selectRow(row)
+            rows = [row]
+
+        menu = QMenu(self)
+        label = "Delete peak" if len(rows) == 1 else f"Delete {len(rows)} peaks"
+        menu.addAction(label, lambda: self.delete_peak_rows(rows))
+        menu.addAction("Mark on plot", lambda: self._on_peak_row_changed(row))
+        menu.addAction("Clear marker", self.clear_peak_highlight)
+        menu.exec_(self.peaks_table.viewport().mapToGlobal(pos))
+
+    def delete_peak_rows(self, rows: list):
+        """Remove peaks from the session list and rebuild the table."""
+        peaks = self.session.peaks
+        if peaks is None or not rows:
+            return
+        n = len(np.asarray(peaks.get("two_theta", [])))
+        drop = np.asarray(sorted({int(r) for r in rows if 0 <= int(r) < n}), dtype=int)
+        if len(drop) == 0:
+            return
+
+        if len(drop) >= n:
+            self.session.set_peaks(None)
+            self.clear_peaks_table()
+            self.process_stage.peak_status.setText("All peaks deleted.")
+            self.set_status("Deleted all peaks")
+            self.refresh_plot()
+            return
+
+        keep = np.ones(n, dtype=bool)
+        keep[drop] = False
+        cleaned = dict(peaks)
+        for key, value in peaks.items():
+            arr = np.asarray(value)
+            if arr.ndim == 1 and len(arr) == n:
+                cleaned[key] = arr[keep]
+
+        self.session.set_peaks(cleaned)
+        self.set_results_peaks(cleaned, select_row=int(drop[0]))
+        removed = len(drop)
+        self.process_stage.peak_status.setText(
+            f"Deleted {removed} peak{'s' if removed > 1 else ''}; "
+            f"{len(cleaned['two_theta'])} remain."
+        )
+        self.set_status(f"Deleted {removed} peak{'s' if removed > 1 else ''}")
 
     @staticmethod
-    def _fingerprint_cell(result: dict) -> str:
+    def _lines_cell(result: dict) -> QTableWidgetItem:
+        """Fingerprint line count, e.g. 9/10, flagged when the top line is absent."""
         fp = result.get("fingerprint")
         if not fp:
-            return "—"
-        flag = "" if fp.get("top_found", True) else "  ⚠ no top line"
-        return f"{fp['score']:.2f}  ({fp['n_found']}/{fp['n_expected']}){flag}"
+            item = QTableWidgetItem("—")
+            item.setToolTip("No fingerprint scoring for this hit")
+            return item
+        text = f"{fp['n_found']}/{fp['n_expected']}"
+        if not fp.get("top_found", True):
+            text += " ⚠"
+        item = QTableWidgetItem(text)
+        tip = [
+            f"Fingerprint score {fp['score']:.3f}",
+            f"{fp['n_found']} of {fp['n_expected']} strong lines present",
+            "Strongest line present" if fp.get("top_found") else "Strongest line MISSING",
+        ]
+        if fp.get("intensity_consistency") is not None:
+            tip.append(
+                f"Intensity consistency {fp['intensity_consistency']:.2f} "
+                "(1.0 = every line has enough observed intensity)"
+            )
+        if fp.get("residual_score") is not None and fp["residual_score"] != fp["score"]:
+            tip.append(f"Residual score {fp['residual_score']:.3f} (new peaks only)")
+        missing = fp.get("missing_strong") or []
+        if missing:
+            tip.append("Missing: " + ", ".join(f"{m:.2f}°" for m in missing[:6]))
+        item.setToolTip("\n".join(tip))
+        return item
+
+    @staticmethod
+    def _mineral_item(name: str, result: dict) -> QTableWidgetItem:
+        """Name cell carrying formula and cell data in its tooltip."""
+        item = QTableWidgetItem(str(name))
+        phase = result.get("phase", result)
+        src = {**result, **phase} if isinstance(phase, dict) else result
+        formula = src.get("chemical_formula") or src.get("formula") or "—"
+        tip = [str(name), f"Formula: {formula}", f"Space group: {src.get('space_group') or '—'}"]
+        cell = [src.get("cell_a"), src.get("cell_b"), src.get("cell_c")]
+        if all(v for v in cell):
+            tip.append("a, b, c: " + ", ".join(f"{float(v):.4f}" for v in cell))
+        tip.append("Right-click for full details")
+        item.setToolTip("\n".join(tip))
+        return item
 
     def set_results_candidates(self, results: list):
         self._results_mode = "candidates"
@@ -376,32 +528,30 @@ class AnalysisWorkspace(QWidget):
         self._preview = None
         self.show_bottom_tab("phases")
         self.phases_label.setText(
-            f"Search candidates ({len(results)}) — click a row to preview peaks, "
-            "check the ones to match, right-click for details"
+            f"Candidates ({len(results)}) — click to preview, check to match, "
+            "right-click for details"
         )
         self.results_table.blockSignals(True)
         self.results_table.clear()
-        self.results_table.setColumnCount(6)
-        self.results_table.setHorizontalHeaderLabels(
-            ["Mineral", "Formula", "Space Group", "Score", "Fingerprint", "Select"]
-        )
+        self.results_table.setColumnCount(4)
+        self.results_table.setHorizontalHeaderLabels(["Mineral", "Score", "Lines", "✓"])
         self.results_table.setRowCount(len(results))
         for i, r in enumerate(results):
-            self.results_table.setItem(i, 0, QTableWidgetItem(str(r.get("mineral_name", ""))))
-            self.results_table.setItem(i, 1, QTableWidgetItem(str(r.get("chemical_formula", ""))))
-            self.results_table.setItem(i, 2, QTableWidgetItem(str(r.get("space_group", ""))))
+            self.results_table.setItem(i, 0, self._mineral_item(r.get("mineral_name", ""), r))
             score = r.get(
                 "fingerprint_score",
                 r.get("ensemble_score",
                       r.get("combined_score", r.get("correlation", r.get("match_score", 0)))),
             )
-            self.results_table.setItem(i, 3, QTableWidgetItem(f"{float(score):.3f}"))
-            self.results_table.setItem(i, 4, QTableWidgetItem(self._fingerprint_cell(r)))
+            self.results_table.setItem(i, 1, QTableWidgetItem(f"{float(score):.3f}"))
+            self.results_table.setItem(i, 2, self._lines_cell(r))
             cb = QCheckBox()
             cb.setChecked(False)  # user must opt in
+            cb.stateChanged.connect(self._on_candidate_checked)
             self.results_table.setCellWidget(i, CAND_SELECT_COL, cb)
         self.results_table.blockSignals(False)
-        self.results_table.resizeColumnsToContents()
+        self._size_results_columns(stretch_cols=(0,))
+        self.identify_stage.update_action_states()
 
     def check_candidate_rows(self, names: list):
         """Check rows whose mineral name matches (used for manually added phases)."""
@@ -436,15 +586,13 @@ class AnalysisWorkspace(QWidget):
         self._preview = None
         self.show_bottom_tab("phases")
         self.phases_label.setText(
-            f"Matched phases ({len(results)}) — check to keep and plot, "
-            "click a row to preview, right-click for details"
+            f"Matched ({len(results)}) — check to keep and plot, click to preview, "
+            "right-click for details"
         )
         self.results_table.blockSignals(True)
         self.results_table.clear()
-        self.results_table.setColumnCount(6)
-        self.results_table.setHorizontalHeaderLabels(
-            ["Select", "Phase", "Score", "Fingerprint", "Coverage", "Matches"]
-        )
+        self.results_table.setColumnCount(4)
+        self.results_table.setHorizontalHeaderLabels(["✓", "Phase", "Score", "Lines"])
         self.results_table.setRowCount(len(results))
 
         from utils.residual_search import mineral_key
@@ -461,17 +609,31 @@ class AnalysisWorkspace(QWidget):
             cb.setChecked(bool(preselect_keys) and mineral_key(r) in preselect_keys)
             cb.stateChanged.connect(self._sync_selected_from_table)
             self.results_table.setCellWidget(i, MATCH_SELECT_COL, cb)
-            self.results_table.setItem(i, 1, QTableWidgetItem(str(name)))
-            score = r.get("combined_score", r.get("match_score", 0))
-            self.results_table.setItem(i, 2, QTableWidgetItem(f"{float(score):.3f}"))
-            self.results_table.setItem(i, 3, QTableWidgetItem(self._fingerprint_cell(r)))
+            item = self._mineral_item(name, r)
             cov = r.get("coverage", 0)
-            self.results_table.setItem(i, 4, QTableWidgetItem(f"{float(cov):.2f}" if cov else "—"))
-            nmatch = len(r.get("matches", []))
-            self.results_table.setItem(i, 5, QTableWidgetItem(str(nmatch)))
+            if cov:
+                item.setToolTip(f"{item.toolTip()}\nCoverage: {float(cov):.2f}")
+            self.results_table.setItem(i, 1, item)
+            score = r.get("combined_score", r.get("match_score", 0))
+            score_item = QTableWidgetItem(f"{float(score):.3f}")
+            score_item.setToolTip(
+                f"Matched peaks: {len(r.get('matches', []))}"
+                + (f"\nCoverage: {float(cov):.2f}" if cov else "")
+            )
+            self.results_table.setItem(i, 2, score_item)
+            self.results_table.setItem(i, 3, self._lines_cell(r))
         self.results_table.blockSignals(False)
-        self.results_table.resizeColumnsToContents()
+        self._size_results_columns(stretch_cols=(1,))
         self._sync_selected_from_table()
+
+    def _size_results_columns(self, stretch_cols=(0,)):
+        """Give the name columns the slack instead of the checkbox column."""
+        header = self.results_table.horizontalHeader()
+        header.setStretchLastSection(False)
+        self.results_table.resizeColumnsToContents()
+        for col in range(self.results_table.columnCount()):
+            mode = QHeaderView.Stretch if col in stretch_cols else QHeaderView.ResizeToContents
+            header.setSectionResizeMode(col, mode)
 
     def get_selected_matches(self) -> list:
         if self._results_mode != "matches":
@@ -680,6 +842,16 @@ class AnalysisWorkspace(QWidget):
             if cb and cb.isChecked() and i < len(matches):
                 selected.append(matches[i])
         self.session.set_selected_phases(selected)
+        self.identify_stage.update_action_states()
+        self.refresh_plot()
+
+    def _on_candidate_checked(self, *_):
+        """Checked candidates count as accepted phases: plot them and enable actions."""
+        if self._results_mode != "candidates":
+            return
+        accepted = self.identify_stage.accepted_phases()
+        self.session.set_selected_phases(accepted)
+        self.identify_stage.update_action_states()
         self.refresh_plot()
 
     # --- plotting ---
@@ -698,11 +870,27 @@ class AnalysisWorkspace(QWidget):
             self._plot_load(ax, palette)
 
         self._draw_preview(ax)
+        self._draw_peak_highlight(ax)
         if ax.get_legend_handles_labels()[0]:
             ax.legend(loc="upper right", fontsize=8)
 
         apply_plot_style(self.figure, mode)
         self.canvas.draw_idle()
+
+    def _draw_peak_highlight(self, ax):
+        """Mark the peak selected in the Peaks table."""
+        if not self._peak_highlight:
+            return
+        tt = self._peak_highlight["two_theta"]
+        xlim = ax.get_xlim()
+        if not (xlim[0] <= tt <= xlim[1]):
+            return
+        d = self._peak_highlight.get("d_spacing")
+        label = f"Selected peak {tt:.3f}°"
+        if d is not None and np.isfinite(d):
+            label += f"  (d = {d:.4f} Å)"
+        ax.axvline(tt, color="#d81b60", lw=1.2, ls="--", alpha=0.9, label=label, zorder=6)
+        ax.set_xlim(xlim)
 
     def _draw_preview(self, ax):
         """Overlay the highlighted candidate's reference lines."""
@@ -715,10 +903,17 @@ class AnalysisWorkspace(QWidget):
         top = ax.get_ylim()[1] or 1.0
         imax = float(np.max(inten)) if len(inten) and np.max(inten) > 0 else 1.0
         heights = inten / imax * top * 0.75
+
+        # Reference lines often run past the measured range; keep the view fixed
+        xlim = ax.get_xlim()
+        inside = (tt >= xlim[0]) & (tt <= xlim[1])
+        if not np.any(inside):
+            return
         ax.vlines(
-            tt, 0, heights, colors="#e0a300", lw=1.4, alpha=0.9, ls="-",
+            tt[inside], 0, heights[inside], colors="#e0a300", lw=1.4, alpha=0.9,
             label=f"Preview: {self._preview['name']}", zorder=5,
         )
+        ax.set_xlim(xlim)
 
     def _plot_load(self, ax, palette):
         pattern = self.session.raw_pattern
@@ -778,6 +973,8 @@ class AnalysisWorkspace(QWidget):
             ax.set_title("Identify")
             return
         inten = np.asarray(pattern["intensity"], dtype=float)
+        two_theta = np.asarray(pattern["two_theta"], dtype=float)
+        data_range = (float(np.min(two_theta)), float(np.max(two_theta))) if len(two_theta) else None
         max_i = np.max(inten) if len(inten) else 1.0
         norm = (inten / max_i * 100.0) if max_i > 0 else inten
         if self._visible("processed"):
@@ -835,3 +1032,6 @@ class AnalysisWorkspace(QWidget):
         ax.set_ylabel("Normalized Intensity")
         ax.set_title("Phase Identification")
         ax.set_ylim(0, 110)
+        # Reference lines run past the measurement; keep the view on the data
+        if data_range is not None:
+            ax.set_xlim(*data_range)
