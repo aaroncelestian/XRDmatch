@@ -1,18 +1,19 @@
-"""Process stage — background subtraction and peak finding (split panels)."""
+"""Process stage — background subtraction and peak finding (wide control bars)."""
 
 from __future__ import annotations
 
 import numpy as np
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
-    QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QHBoxLayout,
-    QLabel, QMessageBox, QPushButton, QScrollArea, QSizePolicy, QSlider,
-    QSpinBox, QToolBox, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QDoubleSpinBox, QHBoxLayout, QLabel, QMessageBox,
+    QPushButton, QSlider, QSpinBox, QVBoxLayout, QWidget,
 )
 from scipy.ndimage import median_filter, uniform_filter1d
 from scipy.signal import find_peaks
 from scipy.sparse import diags
 from scipy.sparse.linalg import spsolve
+
+from gui.widgets.control_bar import ControlRow, OptionsDialog
 
 
 def als_baseline(y, lam=1e5, p=0.01, niter=10):
@@ -32,131 +33,151 @@ def als_baseline(y, lam=1e5, p=0.01, niter=10):
         return np.zeros_like(y)
 
 
-def _compact_field(widget, max_width: int = 140):
-    widget.setMaximumWidth(max_width)
-    widget.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
-    return widget
-
-
-def _compact_form(form: QFormLayout):
-    form.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
-    form.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
-    form.setLabelAlignment(Qt.AlignLeft)
-
-
-def _wrap_scroll(content: QWidget) -> QScrollArea:
-    scroll = QScrollArea()
-    scroll.setWidgetResizable(True)
-    scroll.setFrameShape(QScrollArea.NoFrame)
-    scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-    scroll.setWidget(content)
-    return scroll
-
-
 class ProcessStage(QWidget):
-    """Coordinator for background + peak finding; UI lives in split panels."""
+    """Coordinator for background + peak finding; UI lives in two wide panels."""
 
     def __init__(self, session, workspace, parent=None):
         super().__init__(parent)
         self.session = session
         self.workspace = workspace
         self._background = None
+        self._bg_options = None
+        self._peak_options = None
+
         self.background_panel = self._build_background_panel()
         self.peaks_panel = self._build_peaks_panel()
-        # Keep a trivial layout so the QWidget is valid if ever shown alone
+
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        outer.addWidget(QLabel("Process controls live in Background / Peaks tabs."))
+
+    # --- background panel ---
 
     def _build_background_panel(self) -> QWidget:
-        content = QWidget()
-        layout = QVBoxLayout(content)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(8)
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
 
-        self.enable_bg = QCheckBox("Background subtraction (ALS)")
-        self.enable_bg.setChecked(True)
-        layout.addWidget(self.enable_bg)
-
-        bg_form = QFormLayout()
-        _compact_form(bg_form)
-        self.lambda_slider = QSlider(Qt.Horizontal)
-        self.lambda_slider.setRange(2, 8)
-        self.lambda_slider.setValue(5)
-        self.lambda_slider.setMaximumWidth(220)
-        self.lambda_label = QLabel("1e5")
-        self.lambda_slider.valueChanged.connect(
-            lambda v: self.lambda_label.setText(f"1e{v}")
-        )
-        lam_row = QHBoxLayout()
-        lam_row.addWidget(self.lambda_slider)
-        lam_row.addWidget(self.lambda_label)
-        lam_row.addStretch()
-        bg_form.addRow("Smoothness λ:", lam_row)
-
-        self.p_spin = _compact_field(QDoubleSpinBox())
-        self.p_spin.setRange(0.001, 0.1)
-        self.p_spin.setDecimals(3)
-        self.p_spin.setSingleStep(0.001)
-        self.p_spin.setValue(0.01)
-        bg_form.addRow("Asymmetry p:", self.p_spin)
-
-        self.iterations = _compact_field(QSpinBox())
-        self.iterations.setRange(5, 50)
-        self.iterations.setValue(10)
-        bg_form.addRow("ALS iterations:", self.iterations)
-
-        self.enable_smooth = QCheckBox("Smoothing")
-        bg_form.addRow(self.enable_smooth)
-        self.smooth_window = _compact_field(QSpinBox())
-        self.smooth_window.setRange(3, 21)
-        self.smooth_window.setSingleStep(2)
-        self.smooth_window.setValue(5)
-        bg_form.addRow("Smooth window:", self.smooth_window)
-
-        self.enable_noise = QCheckBox("Median noise reduction")
-        bg_form.addRow(self.enable_noise)
-
-        self.displacement = _compact_field(QDoubleSpinBox(), 130)
-        self.displacement.setRange(-2.0, 2.0)
-        self.displacement.setDecimals(4)
-        self.displacement.setSingleStep(0.001)
-        self.displacement.setValue(0.0)
-        bg_form.addRow("2θ offset (°):", self.displacement)
-        layout.addLayout(bg_form)
-
+        row = ControlRow()
         self.apply_btn = QPushButton("Apply Processing")
         self.apply_btn.setObjectName("primaryButton")
         self.apply_btn.setToolTip("Apply background subtraction and smoothing")
         self.apply_btn.clicked.connect(self.apply_processing)
-        layout.addWidget(self.apply_btn)
+        row.add_widget(self.apply_btn)
+        row.add_separator()
+
+        self.enable_bg = QCheckBox("ALS background")
+        self.enable_bg.setChecked(True)
+        row.add_widget(self.enable_bg)
+
+        self.lambda_slider = QSlider(Qt.Horizontal)
+        self.lambda_slider.setRange(2, 8)
+        self.lambda_slider.setValue(5)
+        self.lambda_label = QLabel("1e5")
+        self.lambda_slider.valueChanged.connect(
+            lambda v: self.lambda_label.setText(f"1e{v}")
+        )
+        row.add_field("Smoothness λ:", self.lambda_slider, 120)
+        row.add_widget(self.lambda_label)
+
+        self.p_spin = QDoubleSpinBox()
+        self.p_spin.setRange(0.001, 0.1)
+        self.p_spin.setDecimals(3)
+        self.p_spin.setSingleStep(0.001)
+        self.p_spin.setValue(0.01)
+        row.add_field("Asymmetry p:", self.p_spin, 84)
+
+        self.displacement = QDoubleSpinBox()
+        self.displacement.setRange(-2.0, 2.0)
+        self.displacement.setDecimals(4)
+        self.displacement.setSingleStep(0.001)
+        self.displacement.setValue(0.0)
+        self.displacement.setSuffix("°")
+        row.add_field("2θ offset:", self.displacement, 100)
+
+        row.add_separator()
+        options_btn = QPushButton("Options…")
+        options_btn.setToolTip("Smoothing, noise reduction, and ALS iterations")
+        options_btn.clicked.connect(self._show_bg_options)
+        row.add_widget(options_btn)
+        row.add_stretch()
+        layout.addWidget(row)
 
         self.bg_status = QLabel("Load a pattern first.")
         self.bg_status.setObjectName("mutedLabel")
         self.bg_status.setWordWrap(True)
+        self.bg_status.setContentsMargins(8, 0, 8, 4)
         layout.addWidget(self.bg_status)
         layout.addStretch()
-        return _wrap_scroll(content)
+
+        # Advanced widgets live in the popup but are owned by this stage
+        self.iterations = QSpinBox()
+        self.iterations.setRange(5, 50)
+        self.iterations.setValue(10)
+
+        self.enable_smooth = QCheckBox("Smoothing")
+        self.smooth_window = QSpinBox()
+        self.smooth_window.setRange(3, 21)
+        self.smooth_window.setSingleStep(2)
+        self.smooth_window.setValue(5)
+
+        self.enable_noise = QCheckBox("Median noise reduction")
+        return panel
+
+    def _show_bg_options(self):
+        if self._bg_options is None:
+            dlg = OptionsDialog(
+                "Background Options",
+                self.workspace.window(),
+                "Applied the next time you press Apply Processing.",
+            )
+            dlg.add_row("ALS iterations:", self.iterations)
+            dlg.add_row("", self.enable_smooth)
+            dlg.add_row("Smooth window:", self.smooth_window)
+            dlg.add_row("", self.enable_noise)
+            self._bg_options = dlg
+        self._bg_options.show_centered()
+
+    # --- peaks panel ---
 
     def _build_peaks_panel(self) -> QWidget:
-        content = QWidget()
-        layout = QVBoxLayout(content)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(8)
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
 
-        peak_form = QFormLayout()
-        _compact_form(peak_form)
-        self.min_height = _compact_field(QSpinBox())
+        row = ControlRow()
+        self.peaks_btn = QPushButton("Find Peaks")
+        self.peaks_btn.setObjectName("primaryButton")
+        self.peaks_btn.setToolTip("Detect peaks on the processed pattern")
+        self.peaks_btn.clicked.connect(self.find_peaks)
+        row.add_widget(self.peaks_btn)
+
+        self.clear_peaks_btn = QPushButton("Clear Peaks")
+        self.clear_peaks_btn.setToolTip("Discard the current peak list")
+        self.clear_peaks_btn.clicked.connect(self.clear_peaks)
+        row.add_widget(self.clear_peaks_btn)
+        row.add_separator()
+
+        self.sensitivity = QComboBox()
+        self.sensitivity.addItems(["High", "Medium", "Low"])
+        self.sensitivity.setCurrentIndex(1)
+        self.sensitivity.setToolTip(
+            "High/Medium/Low sets relative prominence to ~1% / 2.5% / 5% of max intensity"
+        )
+        row.add_field("Sensitivity:", self.sensitivity, 92)
+
+        self.min_height = QSpinBox()
         self.min_height.setRange(1, 100000)
         self.min_height.setValue(50)
-        peak_form.addRow("Peak min height:", self.min_height)
+        row.add_field("Min height:", self.min_height, 88)
 
-        self.min_prominence = _compact_field(QSpinBox())
+        self.min_prominence = QSpinBox()
         self.min_prominence.setRange(1, 100000)
         self.min_prominence.setValue(20)
-        peak_form.addRow("Peak prominence:", self.min_prominence)
+        row.add_field("Prominence:", self.min_prominence, 88)
 
-        self.min_sep = _compact_field(QDoubleSpinBox(), 110)
+        self.min_sep = QDoubleSpinBox()
         self.min_sep.setRange(0.02, 2.0)
         self.min_sep.setDecimals(2)
         self.min_sep.setSingleStep(0.02)
@@ -165,27 +186,26 @@ class ProcessStage(QWidget):
         self.min_sep.setToolTip(
             "Minimum 2θ separation between peaks (reduces duplicate picks on one peak)"
         )
-        peak_form.addRow("Min 2θ separation:", self.min_sep)
+        row.add_field("Min 2θ sep:", self.min_sep, 88)
 
-        self.sensitivity = _compact_field(QComboBox(), 110)
-        self.sensitivity.addItems(["High", "Medium", "Low"])
-        self.sensitivity.setCurrentIndex(1)
-        self.sensitivity.setToolTip(
-            "High/Medium/Low sets relative prominence to ~1% / 2% / 5% of max intensity"
-        )
-        peak_form.addRow("Sensitivity:", self.sensitivity)
-        layout.addLayout(peak_form)
+        row.add_separator()
+        options_btn = QPushButton("Options…")
+        options_btn.setToolTip("Peak width and detection smoothing")
+        options_btn.clicked.connect(self._show_peak_options)
+        row.add_widget(options_btn)
+        row.add_stretch()
+        layout.addWidget(row)
 
-        toolbox = QToolBox()
-        adv = QWidget()
-        adv_layout = QFormLayout(adv)
-        _compact_form(adv_layout)
+        self.peak_status = QLabel("Apply background, then find peaks.")
+        self.peak_status.setObjectName("mutedLabel")
+        self.peak_status.setWordWrap(True)
+        self.peak_status.setContentsMargins(8, 0, 8, 4)
+        layout.addWidget(self.peak_status)
 
-        self.min_width = _compact_field(QSpinBox())
+        self.min_width = QSpinBox()
         self.min_width.setRange(1, 50)
         self.min_width.setValue(2)
         self.min_width.setToolTip("Minimum peak width in data points")
-        adv_layout.addRow("Peak min width (pts):", self.min_width)
 
         self.detect_smooth = QCheckBox("Smooth for detection only")
         self.detect_smooth.setChecked(True)
@@ -193,23 +213,19 @@ class ProcessStage(QWidget):
             "Light smoothing before find_peaks to suppress shoulder false positives; "
             "reported intensities still use the unsmoothed pattern"
         )
-        adv_layout.addRow(self.detect_smooth)
+        return panel
 
-        toolbox.addItem(adv, "Advanced")
-        layout.addWidget(toolbox)
-
-        self.peaks_btn = QPushButton("Find Peaks")
-        self.peaks_btn.setObjectName("primaryButton")
-        self.peaks_btn.setToolTip("Detect peaks on the processed pattern")
-        self.peaks_btn.clicked.connect(self.find_peaks)
-        layout.addWidget(self.peaks_btn)
-
-        self.peak_status = QLabel("Apply background, then find peaks.")
-        self.peak_status.setObjectName("mutedLabel")
-        self.peak_status.setWordWrap(True)
-        layout.addWidget(self.peak_status)
-        layout.addStretch()
-        return _wrap_scroll(content)
+    def _show_peak_options(self):
+        if self._peak_options is None:
+            dlg = OptionsDialog(
+                "Peak Detection Options",
+                self.workspace.window(),
+                "Applied the next time you press Find Peaks.",
+            )
+            dlg.add_row("Peak min width (pts):", self.min_width)
+            dlg.add_row("", self.detect_smooth)
+            self._peak_options = dlg
+        self._peak_options.show_centered()
 
     @property
     def status(self):
@@ -271,6 +287,16 @@ class ProcessStage(QWidget):
         if not silent:
             self.bg_status.setText("Processing applied.")
             self.workspace.set_status("Processing applied")
+
+    def clear_peaks(self):
+        if not self.session.has_peaks():
+            self.peak_status.setText("No peaks to clear.")
+            return
+        self.session.set_peaks(None)
+        self.workspace.clear_peaks_table()
+        self.peak_status.setText("Peak list cleared.")
+        self.workspace.set_status("Peaks cleared")
+        self.workspace.refresh_plot()
 
     def find_peaks(self):
         if self.session.processed_pattern is None:

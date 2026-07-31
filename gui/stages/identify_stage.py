@@ -5,15 +5,16 @@ from __future__ import annotations
 import numpy as np
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
-    QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
+    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
     QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox,
-    QProgressBar, QPushButton, QSpinBox, QToolBox, QVBoxLayout, QWidget,
+    QProgressBar, QPushButton, QSpinBox, QVBoxLayout, QWidget,
 )
 
 from utils.fast_pattern_search import FastPatternSearchEngine
 from utils.pattern_search import PatternSearchEngine
 from utils.multi_phase_analyzer import MultiPhaseAnalyzer
 from utils.local_database import LocalCIFDatabase
+from utils.fingerprint_search import fingerprint_score, rank_by_fingerprint
 from utils.residual_search import (
     build_residual_pattern,
     build_residual_peaks,
@@ -24,6 +25,17 @@ from utils.residual_search import (
     mineral_key,
 )
 from gui.matching_tab import PhaseMatchingThread
+from gui.widgets.control_bar import ControlRow, OptionsDialog
+
+
+SEARCH_METHODS = [
+    ("Fingerprint (mixtures)", "fingerprint"),
+    ("Ultra-Fast Correlation", "ultrafast"),
+    ("Peak Match", "peaks"),
+    ("Pearson Correlation", "correlation"),
+    ("Combined", "combined"),
+    ("Ensemble", "ensemble"),
+]
 
 
 class IdentifyStage(QWidget):
@@ -37,79 +49,35 @@ class IdentifyStage(QWidget):
         self.local_db = LocalCIFDatabase()
         self._match_thread = None
         self._search_results = []
-        self._build_ui()
+        self._theo_cache = {}
+        self._options = None
 
-    def _build_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(8)
+        self.control_panel = self._build_controls()
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
 
-        # --- Quick-add known mineral ---
-        add_box = QVBoxLayout()
-        add_label = QLabel("Add known mineral")
-        add_label.setStyleSheet("font-weight: 600;")
-        add_box.addWidget(add_label)
-        add_row = QHBoxLayout()
-        self.mineral_search = QLineEdit()
-        self.mineral_search.setPlaceholderText("e.g. quartz, calcite…")
-        self.mineral_search.returnPressed.connect(self.add_mineral_by_name)
-        add_row.addWidget(self.mineral_search, 1)
-        self.add_mineral_btn = QPushButton("Add")
-        self.add_mineral_btn.setToolTip("Search the local database and add a mineral as a candidate")
-        self.add_mineral_btn.clicked.connect(self.add_mineral_by_name)
-        add_row.addWidget(self.add_mineral_btn)
-        add_box.addLayout(add_row)
-        layout.addLayout(add_box)
+    # --- UI ---
 
-        form = QFormLayout()
-        self.method_combo = QComboBox()
-        self.method_combo.addItems([
-            "Ultra-Fast Correlation",
-            "Peak Match",
-            "Pearson Correlation",
-            "Combined",
-            "Ensemble",
-        ])
-        form.addRow("Search method:", self.method_combo)
+    def _build_controls(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
 
-        self.min_corr = QDoubleSpinBox()
-        self.min_corr.setRange(0.1, 1.0)
-        self.min_corr.setDecimals(2)
-        self.min_corr.setValue(0.3)
-        form.addRow("Min. correlation:", self.min_corr)
-
-        self.max_results = QSpinBox()
-        self.max_results.setRange(10, 200)
-        self.max_results.setValue(50)
-        form.addRow("Max results:", self.max_results)
-
-        self.tolerance = QDoubleSpinBox()
-        self.tolerance.setRange(0.01, 2.0)
-        self.tolerance.setDecimals(2)
-        self.tolerance.setValue(0.20)
-        form.addRow("Match 2θ tol (°):", self.tolerance)
-
-        self.min_score = QDoubleSpinBox()
-        self.min_score.setRange(0.0, 1.0)
-        self.min_score.setDecimals(2)
-        self.min_score.setValue(0.01)
-        form.addRow("Min. match score:", self.min_score)
-        layout.addLayout(form)
-
-        btn_row = QHBoxLayout()
-        self.search_btn = QPushButton("Start Search")
+        actions = ControlRow()
+        self.search_btn = QPushButton("Search")
         self.search_btn.setObjectName("primaryButton")
+        self.search_btn.setToolTip("Search the database for candidate phases")
         self.search_btn.clicked.connect(self.start_search)
-        btn_row.addWidget(self.search_btn)
+        actions.add_widget(self.search_btn)
 
-        self.match_btn = QPushButton("Start Matching")
+        self.match_btn = QPushButton("Match Selected")
         self.match_btn.setObjectName("primaryButton")
+        self.match_btn.setToolTip("Run peak matching on the checked candidates")
         self.match_btn.clicked.connect(self.start_matching)
         self.match_btn.setEnabled(False)
-        btn_row.addWidget(self.match_btn)
-        layout.addLayout(btn_row)
+        actions.add_widget(self.match_btn)
 
-        residual_row = QHBoxLayout()
         self.residual_btn = QPushButton("Search Residual")
         self.residual_btn.setToolTip(
             "Keep selected phases, soft-subtract their contribution, and search again. "
@@ -117,48 +85,150 @@ class IdentifyStage(QWidget):
         )
         self.residual_btn.clicked.connect(self.search_residual)
         self.residual_btn.setEnabled(False)
-        residual_row.addWidget(self.residual_btn)
+        actions.add_widget(self.residual_btn)
 
-        self.multi_btn = QPushButton("Multi-Phase Analysis")
+        self.multi_btn = QPushButton("Multi-Phase")
+        self.multi_btn.setToolTip("Joint Le Bail accept/reject over the selected phases")
         self.multi_btn.clicked.connect(self.start_multi_phase)
         self.multi_btn.setEnabled(False)
-        residual_row.addWidget(self.multi_btn)
-        layout.addLayout(residual_row)
+        actions.add_widget(self.multi_btn)
+        actions.add_separator()
 
+        self.mineral_search = QLineEdit()
+        self.mineral_search.setPlaceholderText("Add known mineral — e.g. quartz")
+        self.mineral_search.setMinimumWidth(180)
+        self.mineral_search.returnPressed.connect(self.add_mineral_by_name)
+        actions.add_widget(self.mineral_search)
+        self.add_mineral_btn = QPushButton("Add")
+        self.add_mineral_btn.setToolTip("Search the local database and add a mineral as a candidate")
+        self.add_mineral_btn.clicked.connect(self.add_mineral_by_name)
+        actions.add_widget(self.add_mineral_btn)
+        actions.add_stretch()
+        layout.addWidget(actions)
+
+        params = ControlRow()
+        self.method_combo = QComboBox()
+        for label, key in SEARCH_METHODS:
+            self.method_combo.addItem(label, key)
+        self.method_combo.setToolTip(
+            "Fingerprint scores each candidate on its own strong lines, so minor "
+            "phases in a mixture are not penalized for unexplained peaks."
+        )
+        self.method_combo.currentIndexChanged.connect(self._on_method_changed)
+        params.add_field("Method:", self.method_combo, 170)
+
+        self.min_corr = QDoubleSpinBox()
+        self.min_corr.setRange(0.01, 1.0)
+        self.min_corr.setDecimals(2)
+        self.min_corr.setSingleStep(0.05)
+        self.min_corr.setValue(0.30)
+        params.add_field("Min corr:", self.min_corr, 74)
+
+        self.fp_min_score = QDoubleSpinBox()
+        self.fp_min_score.setRange(0.0, 1.0)
+        self.fp_min_score.setDecimals(2)
+        self.fp_min_score.setSingleStep(0.05)
+        self.fp_min_score.setValue(0.40)
+        self.fp_min_score.setToolTip(
+            "Minimum fraction of a candidate's strong lines that must be present"
+        )
+        params.add_field("Min fingerprint:", self.fp_min_score, 74)
+
+        self.max_results = QSpinBox()
+        self.max_results.setRange(10, 500)
+        self.max_results.setValue(50)
+        params.add_field("Max results:", self.max_results, 74)
+
+        self.tolerance = QDoubleSpinBox()
+        self.tolerance.setRange(0.01, 2.0)
+        self.tolerance.setDecimals(2)
+        self.tolerance.setValue(0.20)
+        self.tolerance.setSuffix("°")
+        params.add_field("2θ tol:", self.tolerance, 78)
+
+        options_btn = QPushButton("Options…")
+        options_btn.setToolTip("Fingerprint, residual, weighting, and multi-phase settings")
+        options_btn.clicked.connect(self._show_options)
+        params.add_widget(options_btn)
+        params.add_stretch()
+        self.actions_row = params  # workspace appends table actions here
+        layout.addWidget(params)
+
+        status_row = ControlRow(margins=(8, 0, 8, 4))
+        self.status = QLabel("Load a pattern, find peaks, then search.")
+        self.status.setObjectName("mutedLabel")
+        status_row.add_widget(self.status, 1)
         self.progress = QProgressBar()
         self.progress.setVisible(False)
-        layout.addWidget(self.progress)
+        self.progress.setMaximumWidth(180)
+        status_row.add_widget(self.progress)
+        layout.addWidget(status_row)
 
-        self.status = QLabel(
-            "Search the database, select candidates, then match. "
-            "Use Search Residual for additional phases."
+        self._build_option_widgets()
+        self._on_method_changed()
+        return panel
+
+    def _build_option_widgets(self):
+        """Advanced parameters — shown in the Options popup, owned here."""
+        self.fp_n_peaks = QSpinBox()
+        self.fp_n_peaks.setRange(3, 30)
+        self.fp_n_peaks.setValue(10)
+        self.fp_n_peaks.setToolTip("How many of the candidate's strongest lines define its fingerprint")
+
+        self.fp_min_rel = QDoubleSpinBox()
+        self.fp_min_rel.setRange(0.5, 50.0)
+        self.fp_min_rel.setDecimals(1)
+        self.fp_min_rel.setValue(5.0)
+        self.fp_min_rel.setSuffix("%")
+        self.fp_min_rel.setToolTip("Ignore reference lines weaker than this fraction of the phase maximum")
+
+        self.fp_min_found = QSpinBox()
+        self.fp_min_found.setRange(1, 20)
+        self.fp_min_found.setValue(3)
+        self.fp_min_found.setToolTip("Minimum number of fingerprint lines that must be found")
+
+        self.fp_require_top = QCheckBox("Require strongest line present")
+        self.fp_require_top.setChecked(False)
+        self.fp_require_top.setToolTip(
+            "Reject a candidate outright when its most intense line is missing"
         )
-        self.status.setObjectName("mutedLabel")
-        self.status.setWordWrap(True)
-        layout.addWidget(self.status)
 
-        toolbox = QToolBox()
-        adv = QWidget()
-        adv_form = QFormLayout(adv)
+        self.pool_min_corr = QDoubleSpinBox()
+        self.pool_min_corr.setRange(0.01, 1.0)
+        self.pool_min_corr.setDecimals(2)
+        self.pool_min_corr.setSingleStep(0.05)
+        self.pool_min_corr.setValue(0.10)
+        self.pool_min_corr.setToolTip(
+            "Correlation floor for the candidate pool that fingerprint scoring reranks. "
+            "Keep it low so minor phases survive to the rescoring step."
+        )
+
+        self.pool_size = QSpinBox()
+        self.pool_size.setRange(50, 3000)
+        self.pool_size.setSingleStep(50)
+        self.pool_size.setValue(400)
+        self.pool_size.setToolTip("How many candidates to pull before fingerprint rescoring")
+
+        self.min_score = QDoubleSpinBox()
+        self.min_score.setRange(0.0, 1.0)
+        self.min_score.setDecimals(2)
+        self.min_score.setValue(0.01)
 
         self.peak_tol = QDoubleSpinBox()
         self.peak_tol.setRange(0.05, 1.0)
         self.peak_tol.setDecimals(2)
         self.peak_tol.setValue(0.2)
         self.peak_tol.setSuffix("°")
-        adv_form.addRow("Peak tolerance:", self.peak_tol)
 
         self.peak_weight = QDoubleSpinBox()
         self.peak_weight.setRange(0.0, 1.0)
         self.peak_weight.setDecimals(2)
         self.peak_weight.setValue(0.6)
-        adv_form.addRow("Peak weight:", self.peak_weight)
 
         self.corr_weight = QDoubleSpinBox()
         self.corr_weight.setRange(0.0, 1.0)
         self.corr_weight.setDecimals(2)
         self.corr_weight.setValue(0.4)
-        adv_form.addRow("Corr. weight:", self.corr_weight)
 
         self.overlap_keep = QDoubleSpinBox()
         self.overlap_keep.setRange(0.0, 1.0)
@@ -169,7 +239,6 @@ class IdentifyStage(QWidget):
             "Fraction of explained/overlapping intensity kept in the residual "
             "(0 = hard subtract, 1 = no subtract). Prevents discarding shared peaks."
         )
-        adv_form.addRow("Overlap keep:", self.overlap_keep)
 
         self.unmatched_boost = QDoubleSpinBox()
         self.unmatched_boost.setRange(1.0, 3.0)
@@ -179,40 +248,111 @@ class IdentifyStage(QWidget):
         self.unmatched_boost.setToolTip(
             "Intensity multiplier for peaks not explained by selected phases"
         )
-        adv_form.addRow("Unmatched boost:", self.unmatched_boost)
 
         self.mp_max = QSpinBox()
         self.mp_max.setRange(1, 10)
         self.mp_max.setValue(5)
-        adv_form.addRow("Multi-phase max:", self.mp_max)
 
         self.mp_delta = QDoubleSpinBox()
         self.mp_delta.setRange(0.1, 50.0)
         self.mp_delta.setDecimals(1)
         self.mp_delta.setValue(2.0)
         self.mp_delta.setSuffix("%")
-        adv_form.addRow("Min ΔRwp:", self.mp_delta)
 
-        toolbox.addItem(adv, "Advanced")
-        layout.addWidget(toolbox)
-        layout.addStretch()
+    def _show_options(self):
+        if self._options is None:
+            dlg = OptionsDialog("Phase Search Options", self.workspace.window())
+            dlg.add_heading("Fingerprint")
+            dlg.add_row("Fingerprint lines:", self.fp_n_peaks)
+            dlg.add_row("Min line intensity:", self.fp_min_rel)
+            dlg.add_row("Min lines found:", self.fp_min_found)
+            dlg.add_row("", self.fp_require_top)
+            dlg.add_row("Pool min corr:", self.pool_min_corr)
+            dlg.add_row("Pool size:", self.pool_size)
+
+            dlg.add_heading("Matching")
+            dlg.add_row("Min match score:", self.min_score)
+            dlg.add_row("Peak tolerance:", self.peak_tol)
+            dlg.add_row("Peak weight:", self.peak_weight)
+            dlg.add_row("Corr. weight:", self.corr_weight)
+
+            dlg.add_heading("Residual & multi-phase")
+            dlg.add_row("Overlap keep:", self.overlap_keep)
+            dlg.add_row("Unmatched boost:", self.unmatched_boost)
+            dlg.add_row("Multi-phase max:", self.mp_max)
+            dlg.add_row("Min ΔRwp:", self.mp_delta)
+            self._options = dlg
+        self._options.show_centered()
+
+    def _method_key(self) -> str:
+        return self.method_combo.currentData() or "fingerprint"
+
+    def _on_method_changed(self, *_args):
+        is_fp = self._method_key() == "fingerprint"
+        self.fp_min_score.setEnabled(is_fp)
+
+    # --- state ---
+
+    def reset_results(self):
+        self._search_results = []
 
     def on_enter(self):
         can = self.session.has_pattern()
         self.search_btn.setEnabled(can)
-        has_sel = len(self.workspace.get_selected_candidates()) > 0 or len(self.session.search_candidates) > 0
-        self.match_btn.setEnabled(has_sel and self.session.has_peaks())
+        has_candidates = (
+            len(self.workspace.get_selected_candidates()) > 0
+            or len(self.session.search_candidates) > 0
+        )
+        self.match_btn.setEnabled(has_candidates and self.session.has_peaks())
         self.residual_btn.setEnabled(
-            self.session.has_pattern()
-            and (len(self.session.selected_phases) > 0 or len(self.session.matched_phases) > 0)
+            can and (len(self.session.selected_phases) > 0 or len(self.session.matched_phases) > 0)
         )
         self.multi_btn.setEnabled(len(self.session.matched_phases) > 1)
         if not can:
             self.status.setText("Load and process a pattern first.")
         elif not self.session.has_peaks():
-            self.status.setText("Find peaks in the Peaks tab for best matching (search still works).")
+            self.status.setText("Find peaks in the Peaks tab — fingerprint search needs them.")
         else:
-            self.status.setText("Ready to search. Select candidates manually after search.")
+            self.status.setText("Ready to search. Check the candidates you want, then match.")
+
+    def _measured_range(self):
+        """Measured 2θ span — reference lines outside it cannot be expected."""
+        pattern = self.session.active_pattern()
+        if not pattern:
+            return None
+        tt = np.asarray(pattern["two_theta"], dtype=float)
+        if len(tt) == 0:
+            return None
+        return float(np.min(tt)), float(np.max(tt))
+
+    # --- theoretical peak access (shared with preview / details) ---
+
+    def theoretical_peaks_for(self, result: dict):
+        """Reference peaks for a search hit, match result, or phase dict."""
+        if not isinstance(result, dict):
+            return None
+        theo = result.get("theoretical_peaks")
+        if theo and len(theo.get("two_theta", [])) > 0:
+            return theo
+
+        phase = result.get("phase", result)
+        mineral_id = (
+            result.get("mineral_id")
+            or (phase.get("id") if isinstance(phase, dict) else None)
+            or result.get("id")
+        )
+        if mineral_id is None:
+            return None
+        wl = round(float(self.session.wavelength), 4)
+        key = (str(mineral_id), wl)
+        if key in self._theo_cache:
+            return self._theo_cache[key]
+        try:
+            pattern = self.local_db.get_diffraction_pattern(int(mineral_id), wl)
+        except Exception:
+            pattern = None
+        self._theo_cache[key] = pattern
+        return pattern
 
     # --- mineral quick-add ---
 
@@ -230,7 +370,6 @@ class IdentifyStage(QWidget):
             QMessageBox.information(self, "No Matches", f"No minerals matching “{query}”.")
             return
 
-        # Prefer exact (case-insensitive) name match when unique
         exact = [h for h in hits if str(h.get("mineral_name", "")).lower() == query.lower()]
         if len(exact) == 1:
             chosen = exact[0]
@@ -243,8 +382,7 @@ class IdentifyStage(QWidget):
 
         phase = self._db_row_to_phase(chosen)
         self.session.add_candidates([phase])
-        # Show in candidates table (merge into current list view)
-        self._append_candidate_result({
+        row = {
             "mineral_id": chosen.get("id"),
             "mineral_name": chosen.get("mineral_name"),
             "chemical_formula": chosen.get("chemical_formula"),
@@ -255,13 +393,39 @@ class IdentifyStage(QWidget):
             "cell_alpha": chosen.get("cell_alpha"),
             "cell_beta": chosen.get("cell_beta"),
             "cell_gamma": chosen.get("cell_gamma"),
+            "rir": chosen.get("rir"),
             "match_score": 1.0,
             "manual_add": True,
-        })
+        }
+        # Report how well the known mineral actually fits the peaks
+        if self.session.has_peaks():
+            theo = self.theoretical_peaks_for(row)
+            if theo:
+                info = fingerprint_score(
+                    self.session.peaks["two_theta"],
+                    self.session.peaks["intensity"],
+                    theo.get("two_theta", []),
+                    theo.get("intensity", []),
+                    tolerance=self.tolerance.value(),
+                    n_peaks=self.fp_n_peaks.value(),
+                    min_rel_intensity=self.fp_min_rel.value(),
+                    exp_range=self._measured_range(),
+                )
+                row["fingerprint"] = info
+                row["fingerprint_score"] = info["score"]
+
+        self._append_candidate_result(row)
         self.match_btn.setEnabled(self.session.has_peaks())
         self.mineral_search.clear()
         name = chosen.get("mineral_name", "phase")
-        self.status.setText(f"Added {name}. Select it and run matching when ready.")
+        fp = row.get("fingerprint")
+        if fp:
+            self.status.setText(
+                f"Added {name} — {fp['n_found']}/{fp['n_expected']} strong lines present "
+                f"(fingerprint {fp['score']:.2f})."
+            )
+        else:
+            self.status.setText(f"Added {name}. Select it and run matching when ready.")
         self.workspace.set_status(f"Added mineral: {name}")
 
     def _pick_mineral_dialog(self, hits: list, query: str):
@@ -314,20 +478,16 @@ class IdentifyStage(QWidget):
         }
 
     def _append_candidate_result(self, result: dict):
-        """Merge a manual/search hit into the candidates table and select it."""
+        """Merge a manual hit into the candidates table and check it."""
         existing = list(getattr(self.workspace, "_candidate_results", []) or [])
         key = (result.get("mineral_name") or "").lower()
         if not any((r.get("mineral_name") or "").lower() == key for r in existing):
             existing.insert(0, result)
         self._search_results = existing
         self.workspace.set_results_candidates(existing)
-        # Auto-check only the newly added row (index 0 after insert)
-        if self.workspace.results_table.rowCount() > 0:
-            cb = self.workspace.results_table.cellWidget(0, 4)
-            if cb:
-                cb.setChecked(True)
+        self.workspace.check_candidate_rows([key])
 
-    # --- search / match ---
+    # --- search ---
 
     def start_search(self):
         pattern = self.session.active_pattern()
@@ -343,10 +503,7 @@ class IdentifyStage(QWidget):
             QMessageBox.warning(self, "No Pattern", "Load a pattern first.")
             return
 
-        selected = self.workspace.get_selected_matches()
-        if not selected:
-            # Fall back to session selection
-            selected = list(self.session.selected_phases)
+        selected = self.workspace.get_selected_matches() or list(self.session.selected_phases)
         if not selected:
             QMessageBox.warning(
                 self, "No Phases Selected",
@@ -355,12 +512,7 @@ class IdentifyStage(QWidget):
             )
             return
 
-        # Persist selection as the kept matched set
         self.session.set_selected_phases(selected)
-        if getattr(self.workspace, "_results_mode", None) == "matches":
-            # Optionally trim unselected so the kept set is clear
-            pass
-
         overlap_keep = self.overlap_keep.value()
         boost = self.unmatched_boost.value()
         tol = self.tolerance.value()
@@ -382,10 +534,7 @@ class IdentifyStage(QWidget):
 
         self.status.setText(
             f"Residual search… remaining intensity {pinfo['fraction_remaining']*100:.0f}%"
-            + (
-                f", unmatched peaks {peak_info.get('n_unmatched', '?')}"
-                if peak_info else ""
-            )
+            + (f", unmatched peaks {peak_info.get('n_unmatched', '?')}" if peak_info else "")
         )
         self._run_search(
             residual_pattern,
@@ -403,7 +552,15 @@ class IdentifyStage(QWidget):
         exclude_keys=None,
         kept_phases=None,
     ):
-        method_idx = self.method_combo.currentIndex()
+        method = self._method_key()
+        if method == "fingerprint" and not self.session.has_peaks():
+            QMessageBox.warning(
+                self, "Peaks Required",
+                "Fingerprint search compares peak positions.\n\n"
+                "Find peaks in the Peaks tab first, or pick another search method.",
+            )
+            return
+
         self.progress.setVisible(True)
         self.progress.setRange(0, 0)
         self.search_btn.setEnabled(False)
@@ -412,24 +569,21 @@ class IdentifyStage(QWidget):
             self.status.setText("Searching…")
 
         try:
-            if method_idx == 0:
-                results = self._ultra_fast(pattern)
+            if method == "fingerprint":
+                results = self._fingerprint_search(pattern, residual_peaks)
+            elif method == "ultrafast":
+                results = self._ultra_fast(pattern, self.min_corr.value(), self.max_results.value())
             else:
-                results = self._legacy_search(
-                    pattern, method_idx, peaks_override=residual_peaks
-                )
+                results = self._legacy_search(pattern, method, peaks_override=residual_peaks)
 
             results = results or []
-            # Always drop already-found minerals (by ID and by name, e.g. no more quartz)
             kept = list(kept_phases or []) or list(self.session.selected_phases)
+            dropped = 0
             if residual_mode or kept:
                 before = len(results)
                 results = filter_new_hits(results, kept)
                 dropped = before - len(results)
-            else:
-                dropped = 0
 
-            # Legacy name-only exclude_keys still honored if passed
             if exclude_keys:
                 results = [
                     r for r in results
@@ -441,14 +595,14 @@ class IdentifyStage(QWidget):
             self.session.set_candidates(candidates)
             self.workspace.set_results_candidates(results)
             self.match_btn.setEnabled(len(candidates) > 0 and self.session.has_peaks())
-            self.residual_btn.setEnabled(len(self.session.selected_phases) > 0 or bool(kept_phases))
 
             label = "Residual search" if residual_mode else "Search"
             extra = f" (excluded {dropped} already-found)" if dropped else ""
-            self.status.setText(
-                f"{label}: {len(candidates)} new candidates{extra}. "
-                "Select phases manually, then match (or Clear Unselected)."
+            hint = (
+                " Click a row to preview its peaks; arrow keys step through."
+                if candidates else " Try a lower Min fingerprint or a wider 2θ tolerance."
             )
+            self.status.setText(f"{label}: {len(candidates)} candidates{extra}.{hint}")
             self.workspace.set_status(f"{label}: {len(candidates)} candidates")
             self.workspace.refresh_plot()
         except Exception as e:
@@ -462,7 +616,48 @@ class IdentifyStage(QWidget):
                 and (len(self.session.selected_phases) > 0 or len(self.session.matched_phases) > 0)
             )
 
-    def _ultra_fast(self, pattern):
+    def _fingerprint_search(self, pattern, residual_peaks=None):
+        """Broad candidate pool, then rerank on each candidate's own strong lines."""
+        exp_peaks = residual_peaks if residual_peaks is not None else self.session.peaks
+        pool_size = self.pool_size.value()
+        pool = []
+
+        if self.fast_engine.search_index is not None:
+            pool = self.fast_engine.ultra_fast_correlation_search(
+                pattern,
+                min_correlation=self.pool_min_corr.value(),
+                max_results=pool_size,
+            ) or []
+        if not pool:
+            peak_data = {
+                "two_theta": np.asarray(exp_peaks["two_theta"]),
+                "intensity": np.asarray(exp_peaks["intensity"]),
+                "wavelength": pattern.get("wavelength", self.session.wavelength),
+            }
+            pool = self.search_engine.search_by_peaks(
+                peak_data, tolerance=self.peak_tol.value(), max_results=pool_size
+            ) or []
+
+        ranked = rank_by_fingerprint(
+            pool,
+            exp_peaks,
+            self.theoretical_peaks_for,
+            tolerance=self.tolerance.value(),
+            n_peaks=self.fp_n_peaks.value(),
+            min_rel_intensity=self.fp_min_rel.value(),
+            min_score=self.fp_min_score.value(),
+            min_found=self.fp_min_found.value(),
+            require_top_peak=self.fp_require_top.isChecked(),
+            max_results=self.max_results.value(),
+            exp_range=self._measured_range(),
+        )
+        print(
+            f"Fingerprint search: pool={len(pool)} → {len(ranked)} candidates "
+            f"(min score {self.fp_min_score.value():.2f})"
+        )
+        return ranked
+
+    def _ultra_fast(self, pattern, min_correlation, max_results):
         if self.fast_engine.search_index is None:
             QMessageBox.warning(
                 self,
@@ -473,11 +668,11 @@ class IdentifyStage(QWidget):
             return []
         return self.fast_engine.ultra_fast_correlation_search(
             pattern,
-            min_correlation=self.min_corr.value(),
-            max_results=self.max_results.value(),
+            min_correlation=min_correlation,
+            max_results=max_results,
         )
 
-    def _legacy_search(self, pattern, method_idx, peaks_override=None):
+    def _legacy_search(self, pattern, method: str, peaks_override=None):
         peaks = peaks_override if peaks_override is not None else self.session.peaks
         peak_data = pattern
         if peaks is not None:
@@ -490,15 +685,15 @@ class IdentifyStage(QWidget):
         max_r = self.max_results.value()
         ptol = self.peak_tol.value()
 
-        if method_idx == 1:
+        if method == "peaks":
             return self.search_engine.search_by_peaks(
                 peak_data, tolerance=ptol, max_results=max_r
             )
-        if method_idx == 2:
+        if method == "correlation":
             return self.search_engine.search_by_correlation(
                 pattern, min_correlation=min_c, max_results=max_r
             )
-        if method_idx == 3:
+        if method == "combined":
             return self.search_engine.combined_search(
                 peak_data if peaks is not None else pattern,
                 peak_tolerance=ptol,
@@ -531,10 +726,15 @@ class IdentifyStage(QWidget):
             "rir": result.get("rir"),
             "local_db": True,
             "search_score": result.get(
-                "ensemble_score",
-                result.get("combined_score", result.get("correlation", result.get("match_score", 0))),
+                "fingerprint_score",
+                result.get(
+                    "ensemble_score",
+                    result.get("combined_score", result.get("correlation", result.get("match_score", 0))),
+                ),
             ),
         }
+
+    # --- matching ---
 
     def start_matching(self):
         if not self.session.has_peaks():
@@ -545,12 +745,11 @@ class IdentifyStage(QWidget):
         if not phases:
             QMessageBox.warning(
                 self, "No Selection",
-                "Select one or more candidates in the table, then Start Matching.\n\n"
-                "(Nothing is auto-selected — check the boxes you want.)",
+                "Check one or more candidates in the table, then Match Selected.\n\n"
+                "(Nothing is auto-selected.)",
             )
             return
 
-        # Skip candidates that duplicate already-kept minerals (ID or name)
         kept = list(self.session.selected_phases)
         if kept:
             before = len(phases)
@@ -558,7 +757,7 @@ class IdentifyStage(QWidget):
             if not phases:
                 QMessageBox.information(
                     self, "Already Found",
-                    "All selected candidates are already in your kept phases "
+                    "All checked candidates are already in your kept phases "
                     "(same mineral ID or name).",
                 )
                 return
@@ -592,10 +791,14 @@ class IdentifyStage(QWidget):
         self.match_btn.setEnabled(True)
         min_score = self.min_score.value()
         filtered = [r for r in results if r.get("match_score", 0) >= min_score]
-        filtered.sort(key=lambda x: x.get("combined_score", x.get("match_score", 0)), reverse=True)
+        for r in filtered:
+            self._attach_fingerprint(r)
+        filtered.sort(
+            key=lambda x: x.get("fingerprint_score", x.get("combined_score", x.get("match_score", 0))),
+            reverse=True,
+        )
 
-        # Keep previously locked selections + new matches (no auto-check).
-        # Never re-add the same mineral ID or mineral name (e.g. more quartz).
+        # Keep previously locked selections; never re-add the same mineral twice
         previous = list(self.session.selected_phases)
         excl_ids, excl_names = exclusion_sets(previous)
         merged = list(previous)
@@ -611,21 +814,39 @@ class IdentifyStage(QWidget):
             new_count += 1
 
         self.session.set_matched_phases(merged)
-        # Do not auto-select new matches — preserve prior selections only
         self.session.set_selected_phases(previous)
         self.workspace.set_results_matches(merged, preselect=previous)
         self.multi_btn.setEnabled(len(merged) > 1)
         self.residual_btn.setEnabled(True)
         self.status.setText(
-            f"Matched {new_count} new phase(s); {len(previous)} previously selected. "
+            f"Matched {new_count} new phase(s); {len(previous)} previously kept. "
             "Check phases to keep, then Clear Unselected or Search Residual."
         )
         self.workspace.set_status(f"Matched {new_count} new phases")
         self.workspace.refresh_plot()
 
+    def _attach_fingerprint(self, result: dict):
+        """Add fingerprint stats so mixtures rank on their own lines."""
+        if "fingerprint" in result or not self.session.has_peaks():
+            return
+        theo = self.theoretical_peaks_for(result)
+        if not theo:
+            return
+        info = fingerprint_score(
+            self.session.peaks["two_theta"],
+            self.session.peaks["intensity"],
+            theo.get("two_theta", []),
+            theo.get("intensity", []),
+            tolerance=self.tolerance.value(),
+            n_peaks=self.fp_n_peaks.value(),
+            min_rel_intensity=self.fp_min_rel.value(),
+            exp_range=self._measured_range(),
+        )
+        result["fingerprint"] = info
+        result["fingerprint_score"] = info["score"]
+
     def start_multi_phase(self):
         pattern = self.session.active_pattern()
-        # Prefer explicitly selected matches
         results = self.workspace.get_selected_matches() or self.session.matched_phases
         if not pattern or len(results) < 2:
             QMessageBox.warning(
@@ -662,7 +883,6 @@ class IdentifyStage(QWidget):
                             "combined_score": 1.0,
                         })
                 self.session.set_matched_phases(wrapped)
-                # Still no auto-select — user chooses
                 self.session.set_selected_phases([])
                 self.workspace.set_results_matches(wrapped, preselect=[])
                 self.status.setText(
@@ -681,29 +901,25 @@ class IdentifyStage(QWidget):
         self.session.add_candidates(phases)
         existing = list(getattr(self.workspace, "_candidate_results", []) or [])
         existing_names = {(r.get("mineral_name") or "").lower() for r in existing}
-        new_rows = []
+        new_keys = []
         for p in phases:
             name = p.get("mineral", p.get("mineral_name", "Unknown"))
             if name.lower() in existing_names:
                 continue
-            row = {
+            existing.insert(0, {
                 "mineral_id": p.get("id") or p.get("amcsd_id"),
                 "mineral_name": name,
                 "chemical_formula": p.get("formula", p.get("chemical_formula", "")),
                 "space_group": p.get("space_group", ""),
                 "match_score": 1.0,
                 "manual_add": True,
-            }
-            existing.insert(0, row)
+            })
             existing_names.add(name.lower())
-            new_rows.append(name.lower())
+            new_keys.append(name.lower())
         self._search_results = existing
         self.workspace.set_results_candidates(existing)
-        # Check the newly added rows (they were inserted at the front)
-        for i, r in enumerate(existing):
-            if (r.get("mineral_name") or "").lower() in new_rows:
-                cb = self.workspace.results_table.cellWidget(i, 4)
-                if cb:
-                    cb.setChecked(True)
-        self.match_btn.setEnabled(len(self.session.search_candidates) > 0 and self.session.has_peaks())
+        self.workspace.check_candidate_rows(new_keys)
+        self.match_btn.setEnabled(
+            len(self.session.search_candidates) > 0 and self.session.has_peaks()
+        )
         self.status.setText(f"Added {len(phases)} phase(s) from database.")
