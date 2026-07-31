@@ -11,6 +11,7 @@ from scipy.fft import fft, ifft
 from scipy.signal import correlate
 from utils.ima_mineral_database import get_ima_database
 from utils.conditions import is_ambient
+from utils.two_theta_shift import DISPLACEMENT, remove_shift
 import time
 
 class FastPatternSearchEngine:
@@ -392,7 +393,10 @@ class FastPatternSearchEngine:
                                 tolerance: float = 0.2, top_n: int = 400,
                                 min_coverage: float = 0.05,
                                 wavelength: Optional[float] = None,
-                                ambient_only: bool = True) -> List[Dict]:
+                                ambient_only: bool = True,
+                                shift: float = 0.0,
+                                shift_span: float = 0.0,
+                                shift_model: str = DISPLACEMENT) -> List[Dict]:
         """
         Screen the whole index on peak positions instead of pattern similarity.
 
@@ -402,6 +406,12 @@ class FastPatternSearchEngine:
         `weights` (residual search) lets already-explained peaks count for less.
         `ambient_only` drops structures measured at high P/T, whose shifted
         cells would otherwise match at shifted 2θ.
+
+        `shift` pulls the observed peaks back onto the reference scale so a
+        displaced sample still screens in; `shift_span` widens the match
+        windows to cover a shift that has not been pinned down yet. Screening
+        only decides who gets scored, so a loose window here costs pool size
+        rather than accuracy.
         """
         from utils.fingerprint_search import line_coverage
 
@@ -411,6 +421,10 @@ class FastPatternSearchEngine:
         tt = np.asarray(peak_two_theta, dtype=float)
         if len(tt) == 0:
             return []
+
+        if shift:
+            tt = remove_shift(tt, shift, shift_model)
+        tolerance = tolerance + abs(shift_span)
 
         # The index grid is Cu Kα1; convert experimental positions if needed
         if wavelength and abs(wavelength - 1.5406) > 1e-4:

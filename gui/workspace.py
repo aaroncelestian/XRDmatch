@@ -19,6 +19,7 @@ from gui.widgets.file_browser import FileBrowser
 from gui.widgets.plot_host import create_plot_host
 from gui.stages import ProcessStage, IdentifyStage
 from gui.pattern_io import load_pattern_file
+from utils.two_theta_shift import DISPLACEMENT, describe as describe_shift
 
 
 LEFT_MIN_WIDTH = 220
@@ -113,6 +114,10 @@ class AnalysisWorkspace(QWidget):
             ("processed", "Processed", "Show the background-subtracted pattern", True),
             ("background", "Background", "Show the fitted background curve", True),
             ("peaks", "Peaks", "Show detected peak markers", True),
+            ("scaled", "Scaled",
+             "Scale each phase's reference lines to the intensity it actually accounts "
+             "for. Uncheck to draw every phase at full height, which is easier for "
+             "checking peak positions alone.", True),
         ):
             cb = QCheckBox(label)
             cb.setChecked(checked)
@@ -501,6 +506,11 @@ class AnalysisWorkspace(QWidget):
             )
         if fp.get("residual_score") is not None and fp["residual_score"] != fp["score"]:
             tip.append(f"Residual score {fp['residual_score']:.3f} (new peaks only)")
+        if fp.get("shift"):
+            tip.append(
+                "Lines placed at "
+                + describe_shift(fp["shift"], fp.get("shift_model", DISPLACEMENT))
+            )
         missing = fp.get("missing_strong") or []
         if missing:
             tip.append("Missing: " + ", ".join(f"{m:.2f}°" for m in missing[:6]))
@@ -659,12 +669,16 @@ class AnalysisWorkspace(QWidget):
             return None
         return results[row] if row < len(results) else None
 
+    def current_result(self) -> Optional[dict]:
+        """The phase highlighted in the list, whatever the list is showing."""
+        return self._result_at_row(self.results_table.currentRow())
+
     def _on_results_row_changed(self, row: int, _col=0, _prow=-1, _pcol=0):
         """Preview the highlighted phase; driven by clicks and arrow keys alike."""
         result = self._result_at_row(row)
         if result is None:
             return
-        theo = self.identify_stage.theoretical_peaks_for(result)
+        theo = self.identify_stage.reference_peaks_for(result)
         if not theo or len(theo.get("two_theta", [])) == 0:
             self._preview = None
             self.set_status("No reference peaks available for preview")
@@ -681,6 +695,7 @@ class AnalysisWorkspace(QWidget):
             "name": str(name),
             "two_theta": np.asarray(theo["two_theta"], dtype=float),
             "intensity": np.asarray(theo["intensity"], dtype=float),
+            "result": result,
         }
         self.refresh_plot()
 
@@ -705,7 +720,7 @@ class AnalysisWorkspace(QWidget):
 
         if self._details_dialog is None:
             self._details_dialog = PhaseDetailsDialog(self.window())
-        theo = self.identify_stage.theoretical_peaks_for(result)
+        theo = self.identify_stage.reference_peaks_for(result)
         self._details_dialog.show_phase(result, theo)
 
     def _show_results_menu(self, pos):
@@ -896,13 +911,24 @@ class AnalysisWorkspace(QWidget):
         """Overlay the highlighted candidate's reference lines."""
         if not self._preview:
             return
-        tt = self._preview["two_theta"]
-        inten = self._preview["intensity"]
+        # Re-resolve so the overlay tracks the 2θ shift as the user dials it
+        theo = self.identify_stage.reference_peaks_for(self._preview.get("result"))
+        if theo and len(theo.get("two_theta", [])) > 0:
+            tt = np.asarray(theo["two_theta"], dtype=float)
+            inten = np.asarray(theo["intensity"], dtype=float)
+        else:
+            tt = self._preview["two_theta"]
+            inten = self._preview["intensity"]
         if len(tt) == 0:
             return
         top = ax.get_ylim()[1] or 1.0
         imax = float(np.max(inten)) if len(inten) and np.max(inten) > 0 else 1.0
         heights = inten / imax * top * 0.75
+
+        label = f"Preview: {self._preview['name']}"
+        shift = (theo or {}).get("two_theta_shift") or 0.0
+        if shift:
+            label += f" ({shift:+.3f}° shift)"
 
         # Reference lines often run past the measured range; keep the view fixed
         xlim = ax.get_xlim()
@@ -911,7 +937,7 @@ class AnalysisWorkspace(QWidget):
             return
         ax.vlines(
             tt[inside], 0, heights[inside], colors="#e0a300", lw=1.4, alpha=0.9,
-            label=f"Preview: {self._preview['name']}", zorder=5,
+            label=label, zorder=5,
         )
         ax.set_xlim(xlim)
 
@@ -967,6 +993,60 @@ class AnalysisWorkspace(QWidget):
         ax.set_ylabel("Intensity")
         ax.set_title("Processing Preview")
 
+    def _reference_heights(self, result, tt, ti, two_theta, norm, max_i):
+        """
+        Reference line heights on the same 0-100 scale as the plotted pattern.
+
+        Normalizing each phase to its own strongest line draws a trace phase as
+        tall as a major one, which makes a correct minor phase look like a bad
+        fit. Heights come from the joint Le Bail contribution when a refinement
+        has produced one, and otherwise from fitting the phase's own lines to the
+        observed curve.
+        """
+        tmax = float(np.max(ti)) if len(ti) else 0.0
+        if tmax <= 0:
+            return None
+        rel = ti / tmax * 100.0
+        if not self._visible("scaled"):
+            return rel * 0.8
+        if len(two_theta) < 2:
+            return rel * 0.8
+
+        contribution = result.get("contribution")
+        if contribution is not None:
+            contribution = np.asarray(contribution, dtype=float)
+            if len(contribution) == len(two_theta) and np.max(contribution) > 0 and max_i > 0:
+                return np.interp(tt, two_theta, contribution / max_i * 100.0)
+
+        # Lines below a few percent sit in the noise, so they cannot pin a scale
+        inside = (tt >= two_theta[0]) & (tt <= two_theta[-1])
+        use = inside & (rel >= 10.0)
+        if np.count_nonzero(use) < 2:
+            use = inside & (rel > 0.0)
+        if not np.any(use):
+            return None
+
+        # Peak apex within tolerance, so a slightly offset line is not read as absent
+        tol = float(self.identify_stage.tolerance.value())
+        lo = np.searchsorted(two_theta, tt[use] - tol, side="left")
+        hi = np.searchsorted(two_theta, tt[use] + tol, side="right")
+        observed = np.array([
+            float(np.max(norm[a:b])) if b > a else 0.0 for a, b in zip(lo, hi)
+        ])
+
+        ratios = observed / rel[use]
+        # A low quantile rather than the median: lines overlapping another phase
+        # read high, and anchoring on those inflates the whole phase
+        scale = (
+            float(np.percentile(ratios, 25)) if len(ratios) >= 4
+            else float(np.min(ratios))
+        )
+        if not np.isfinite(scale) or scale <= 0:
+            # Nothing to anchor on; keep the lines faintly visible rather than
+            # dropping the phase off the plot with no explanation
+            scale = 0.03
+        return rel * scale
+
     def _plot_identify(self, ax, palette):
         pattern = self.session.active_pattern()
         if pattern is None:
@@ -1004,14 +1084,17 @@ class AnalysisWorkspace(QWidget):
 
         colors = ["#c45c26", "#7a5cff", "#2a7a4b", "#b33a3a", "#5a6a7a"]
         selected = self.session.selected_phases
+        tallest = 0.0
         for i, result in enumerate(selected[:5]):
-            theo = result.get("theoretical_peaks") or self.identify_stage.theoretical_peaks_for(result)
+            theo = self.identify_stage.reference_peaks_for(result)
             if not theo or len(theo.get("two_theta", [])) == 0:
                 continue
             tt = np.asarray(theo["two_theta"])
             ti = np.asarray(theo["intensity"], dtype=float)
-            tmax = np.max(ti) if len(ti) else 1.0
-            tnorm = (ti / tmax * 80.0) if tmax > 0 else ti
+            tnorm = self._reference_heights(result, tt, ti, two_theta, norm, float(max_i))
+            if tnorm is None:
+                continue
+            tallest = max(tallest, float(np.max(tnorm)) if len(tnorm) else 0.0)
             phase = result.get("phase", {})
             name = phase.get("mineral", f"Phase {i+1}")
             ax.vlines(
@@ -1031,7 +1114,9 @@ class AnalysisWorkspace(QWidget):
         ax.set_xlabel("2θ (degrees)")
         ax.set_ylabel("Normalized Intensity")
         ax.set_title("Phase Identification")
-        ax.set_ylim(0, 110)
+        # Leave room for a phase that over-predicts, but do not let one runaway
+        # line squash the pattern into the baseline
+        ax.set_ylim(0, max(110.0, min(160.0, tallest * 1.05)))
         # Reference lines run past the measurement; keep the view on the data
         if data_range is not None:
             ax.set_xlim(*data_range)

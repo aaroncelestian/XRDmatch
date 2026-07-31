@@ -14,6 +14,8 @@ from typing import Callable, Dict, List, Optional, Sequence
 
 import numpy as np
 
+from utils.two_theta_shift import DISPLACEMENT, apply_shift, fit_shift
+
 
 DEFAULT_TOLERANCE = 0.20
 DEFAULT_MIN_REL_INTENSITY = 5.0
@@ -153,6 +155,9 @@ def fingerprint_score(
     exp_weights: Optional[Sequence[float]] = None,
     chance: Optional[float] = None,
     chance_weighted: Optional[float] = None,
+    shift: float = 0.0,
+    shift_span: float = 0.0,
+    shift_model: str = DISPLACEMENT,
 ) -> Dict:
     """
     Score a candidate by how many of its own strong lines are present.
@@ -165,6 +170,11 @@ def fingerprint_score(
     `exp_weights` (residual search) down-weights peaks already claimed by
     accepted phases, giving a `residual_score` that rewards candidates which
     explain what is still unaccounted for.
+
+    `shift` moves the reference lines to where a displaced sample puts them.
+    With `shift_span` above zero the shift is fitted per candidate inside
+    `shift ± shift_span` and reported back as `shift`, which is what finds a
+    phase whose displacement is not yet known.
     """
     exp_tt = np.asarray(exp_two_theta, dtype=float)
     exp_int = np.asarray(exp_intensity, dtype=float)
@@ -183,6 +193,8 @@ def fingerprint_score(
         "intensity_agreement": 0.0,
         "missing_strong": [],
         "matched_two_theta": [],
+        "shift": float(shift),
+        "shift_model": shift_model,
     }
     if len(exp_tt) == 0:
         return empty
@@ -196,16 +208,32 @@ def fingerprint_score(
             weights = weights / float(np.max(weights))
 
     window = exp_range or (float(np.min(exp_tt)) - tolerance, float(np.max(exp_tt)) + tolerance)
+    # A shift moves lines across the ends of the measured range, so select from
+    # a padded window and drop whatever ends up outside once the shift is known
+    pad = abs(float(shift)) + abs(float(shift_span))
     fp = select_fingerprint_peaks(
         theo_two_theta,
         theo_intensity,
         n_peaks=n_peaks,
         min_rel_intensity=min_rel_intensity,
-        two_theta_range=window,
+        two_theta_range=(window[0] - pad, window[1] + pad),
     )
     fp_tt, fp_int = fp["two_theta"], fp["intensity"]
     if len(fp_tt) == 0:
         return empty
+
+    fitted_shift = float(shift)
+    if shift_span > 0:
+        fitted_shift, _ = fit_shift(
+            exp_tt, fp_tt, fp_int,
+            tolerance=tolerance, center=shift, span=shift_span, model=shift_model,
+        )
+    obs_tt = apply_shift(fp_tt, fitted_shift, shift_model)
+    if pad > 0:
+        inside = (obs_tt >= window[0]) & (obs_tt <= window[1])
+        if not np.any(inside):
+            return {**empty, "shift": fitted_shift}
+        fp_tt, fp_int, obs_tt = fp_tt[inside], fp_int[inside], obs_tt[inside]
 
     exp_max = float(np.max(exp_int)) if len(exp_int) and np.max(exp_int) > 0 else 1.0
     strongest_idx = int(np.argmax(fp_int))
@@ -216,7 +244,7 @@ def fingerprint_score(
     match_weight = np.zeros(len(fp_tt), dtype=float)
     theo_found, exp_found = [], []
 
-    for i, tt in enumerate(fp_tt):
+    for i, tt in enumerate(obs_tt):
         diffs = np.abs(exp_tt - tt)
         j = int(np.argmin(diffs))
         if diffs[j] <= tolerance:
@@ -280,8 +308,10 @@ def fingerprint_score(
         "top_found": top_found,
         "position_quality": pos_quality,
         "intensity_agreement": float(agreement) if agreement is not None else None,
-        "missing_strong": [float(t) for t in fp_tt[~found_mask]],
+        "missing_strong": [float(t) for t in obs_tt[~found_mask]],
         "matched_two_theta": [float(t) for t in exp_matched[found_mask]],
+        "shift": float(fitted_shift),
+        "shift_model": shift_model,
     }
 
 
@@ -359,14 +389,18 @@ def rank_by_fingerprint(
     exp_range: Optional[tuple] = None,
     dedupe_by_name: bool = True,
     exp_weights: Optional[Sequence[float]] = None,
+    shift: float = 0.0,
+    shift_span: float = 0.0,
+    shift_model: str = DISPLACEMENT,
 ) -> List[Dict]:
     """
     Rescore search hits by fingerprint presence and drop weak ones.
 
-    `theo_lookup` maps a result dict to its theoretical peaks (or None); the
-    caller owns any database access and caching. Databases hold many records
-    per mineral, so by default only the best-scoring record per mineral name is
-    kept — otherwise a dozen quartz entries bury the minor phases.
+    `theo_lookup` maps a result dict to its theoretical peaks (or None), in
+    their unshifted database positions; the caller owns any database access and
+    caching. Databases hold many records per mineral, so by default only the
+    best-scoring record per mineral name is kept — otherwise a dozen quartz
+    entries bury the minor phases.
     """
     exp_tt = exp_peaks.get("two_theta", [])
     exp_int = exp_peaks.get("intensity", [])
@@ -395,6 +429,9 @@ def rank_by_fingerprint(
             exp_weights=exp_weights,
             chance=chance,
             chance_weighted=chance_weighted,
+            shift=shift,
+            shift_span=shift_span,
+            shift_model=shift_model,
         )
         # In residual mode rank on newly explained lines, not overall presence
         rank_score = info["residual_score"] if exp_weights is not None else info["score"]

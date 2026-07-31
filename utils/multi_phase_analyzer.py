@@ -840,6 +840,7 @@ class MultiPhaseAnalyzer:
                     refine_profile = True
                     refine_intensities = False
                 
+                params = refinement_params or {}
                 initial_params = {
                     'scale_factor': phase_result.get('optimized_scaling', 1.0),
                     'u_param': u_param,
@@ -851,11 +852,23 @@ class MultiPhaseAnalyzer:
                     'refine_profile': refine_profile,
                     'refine_scale': True,
                     'refine_intensities': refine_intensities,
-                    'max_scale_bound': refinement_params.get('max_scale', 10.0) if refinement_params else 10.0
+                    'refine_absorption': params.get('refine_absorption', False),
+                    'refine_harmonics': params.get('refine_harmonics', False),
+                    'harmonic_order': params.get('harmonic_order', 0),
+                    'max_scale_bound': params.get('max_scale', 10.0)
                 }
                 
                 self.lebail_engine.add_phase(phase_data, initial_params)
-                
+
+            settings = refinement_params or {}
+            # Callers that want quantification ask for 'fixed' explicitly; the
+            # older tabs keep the classic extraction behaviour
+            self.lebail_engine.intensity_model = settings.get('intensity_model', 'extract')
+            self.lebail_engine.set_global_parameters(
+                refine_zero_shift=settings.get('refine_zero_shift', True),
+                refine_displacement=settings.get('refine_displacement', False),
+            )
+
             # Perform refinement (reduced iterations for performance)
             refinement_results = self.lebail_engine.refine_phases(
                 max_iterations=max_iterations,

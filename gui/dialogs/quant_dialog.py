@@ -65,7 +65,7 @@ class QuantDialog(QDialog):
         self.quant_results_label.setObjectName("mutedLabel")
         qr.addWidget(self.quant_results_label)
         self.quant_results_table = QTableWidget()
-        self.quant_results_table.setMaximumHeight(140)
+        self.quant_results_table.setMaximumHeight(190)
         self.quant_results_table.setAlternatingRowColors(True)
         self.quant_results_table.horizontalHeader().setStretchLastSection(True)
         qr.addWidget(self.quant_results_table)
@@ -110,38 +110,118 @@ class QuantDialog(QDialog):
         self.quant_canvas.draw_idle()
         self._update_results_table()
 
+    REFINE_COLUMNS = [
+        "Phase", "wt%", "Scale", "a (Å)", "c (Å)", "V (Å³)",
+        "Lattice Δ%", "Absorb.", "Harmonics", "Contrib.%",
+    ]
+    RIR_COLUMNS = ["Phase", "wt%", "Scale", "Fitted I", "RIR", "Pattern share %"]
+
     def _update_results_table(self):
+        """Refinement details: Le Bail when it has run, otherwise RIR quant."""
         results = self.session.lebail_results
         if results and results.get("success"):
-            refined = results.get("refined_phases") or []
-            rr = results.get("refinement_results") or {}
-            rwp = rr.get("rwp") or results.get("rwp")
-            label = "Refinement"
-            if rwp is not None:
-                label = f"Refinement (Rwp={float(rwp):.2f}%)"
-            self.quant_results_label.setText(label)
-            self.quant_results_table.clear()
-            self.quant_results_table.setColumnCount(2)
-            self.quant_results_table.setHorizontalHeaderLabels(["Phase", "Scale / info"])
-            if refined:
-                self.quant_results_table.setRowCount(len(refined))
-                for i, p in enumerate(refined):
-                    name = (
-                        p.get("mineral", p.get("mineral_name", f"Phase {i+1}"))
-                        if isinstance(p, dict) else str(p)
-                    )
-                    info = ""
-                    if isinstance(p, dict):
-                        scale = p.get("scale", p.get("scale_factor"))
-                        if scale is not None:
-                            info = f"scale={float(scale):.4g}"
-                    self.quant_results_table.setItem(i, 0, QTableWidgetItem(str(name)))
-                    self.quant_results_table.setItem(i, 1, QTableWidgetItem(info))
-            else:
-                self.quant_results_table.setRowCount(0)
+            self._show_lebail_details(results)
+        elif self.session.rir_results:
+            self._show_rir_details(self.session.rir_results)
         else:
-            self.quant_results_label.setText("Refinement")
+            self.quant_results_label.setText(
+                "Refinement — run Le Bail, or RIR Quant in the Phases tab"
+            )
+            self.quant_results_table.clear()
             self.quant_results_table.setRowCount(0)
+            self.quant_results_table.setColumnCount(0)
+
+    def _set_columns(self, columns):
+        self.quant_results_table.clear()
+        self.quant_results_table.setColumnCount(len(columns))
+        self.quant_results_table.setHorizontalHeaderLabels(columns)
+
+    @staticmethod
+    def _cell(text: str, tooltip: str = "") -> QTableWidgetItem:
+        item = QTableWidgetItem(text)
+        if tooltip:
+            item.setToolTip(tooltip)
+        return item
+
+    def _show_lebail_details(self, results: dict):
+        inner = results.get("refinement_results") or {}
+        factors = inner.get("final_r_factors") or results.get("r_factors") or {}
+        summary = inner.get("phase_summary") or []
+        globals_ = inner.get("global_parameters") or {}
+
+        header = []
+        for key, label in (("Rwp", "Rwp"), ("Rp", "Rp"), ("GoF", "GoF")):
+            value = factors.get(key)
+            if value is not None:
+                header.append(f"{label}={float(value):.2f}" + ("%" if key != "GoF" else ""))
+        header.append(f"zero={globals_.get('zero_shift', 0.0):+.4f}°")
+        header.append(f"disp={globals_.get('displacement', 0.0):+.4f}°")
+        if inner.get("iterations"):
+            header.append(f"{inner['iterations']} cycles")
+        if inner.get("intensity_model") == "extract":
+            header.append("Le Bail extraction — wt% unavailable")
+        self.quant_results_label.setText("Refinement — " + "  ·  ".join(header))
+
+        self._set_columns(self.REFINE_COLUMNS)
+        self.quant_results_table.setRowCount(len(summary))
+        for row, phase in enumerate(summary):
+            cell = phase.get("unit_cell") or {}
+            base = phase.get("base_unit_cell") or {}
+            lattice = phase.get("lattice_scale", 1.0)
+            coeffs = phase.get("harmonic_coeffs") or []
+            wt = phase.get("weight_percent")
+            contribution = phase.get("contribution_percent")
+
+            values = [
+                (str(phase.get("name", f"Phase {row + 1}")), phase.get("formula", "")),
+                (f"{wt:.1f}" if wt is not None else "—",
+                 "No RIR value in the database" if phase.get("rir") is None
+                 else "Chung RIR weight percent"),
+                (f"{phase.get('scale', 0.0):.4g}", ""),
+                (f"{cell.get('a', 0.0):.4f}", f"start {base.get('a', 0.0):.4f} Å"),
+                (f"{cell.get('c', 0.0):.4f}", f"start {base.get('c', 0.0):.4f} Å"),
+                (f"{cell.get('volume', 0.0):.2f}", ""),
+                (f"{(lattice - 1.0) * 100:+.3f}", "Isotropic lattice dilation"),
+                (f"{phase.get('absorption', 0.0):+.4f}", ""),
+                (", ".join(f"{c:+.3f}" for c in coeffs) if any(coeffs) else "—",
+                 "Even-order harmonic coefficients c2, c4, c6"),
+                (f"{contribution:.1f}" if contribution is not None else "—",
+                 "Share of the calculated pattern intensity"),
+            ]
+            for column, (text, tooltip) in enumerate(values):
+                self.quant_results_table.setItem(row, column, self._cell(text, tooltip))
+        self.quant_results_table.resizeColumnsToContents()
+
+    def _show_rir_details(self, result: dict):
+        phases = result.get("phases") or []
+        header = [
+            f"fit Rwp={result.get('rwp', float('nan')):.1f}%",
+            f"{result.get('explained_fraction', 0.0) * 100:.0f}% of intensity explained",
+            f"FWHM={result.get('fwhm', 0.0):.3f}°",
+        ]
+        if result.get("missing_rir"):
+            header.append(f"no RIR: {', '.join(result['missing_rir'][:3])}")
+        self.quant_results_label.setText("RIR quantification — " + "  ·  ".join(header))
+
+        self._set_columns(self.RIR_COLUMNS)
+        self.quant_results_table.setRowCount(len(phases))
+        total_pattern = sum(p.get("pattern_intensity", 0.0) for p in phases) or 1.0
+        for row, phase in enumerate(phases):
+            wt = phase.get("weight_percent")
+            rir = phase.get("rir")
+            values = [
+                (str(phase.get("name", f"Phase {row + 1}")), ""),
+                (f"{wt:.1f}" if wt is not None else "—",
+                 "No RIR value in the database" if rir is None else "Chung RIR weight percent"),
+                (f"{phase.get('scale', 0.0):.4g}", ""),
+                (f"{phase.get('line_intensity', 0.0):.4g}", "Strongest-line intensity from the fit"),
+                (f"{rir:.3f}" if rir else "—", "I/I_corundum from AMCSD"),
+                (f"{phase.get('pattern_intensity', 0.0) / total_pattern * 100:.1f}",
+                 "Share of the fitted pattern intensity, before the RIR conversion"),
+            ]
+            for column, (text, tooltip) in enumerate(values):
+                self.quant_results_table.setItem(row, column, self._cell(text, tooltip))
+        self.quant_results_table.resizeColumnsToContents()
 
     def _plot_refine(self, ax, palette):
         results = self.session.lebail_results
@@ -163,6 +243,19 @@ class QuantDialog(QDialog):
                         lw=0.8, label="Difference",
                     )
             ax.set_title("Le Bail Refinement")
+        elif self.session.rir_results:
+            rir = self.session.rir_results
+            tt = rir["two_theta"]
+            exp = np.asarray(rir["observed"])
+            calc = np.asarray(rir["calculated"])
+            ax.plot(tt, exp, color=palette["exp_line"], lw=1.2, label="Experimental")
+            ax.plot(tt, calc, color=palette["calc_line"], lw=1.2, label="RIR fit")
+            offset = -0.15 * (np.max(exp) if len(exp) else 0)
+            ax.plot(
+                tt, exp - calc + offset, color=palette["diff_line"],
+                lw=0.8, label="Difference",
+            )
+            ax.set_title("RIR Quantification — fixed reference patterns, scale only")
         elif pattern is not None:
             ax.plot(
                 pattern["two_theta"], pattern["intensity"],

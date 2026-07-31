@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
     QGridLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
@@ -12,12 +12,13 @@ from PyQt5.QtWidgets import (
 
 from utils.fast_pattern_search import FastPatternSearchEngine
 from utils.pattern_search import PatternSearchEngine
-from utils.multi_phase_analyzer import MultiPhaseAnalyzer
 from utils.local_database import LocalCIFDatabase
+from utils.rir_quant import quantify as rir_quantify, summary_lines as rir_summary_lines
 from utils.fingerprint_search import (
     coincidence_fraction,
     fingerprint_score,
     rank_by_fingerprint,
+    select_fingerprint_peaks,
 )
 from utils.conditions import (AMBIENT_MAX_PRESSURE_GPA, AMBIENT_MAX_TEMPERATURE_K,
                              AMBIENT_MIN_TEMPERATURE_K)
@@ -29,6 +30,16 @@ from utils.residual_search import (
     exclusion_sets,
     mineral_ids,
     mineral_key,
+)
+from utils.two_theta_shift import (
+    DISPLACEMENT,
+    MIN_LINES_TO_FIT,
+    SHIFT_MODELS,
+    describe as describe_shift,
+    fit_shift,
+    remove_shift,
+    shift_pattern,
+    unshift_pattern,
 )
 from gui.matching_tab import PhaseMatchingThread
 from gui.widgets.control_bar import OptionsDialog, compact
@@ -44,41 +55,6 @@ SEARCH_METHODS = [
 ]
 
 
-class MultiPhaseThread(QThread):
-    """Joint Le Bail runs for a minute or more; keep it off the UI thread."""
-
-    finished_ok = pyqtSignal(dict)
-    failed = pyqtSignal(str)
-
-    def __init__(self, analyzer, experimental_data, candidates, max_phases,
-                 min_delta_rwp, min_scale):
-        super().__init__()
-        self.analyzer = analyzer
-        self.experimental_data = experimental_data
-        self.candidates = candidates
-        self.max_phases = max_phases
-        self.min_delta_rwp = min_delta_rwp
-        self.min_scale = min_scale
-
-    def run(self):
-        try:
-            out = self.analyzer.joint_lebail_phase_identification(
-                self.experimental_data,
-                self.candidates,
-                max_phases=self.max_phases,
-                min_delta_rwp=self.min_delta_rwp,
-                min_scale=self.min_scale,
-                residual_research=False,
-                # The user picked these phases; trial each instead of screening
-                # them out on how much of the residue they explain
-                min_proposal_score=0.0,
-                min_proposal_correlation=0.0,
-            )
-            self.finished_ok.emit(out or {})
-        except Exception as exc:  # surfaced in the UI, not swallowed
-            self.failed.emit(str(exc))
-
-
 class IdentifyStage(QWidget):
     def __init__(self, session, workspace, parent=None):
         super().__init__(parent)
@@ -86,10 +62,8 @@ class IdentifyStage(QWidget):
         self.workspace = workspace
         self.fast_engine = FastPatternSearchEngine()
         self.search_engine = PatternSearchEngine()
-        self.multi_phase_analyzer = MultiPhaseAnalyzer()
         self.local_db = LocalCIFDatabase()
         self._match_thread = None
-        self._multi_thread = None
         self._search_results = []
         self._kept_phases = []  # accepted across residual rounds
         self._theo_cache = {}
@@ -134,11 +108,13 @@ class IdentifyStage(QWidget):
         self.residual_btn.setEnabled(False)
         run_row.addWidget(self.residual_btn)
 
-        self.multi_btn = QPushButton("Multi-Phase")
-        self.multi_btn.setToolTip("Joint Le Bail accept/reject over the selected phases")
-        self.multi_btn.clicked.connect(self.start_multi_phase)
-        self.multi_btn.setEnabled(False)
-        run_row.addWidget(self.multi_btn)
+        self.rir_btn = QPushButton("RIR Quant")
+        self.rir_btn.setToolTip(
+            "Weight percents from reference intensity ratios (Chung) for the checked phases"
+        )
+        self.rir_btn.clicked.connect(self.run_rir_quant)
+        self.rir_btn.setEnabled(False)
+        run_row.addWidget(self.rir_btn)
         run_row.addStretch()
         grid.addLayout(run_row, 0, 0, 1, 7)
 
@@ -205,6 +181,8 @@ class IdentifyStage(QWidget):
         options_btn.setToolTip("Fingerprint, residual, weighting, and multi-phase settings")
         options_btn.clicked.connect(self._show_options)
 
+        self._build_shift_widgets()
+
         grid.addWidget(self._label("Method:"), 2, 0)
         grid.addWidget(compact(self.method_combo, 170), 2, 1)
         grid.addWidget(self._label("2θ tol:"), 2, 2)
@@ -219,23 +197,31 @@ class IdentifyStage(QWidget):
         grid.addWidget(self.ambient_only, 3, 4)
         grid.addWidget(options_btn, 3, 5)
 
-        # Row 4 — list actions, filled in by the workspace
+        # Row 4 — sample displacement correction
+        grid.addWidget(self._label("2θ shift:"), 4, 0)
+        grid.addWidget(compact(self.shift, 80), 4, 1)
+        grid.addWidget(self._label("Auto fit ±:"), 4, 2)
+        grid.addWidget(compact(self.shift_span, 80), 4, 3)
+        grid.addWidget(self.fit_shift_btn, 4, 4)
+        grid.addWidget(self.clear_shift_btn, 4, 5)
+
+        # Row 5 — list actions, filled in by the workspace
         self.table_actions = QHBoxLayout()
         self.table_actions.setSpacing(6)
-        grid.addLayout(self.table_actions, 4, 0, 1, 7)
+        grid.addLayout(self.table_actions, 5, 0, 1, 7)
 
-        # Row 5 — status and progress
+        # Row 6 — status and progress
         self.status = QLabel("Load a pattern, find peaks, then search.")
         self.status.setObjectName("mutedLabel")
         self.status.setWordWrap(True)
-        grid.addWidget(self.status, 5, 0, 1, 5)
+        grid.addWidget(self.status, 6, 0, 1, 5)
         self.progress = QProgressBar()
         self.progress.setVisible(False)
         self.progress.setMaximumWidth(140)
-        grid.addWidget(self.progress, 5, 5, 1, 2)
+        grid.addWidget(self.progress, 6, 5, 1, 2)
 
         grid.setColumnStretch(6, 1)
-        grid.setRowStretch(6, 1)
+        grid.setRowStretch(7, 1)
 
         self._build_option_widgets()
         self._on_method_changed()
@@ -254,6 +240,160 @@ class IdentifyStage(QWidget):
 
     def finish_action_row(self):
         self.table_actions.addStretch()
+
+    def _build_shift_widgets(self):
+        """
+        Sample-displacement correction for the reference lines.
+
+        A displaced mount moves every observed line, so a database pattern sat
+        at its nominal 2θ misses peaks it should hit and the phase never makes
+        the candidate list. These controls move the reference lines instead of
+        the data, which leaves the measured pattern untouched.
+        """
+        self.shift = QDoubleSpinBox()
+        self.shift.setRange(-3.0, 3.0)
+        self.shift.setDecimals(3)
+        self.shift.setSingleStep(0.01)
+        self.shift.setValue(0.0)
+        self.shift.setSuffix("°")
+        self.shift.setToolTip(
+            "Move reference lines to where a displaced sample puts them.\n\n"
+            "Positive shifts them to higher 2θ. With the displacement model the "
+            "value is the shift extrapolated to 2θ = 0 and the actual shift is "
+            "value × cos θ, so it fades out towards high angle.\n\n"
+            "This corrects the reference positions only — the measured pattern "
+            "is untouched. To correct the data itself use the 2θ offset in the "
+            "Background tab."
+        )
+
+        self.shift_span = QDoubleSpinBox()
+        self.shift_span.setRange(0.0, 2.0)
+        self.shift_span.setDecimals(2)
+        self.shift_span.setSingleStep(0.05)
+        self.shift_span.setValue(0.0)
+        self.shift_span.setSuffix("°")
+        self.shift_span.setToolTip(
+            "Fit each candidate its own shift within this much of the value on "
+            "the left (0 = off).\n\n"
+            "Use this when the displacement is unknown: a phase that is present "
+            "but sitting 0.3° off will not be found at any sensible tolerance, "
+            "and widening the tolerance instead matches everything.\n\n"
+            "One shift has to satisfy all of a phase's strong lines at once, so "
+            "it stays real evidence — but keep the range only as wide as the "
+            "displacement you actually expect."
+        )
+
+        self.shift_model = QComboBox()
+        for label, key in SHIFT_MODELS:
+            self.shift_model.addItem(label, key)
+        self.shift_model.setToolTip(
+            "Displacement is the usual cause in Bragg-Brentano: the shift goes "
+            "as cos θ, largest at low angle. Zero shift is a flat detector "
+            "offset, the same at every angle."
+        )
+
+        self.fit_shift_btn = QPushButton("Fit to Row")
+        self.fit_shift_btn.setToolTip(
+            "Fit the shift to the highlighted candidate's lines and put the "
+            "result in the box. Use it once you recognize a phase, then turn "
+            "auto fit off and search again with the displacement pinned down."
+        )
+        self.fit_shift_btn.clicked.connect(self.fit_shift_to_row)
+
+        self.clear_shift_btn = QPushButton("No Shift")
+        self.clear_shift_btn.setToolTip("Reset the shift and the auto-fit range to zero")
+        self.clear_shift_btn.clicked.connect(self.clear_shift)
+
+        for spin in (self.shift, self.shift_span):
+            spin.valueChanged.connect(self._on_shift_changed)
+
+    def _on_shift_changed(self, *_args):
+        self.workspace.refresh_plot()
+
+    def clear_shift(self):
+        self.shift.setValue(0.0)
+        self.shift_span.setValue(0.0)
+
+    def shift_model_key(self) -> str:
+        return self.shift_model.currentData() or DISPLACEMENT
+
+    def shift_for(self, result=None) -> float:
+        """
+        The 2θ shift that applies to one phase.
+
+        Phase dicts carry an already-resolved value. Search hits carry the
+        shift fitted while they were scored, which only counts while auto fit
+        is on; otherwise every phase uses the single manual setting.
+        """
+        if isinstance(result, dict):
+            phase = result.get("phase")
+            for src in (result, phase if isinstance(phase, dict) else {}):
+                resolved = src.get("two_theta_shift")
+                if resolved is not None:
+                    return float(resolved)
+            if self.shift_span.value() > 0:
+                fitted = (result.get("fingerprint") or {}).get("shift")
+                if fitted is not None:
+                    return float(fitted)
+        return float(self.shift.value())
+
+    def fit_shift_to_row(self):
+        """Pin the shift down from a phase the user has recognized."""
+        result = self.workspace.current_result()
+        if result is None:
+            QMessageBox.information(
+                self, "No Phase Selected",
+                "Click the phase you recognize in the list, then Fit to Row.",
+            )
+            return
+        if not self.session.has_peaks():
+            QMessageBox.warning(self, "No Peaks", "Find peaks in the Peaks tab first.")
+            return
+
+        theo = self.theoretical_peaks_for(result)
+        if not theo or len(theo.get("two_theta", [])) == 0:
+            QMessageBox.information(
+                self, "No Reference Lines",
+                "This phase has no reference pattern to fit against.",
+            )
+            return
+
+        fp = select_fingerprint_peaks(
+            theo.get("two_theta", []),
+            theo.get("intensity", []),
+            n_peaks=self.fp_n_peaks.value(),
+            min_rel_intensity=self.fp_min_rel.value(),
+            two_theta_range=self._measured_range(),
+        )
+        # A generous window even when auto fit is off, since this is the step
+        # that tells the user how far off the mount actually is
+        span = self.shift_span.value() or 1.0
+        fitted, n_found = fit_shift(
+            self.session.peaks["two_theta"],
+            fp["two_theta"],
+            fp["intensity"],
+            tolerance=self.tolerance.value(),
+            center=0.0,
+            span=span,
+            model=self.shift_model_key(),
+        )
+        name = result.get("mineral_name") or result.get("phase", {}).get("mineral", "phase")
+        if n_found < MIN_LINES_TO_FIT:
+            QMessageBox.information(
+                self, "Not Enough Lines",
+                f"Only {n_found} of {name}'s strong lines land on a peak within "
+                f"±{span:.2f}°, which is too few to pin a shift down.\n\n"
+                "Widen the auto fit range or pick a phase you are surer of.",
+            )
+            return
+
+        self.shift.setValue(fitted)
+        self.status.setText(
+            f"Fitted {describe_shift(fitted, self.shift_model_key())} from {name} "
+            f"({n_found} lines). Set Auto fit to 0 and search again to apply it "
+            "to every candidate."
+        )
+        self.workspace.set_status(f"2θ shift {fitted:+.3f}° from {name}")
 
     def _build_option_widgets(self):
         """Advanced parameters — shown in the Options popup, owned here."""
@@ -370,28 +510,16 @@ class IdentifyStage(QWidget):
             "Intensity multiplier for peaks not explained by selected phases"
         )
 
-        self.mp_max = QSpinBox()
-        self.mp_max.setRange(1, 10)
-        self.mp_max.setValue(5)
-
-        self.mp_delta = QDoubleSpinBox()
-        self.mp_delta.setRange(0.0, 50.0)
-        self.mp_delta.setDecimals(1)
-        self.mp_delta.setValue(0.25)
-        self.mp_delta.setSuffix("%")
-        self.mp_delta.setToolTip(
-            "Rwp improvement a phase must deliver to be kept. A few percent of a "
-            "minor phase moves Rwp very little, so keep this small."
-        )
-
-        self.mp_min_scale = QDoubleSpinBox()
-        self.mp_min_scale.setRange(0.0, 1.0)
-        self.mp_min_scale.setDecimals(3)
-        self.mp_min_scale.setSingleStep(0.005)
-        self.mp_min_scale.setValue(0.01)
-        self.mp_min_scale.setToolTip(
-            "Smallest refined scale factor treated as a real phase. A trace phase "
-            "refines to a few hundredths, so a large floor rejects it outright."
+        self.rir_fwhm = QDoubleSpinBox()
+        self.rir_fwhm.setRange(0.01, 2.0)
+        self.rir_fwhm.setDecimals(3)
+        self.rir_fwhm.setSingleStep(0.01)
+        self.rir_fwhm.setValue(0.12)
+        self.rir_fwhm.setSuffix("°")
+        self.rir_fwhm.setToolTip(
+            "Peak width used to fit reference patterns for RIR quantification.\n\n"
+            "Set it near your measured FWHM. Too narrow and the fit misses "
+            "intensity in the peak flanks; too wide and it absorbs neighbours."
         )
 
     def _show_options(self):
@@ -408,18 +536,19 @@ class IdentifyStage(QWidget):
             dlg.add_row("Screen min coverage:", self.pool_min_coverage)
             dlg.add_row("Pool size:", self.pool_size)
 
+            dlg.add_heading("2θ shift")
+            dlg.add_row("Shift model:", self.shift_model)
+
             dlg.add_heading("Matching")
             dlg.add_row("Min match score:", self.min_score)
             dlg.add_row("Peak tolerance:", self.peak_tol)
             dlg.add_row("Peak weight:", self.peak_weight)
             dlg.add_row("Corr. weight:", self.corr_weight)
 
-            dlg.add_heading("Residual & multi-phase")
+            dlg.add_heading("Residual & quantification")
             dlg.add_row("Overlap keep:", self.overlap_keep)
             dlg.add_row("Unmatched boost:", self.unmatched_boost)
-            dlg.add_row("Multi-phase max:", self.mp_max)
-            dlg.add_row("Min ΔRwp:", self.mp_delta)
-            dlg.add_row("Min phase scale:", self.mp_min_scale)
+            dlg.add_row("RIR fit FWHM:", self.rir_fwhm)
             self._options = dlg
         self._options.show_centered()
 
@@ -469,7 +598,7 @@ class IdentifyStage(QWidget):
             }
             if is_excluded_hit(entry, seen_ids, seen_names):
                 continue
-            theo = self.theoretical_peaks_for(phase)
+            theo = self.reference_peaks_for(phase)
             if theo:
                 entry["theoretical_peaks"] = theo
             accepted.append(entry)
@@ -503,11 +632,11 @@ class IdentifyStage(QWidget):
             "Check the phases you have already identified, then search the residual"
         )
 
-        self.multi_btn.setEnabled(can and len(accepted) > 1)
-        self.multi_btn.setToolTip(
-            f"Joint Le Bail accept/reject over the {len(accepted)} checked phases"
-            if len(accepted) > 1 else
-            "Check at least two phases in the list to test them together"
+        self.rir_btn.setEnabled(can and len(accepted) > 0)
+        self.rir_btn.setToolTip(
+            f"RIR weight percents for the {len(accepted)} checked phase(s)"
+            if accepted else
+            "Check the phases you want quantified"
         )
 
     def _measured_range(self):
@@ -523,12 +652,18 @@ class IdentifyStage(QWidget):
     # --- theoretical peak access (shared with preview / details) ---
 
     def theoretical_peaks_for(self, result: dict):
-        """Reference peaks for a search hit, match result, or phase dict."""
+        """
+        Reference peaks for a search hit, match result, or phase dict.
+
+        Positions are the unshifted database ones, which is what scoring needs
+        — it fits or applies the shift itself. Use `reference_peaks_for` for
+        anything that has to line up with the measured pattern.
+        """
         if not isinstance(result, dict):
             return None
         theo = result.get("theoretical_peaks")
         if theo and len(theo.get("two_theta", [])) > 0:
-            return theo
+            return unshift_pattern(theo)
 
         phase = result.get("phase", result)
         mineral_id = (
@@ -548,6 +683,13 @@ class IdentifyStage(QWidget):
             pattern = None
         self._theo_cache[key] = pattern
         return pattern
+
+    def reference_peaks_for(self, result: dict):
+        """Reference peaks moved to where this phase's shift puts them."""
+        theo = self.theoretical_peaks_for(result)
+        if not theo:
+            return theo
+        return shift_pattern(theo, self.shift_for(result), self.shift_model_key())
 
     # --- mineral quick-add ---
 
@@ -617,6 +759,9 @@ class IdentifyStage(QWidget):
                     n_peaks=self.fp_n_peaks.value(),
                     min_rel_intensity=self.fp_min_rel.value(),
                     exp_range=self._measured_range(),
+                    shift=self.shift.value(),
+                    shift_span=self.shift_span.value(),
+                    shift_model=self.shift_model_key(),
                 )
                 row["fingerprint"] = info
                 row["fingerprint_score"] = info["score"]
@@ -813,10 +958,17 @@ class IdentifyStage(QWidget):
 
             label = "Residual search" if residual_mode else "Search"
             extra = f" (excluded {dropped} already-found)" if dropped else ""
-            hint = (
-                " Click a row to preview its peaks; arrow keys step through."
-                if candidates else " Try a lower Min fingerprint or a wider 2θ tolerance."
-            )
+            if candidates:
+                hint = " Click a row to preview its peaks; arrow keys step through."
+            elif method == "fingerprint" and self.shift_span.value() <= 0:
+                hint = (
+                    " Try a lower Min fingerprint, or set Auto fit ± to 0.30° — a "
+                    "displaced sample puts every line off position and no phase matches."
+                )
+            else:
+                hint = " Try a lower Min fingerprint or a wider 2θ tolerance."
+            if method == "fingerprint":
+                hint += self._shift_summary(results)
             chance = getattr(self, "_last_chance", 0.0)
             if method == "fingerprint" and chance > 0.5:
                 hint += (
@@ -885,6 +1037,9 @@ class IdentifyStage(QWidget):
         pool_size = self.pool_size.value()
         tol = self.tolerance.value()
         wl = pattern.get("wavelength", self.session.wavelength)
+        shift = self.shift.value()
+        span = self.shift_span.value()
+        model = self.shift_model_key()
         pool = []
 
         # How much of the pattern a reference line can hit by luck; warned about
@@ -902,15 +1057,21 @@ class IdentifyStage(QWidget):
                 min_coverage=self.pool_min_coverage.value(),
                 wavelength=wl,
                 ambient_only=self.ambient_only.isChecked(),
+                shift=shift,
+                shift_span=span,
+                shift_model=model,
             ) or []
         if not pool:
             peak_data = {
-                "two_theta": np.asarray(exp_peaks["two_theta"]),
+                # The legacy engine has no shift of its own, so hand it peaks
+                # already pulled back onto the reference scale
+                "two_theta": remove_shift(exp_peaks["two_theta"], shift, model),
                 "intensity": np.asarray(exp_peaks["intensity"]),
                 "wavelength": wl,
             }
             pool = self.search_engine.search_by_peaks(
-                peak_data, tolerance=self.peak_tol.value(), max_results=pool_size,
+                peak_data, tolerance=self.peak_tol.value() + span,
+                max_results=pool_size,
                 ambient_only=self.ambient_only.isChecked(),
             ) or []
 
@@ -928,6 +1089,9 @@ class IdentifyStage(QWidget):
             exp_range=self._measured_range(),
             dedupe_by_name=self.fp_dedupe.isChecked(),
             exp_weights=exp_weights,
+            shift=shift,
+            shift_span=span,
+            shift_model=model,
         )
         mode = "residual-weighted" if exp_weights is not None else "presence"
         print(
@@ -935,6 +1099,39 @@ class IdentifyStage(QWidget):
             f"(min score {self.fp_min_score.value():.2f})"
         )
         return ranked
+
+    def _shift_summary(self, results: list) -> str:
+        """
+        What the fitted shifts say about the mount, for the status line.
+
+        Every candidate gets its own shift, and a wrong phase will happily
+        invent one, so an average across the list means nothing. What does mean
+        something is how many of the top hits land on the *same* shift: that is
+        the pattern telling you the sample really is displaced.
+        """
+        model = self.shift_model_key()
+        if self.shift_span.value() <= 0:
+            shift = self.shift.value()
+            return f" Reference lines held at {describe_shift(shift, model)}." if shift else ""
+
+        fitted = [
+            float(r["fingerprint"]["shift"])
+            for r in results[:10]
+            if (r.get("fingerprint") or {}).get("shift") is not None
+        ]
+        if not fitted:
+            return ""
+        best = fitted[0]
+        agree = sum(1 for s in fitted if abs(s - best) <= self.tolerance.value())
+        note = (
+            f" Auto fit: the top hit sits at {describe_shift(best, model)}, "
+            f"and {agree} of the top {len(fitted)} agree."
+        )
+        if agree >= 3:
+            note += " Fit to Row on a phase you trust, then set Auto fit to 0 to lock it in."
+        else:
+            note += " Little agreement — treat the fitted shifts as guesses for now."
+        return note
 
     def _ultra_fast(self, pattern, min_correlation, max_results):
         if self.fast_engine.search_index is None:
@@ -993,8 +1190,7 @@ class IdentifyStage(QWidget):
             fast_search_engine=self.fast_engine,
         )
 
-    @staticmethod
-    def _result_to_phase(result: dict) -> dict:
+    def _result_to_phase(self, result: dict) -> dict:
         return {
             "id": result.get("mineral_id"),
             "amcsd_id": result.get("mineral_id"),
@@ -1009,6 +1205,9 @@ class IdentifyStage(QWidget):
             "cell_gamma": result.get("cell_gamma"),
             "rir": result.get("rir"),
             "local_db": True,
+            # Resolved here so matching, plotting, and quantification all place
+            # this phase's lines the same way the search scored them
+            "two_theta_shift": self.shift_for(result),
             "search_score": result.get(
                 "fingerprint_score",
                 result.get(
@@ -1066,7 +1265,8 @@ class IdentifyStage(QWidget):
         self.status.setText("Matching…")
 
         self._match_thread = PhaseMatchingThread(
-            self.session.peaks, phases, self.tolerance.value(), pw, cw
+            self.session.peaks, phases, self.tolerance.value(), pw, cw,
+            shift=self.shift.value(), shift_model=self.shift_model_key(),
         )
         self._match_thread.matching_complete.connect(self._on_match_done)
         self._match_thread.progress_updated.connect(self.progress.setValue)
@@ -1126,96 +1326,84 @@ class IdentifyStage(QWidget):
             n_peaks=self.fp_n_peaks.value(),
             min_rel_intensity=self.fp_min_rel.value(),
             exp_range=self._measured_range(),
+            shift=self.shift_for(result),
+            shift_span=self.shift_span.value(),
+            shift_model=self.shift_model_key(),
         )
         result["fingerprint"] = info
         result["fingerprint_score"] = info["score"]
 
-    def start_multi_phase(self):
+    def run_rir_quant(self):
+        """
+        Weight percents for the checked phases from reference intensity ratios.
+
+        Fast enough to run on the UI thread: one non-negative least squares fit
+        of fixed reference patterns, no refinement. Le Bail lives in the Quant
+        window, where the cell and correction terms can move.
+        """
         pattern = self.session.active_pattern()
-        results = self.accepted_phases() or list(self.session.matched_phases)
-        if not pattern or len(results) < 2:
+        phases = self.accepted_phases() or list(self.session.selected_phases)
+        if not pattern or not phases:
             QMessageBox.warning(
-                self, "Need Two Phases",
-                "Check at least two phases in the list, then run Multi-Phase.\n\n"
-                "It refines them together and keeps only the ones that improve the fit.",
+                self, "No Phases Selected",
+                "Check the phases you want quantified, then RIR Quant.",
             )
             return
-        # The analyzer trial-refines each candidate, so every one needs its lines
-        candidates = []
-        for r in results:
-            phase = dict(r.get("phase", r))
-            theo = r.get("theoretical_peaks") or self.theoretical_peaks_for(r)
-            if theo:
-                phase["theoretical_peaks"] = theo
-                candidates.append(phase)
-        if len(candidates) < 2:
+
+        try:
+            result = rir_quantify(
+                pattern,
+                phases,
+                fwhm=self.rir_fwhm.value(),
+                theoretical_for=self.reference_peaks_for,
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "RIR Error", str(exc))
+            self.status.setText("RIR quantification failed.")
+            return
+
+        if result is None:
             QMessageBox.warning(
                 self, "No Reference Patterns",
-                "Could not load reference peaks for at least two of the checked "
-                "phases, so there is nothing to refine together.",
+                "None of the checked phases has reference lines inside the "
+                "measured 2θ range, so there is nothing to fit.",
             )
             return
 
-        names = ", ".join(p.get("mineral", "?") for p in candidates[:4])
-        self.status.setText(
-            f"Refining {len(candidates)} phases together ({names}) — "
-            "joint Le Bail can take a couple of minutes…"
-        )
-        self.progress.setVisible(True)
-        self.progress.setRange(0, 0)
-        self.multi_btn.setEnabled(False)
+        # The fitted profile is the phase's share of the observed intensity, which
+        # is what the plot needs to draw its reference lines at the right height
+        for fitted in result["phases"]:
+            entry = fitted.get("entry")
+            if isinstance(entry, dict):
+                entry["contribution"] = fitted["profile"]
 
-        self._multi_thread = MultiPhaseThread(
-            self.multi_phase_analyzer,
-            {
-                "two_theta": pattern["two_theta"],
-                "intensity": pattern["intensity"],
-                "wavelength": self.session.wavelength,
-            },
-            candidates,
-            self.mp_max.value(),
-            self.mp_delta.value(),
-            self.mp_min_scale.value(),
-        )
-        self._multi_thread.finished_ok.connect(self._on_multi_phase_done)
-        self._multi_thread.failed.connect(self._on_multi_phase_failed)
-        self._multi_thread.start()
+        self.session.set_rir_results(result)
+        for line in rir_summary_lines(result):
+            print(line)
 
-    def _on_multi_phase_failed(self, message: str):
-        self.progress.setVisible(False)
-        self.update_action_states()
-        self.status.setText("Multi-phase analysis failed.")
-        QMessageBox.critical(self, "Multi-Phase Error", message)
-
-    def _on_multi_phase_done(self, out: dict):
-        self.progress.setVisible(False)
-        identified = out.get("identified_phases") or []
-        if identified:
-            wrapped = []
-            for p in identified:
-                if isinstance(p, dict) and "phase" in p:
-                    wrapped.append(p)
-                else:
-                    wrapped.append({
-                        "phase": p if isinstance(p, dict) else {"mineral": str(p)},
-                        "match_score": 1.0,
-                        "combined_score": 1.0,
-                    })
-            self._kept_phases = wrapped
-            self.session.set_matched_phases(wrapped)
-            self.session.set_selected_phases(wrapped)
-            self.workspace.set_results_matches(wrapped, preselect=wrapped)
-            rejected = [
-                t["phase"] for t in (out.get("trial_history") or []) if not t.get("accepted")
-            ]
-            note = f" Rejected: {', '.join(rejected[:4])}." if rejected else ""
-            self.status.setText(
-                f"Multi-phase kept {len(wrapped)} phase(s).{note}"
+        quantified = [p for p in result["phases"] if p.get("weight_percent") is not None]
+        if quantified:
+            headline = ", ".join(
+                f"{p['name']} {p['weight_percent']:.1f}%" for p in quantified[:4]
             )
+            extra = "" if len(quantified) <= 4 else f" +{len(quantified) - 4} more"
+            note = ""
+            if result["missing_rir"]:
+                note = (
+                    f" No RIR for {', '.join(result['missing_rir'][:3])} — "
+                    "excluded from the normalization."
+                )
+            self.status.setText(
+                f"RIR wt%: {headline}{extra} (fit Rwp {result['rwp']:.1f}%, "
+                f"{result['explained_fraction'] * 100:.0f}% of intensity explained).{note}"
+            )
+            self.workspace.set_status(f"RIR quantification: {headline}{extra}")
         else:
             self.status.setText(
-                "Multi-phase analysis kept no phases — none improved the joint fit."
+                "No phase could be quantified — none of the checked phases has a "
+                "RIR value in the database, or all fitted to zero."
             )
+            self.workspace.set_status("RIR quantification: nothing to report")
         self.update_action_states()
         self.workspace.refresh_plot()
 

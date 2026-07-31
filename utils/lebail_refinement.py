@@ -4,9 +4,11 @@ Implements proper crystallographic refinement with profile functions and unit ce
 """
 
 import numpy as np
-from scipy.optimize import minimize, differential_evolution
+import itertools
+
+from scipy.optimize import minimize, differential_evolution, nnls
 from scipy.interpolate import interp1d
-from scipy.special import wofz
+from scipy.special import eval_legendre, wofz
 from typing import Dict, List, Tuple, Optional
 import copy
 import warnings
@@ -36,8 +38,54 @@ class LeBailRefinement:
         self.quiet = False
         self.mode = 'polish'  # 'trial' | 'polish'
         self.peak_intensity_cutoff = 0.0  # fraction of Imax; trial uses ~0.02
-        self.extract_iterations = 5
+        self.extract_iterations = 3
         self._profile_cache = {}  # (phase_idx, cache_key) -> sparse profile parts
+        self._x0 = 0.0
+        self._dx = 0.02
+        self._n = 0
+        # Cap on peaks x window elements for the vectorised profile matrix
+        self._max_window_elements = 8_000_000
+
+    def _update_grid(self):
+        """Cache grid geometry used for windowed profile evaluation"""
+        x = self.experimental_data['two_theta'] if self.experimental_data else None
+        if x is None or len(x) == 0:
+            self._x0, self._dx, self._n = 0.0, 0.02, 0
+            return
+        self._x0 = float(x[0])
+        self._n = len(x)
+        self._dx = float(np.median(np.diff(x))) if len(x) > 1 else 0.02
+        if self._dx <= 0:
+            self._dx = 0.02
+        self._mid_two_theta = 45.0  # anchor for angle-dependent corrections
+
+        # Instrument terms shared by every phase. Fitting these per phase lets
+        # one phase absorb an instrument error and drift off its true cell.
+        self.global_parameters = {
+            'zero_shift': 0.0,      # constant 2-theta offset (degrees)
+            'displacement': 0.0,    # specimen displacement: d(2-theta) = disp * cos(theta)
+            'refine_zero_shift': True,
+            'refine_displacement': False,
+        }
+
+        # 'extract': classic Le Bail, intensities partitioned out of the observed
+        #            pattern. Best profile/cell fit, but scale and the intensity
+        #            corrections are absorbed and cannot be determined.
+        # 'fixed':   calculated intensities stay tied to the reference pattern and
+        #            one scale per phase is refined. Required for quantification.
+        self.intensity_model = 'extract'
+
+    def set_global_parameters(self, **values):
+        """Update shared instrument parameters and their refine flags."""
+        for key, value in values.items():
+            if key in self.global_parameters:
+                self.global_parameters[key] = value
+
+    def _uses_fixed_intensities(self, params: Optional[Dict] = None) -> bool:
+        """True when calculated intensities come from the reference pattern."""
+        if params is not None and params.get('_use_scaled_pattern'):
+            return True
+        return self.mode == 'trial' or self.intensity_model == 'fixed'
         
     def set_experimental_data(self, two_theta: np.ndarray, intensity: np.ndarray, 
                             errors: Optional[np.ndarray] = None,
@@ -77,10 +125,15 @@ class LeBailRefinement:
             'original_max_intensity': max_intensity  # Store for reference
         }
         self.two_theta_range = two_theta_range
+        self._update_grid()
         
         # Apply 2-theta range filter if specified
         if self.two_theta_range is not None:
             self._apply_two_theta_filter()
+        
+        tt = self.experimental_data['two_theta']
+        if len(tt) > 0:
+            self._mid_two_theta = float(0.5 * (np.min(tt) + np.max(tt)))
         
     def add_phase(self, phase_data: Dict, initial_parameters: Optional[Dict] = None):
         """
@@ -103,11 +156,20 @@ class LeBailRefinement:
             'v_param': -0.001,    # Peak width parameter V  
             'w_param': 0.01,      # Peak width parameter W
             'eta_param': 0.5,     # Pseudo-Voigt mixing parameter
-            'zero_shift': 0.0,    # Zero point shift
+            'zero_shift': 0.0,    # legacy per-phase offset; the global term is used now
             'unit_cell': self._extract_unit_cell(phase_data),
+            # Isotropic lattice dilation: every d-spacing scales by this factor.
+            # Anisotropic a/b/c refinement needs Miller indices, which the stored
+            # reference patterns do not carry.
+            'lattice_scale': 1.0,
+            'absorption': 0.0,        # angle-dependent intensity loss
+            'harmonic_order': 0,      # even spherical-harmonic order (0, 2, 4, 6)
+            'harmonic_coeffs': [],
             'refine_cell': True,
             'refine_profile': True,
             'refine_scale': True,
+            'refine_absorption': False,
+            'refine_harmonics': False,
             'refine_intensities': False  # Pawley-style intensity refinement
         }
         
@@ -121,6 +183,15 @@ class LeBailRefinement:
             default_params['peak_intensity_multipliers'] = np.ones(n_peaks)
         else:
             default_params['peak_intensity_multipliers'] = None
+
+        order = int(default_params.get('harmonic_order', 0) or 0)
+        n_harmonics = max(0, order // 2)
+        coeffs = list(default_params.get('harmonic_coeffs') or [])
+        if len(coeffs) != n_harmonics:
+            coeffs = (coeffs + [0.0] * n_harmonics)[:n_harmonics]
+        default_params['harmonic_coeffs'] = coeffs
+        # Lattice dilation is refined against the starting cell, so keep a copy
+        default_params['_base_unit_cell'] = dict(default_params['unit_cell'])
             
         phase = {
             'data': phase_data,
@@ -153,6 +224,7 @@ class LeBailRefinement:
         self.experimental_data['two_theta'] = two_theta[mask]
         self.experimental_data['intensity'] = self._original_experimental_data['intensity'][mask]
         self.experimental_data['errors'] = self._original_experimental_data['errors'][mask]
+        self._update_grid()
         
         self._log(f"Applied 2-theta range filter: {min_2theta:.2f}° - {max_2theta:.2f}°")
         self._log(f"Data points: {len(two_theta)} → {len(self.experimental_data['two_theta'])}")
@@ -234,8 +306,28 @@ class LeBailRefinement:
             'beta': phase_info.get('cell_beta', 90.0) if phase_info.get('cell_beta') else 90.0,
             'gamma': phase_info.get('cell_gamma', 90.0) if phase_info.get('cell_gamma') else 90.0
         }
+        unit_cell['volume'] = self._cell_volume(unit_cell)
         
         return unit_cell
+
+    @staticmethod
+    def _cell_volume(cell: Dict) -> float:
+        """Triclinic cell volume, valid for every crystal system."""
+        try:
+            a, b, c = float(cell['a']), float(cell['b']), float(cell['c'])
+            alpha, beta, gamma = (
+                np.radians(float(cell.get('alpha', 90.0))),
+                np.radians(float(cell.get('beta', 90.0))),
+                np.radians(float(cell.get('gamma', 90.0))),
+            )
+        except (KeyError, TypeError, ValueError):
+            return 0.0
+        term = (
+            1.0
+            - np.cos(alpha) ** 2 - np.cos(beta) ** 2 - np.cos(gamma) ** 2
+            + 2.0 * np.cos(alpha) * np.cos(beta) * np.cos(gamma)
+        )
+        return float(a * b * c * np.sqrt(max(term, 0.0)))
         
     def refine_phases(self, max_iterations: int = 20, 
                      convergence_threshold: float = 1e-5,
@@ -279,10 +371,17 @@ class LeBailRefinement:
         else:
             self.peak_intensity_cutoff = 0.0
             self.extract_iterations = 5
+            fixed = self.intensity_model == 'fixed'
             for phase in self.phases:
-                phase['parameters']['_use_scaled_pattern'] = False
+                phase['parameters']['_use_scaled_pattern'] = fixed
+            self._log(
+                "Intensity model: reference intensities with refined scale"
+                if fixed else
+                "Intensity model: Le Bail extraction (scale and corrections not determinable)"
+            )
 
         self._profile_cache = {}
+        self._global_scan_pass = 0
 
         # Update 2-theta range if provided
         if two_theta_range is not None and two_theta_range != self.two_theta_range:
@@ -313,6 +412,12 @@ class LeBailRefinement:
         self.refinement_history = []
         previous_rwp = float('inf')
         rwp_change = float('inf')
+
+        # Align the pattern before solving the scales. Fitting scales against
+        # misaligned peaks drives a real phase towards zero, and a phase that
+        # starts at zero contributes nothing for the position search to work with.
+        self._refine_global_parameters()
+        self._initialize_scales()
         
         # STAGE 1: Refine unit cell and zero shift only (if staged refinement)
         if staged_refinement and self.mode == 'polish':
@@ -327,6 +432,7 @@ class LeBailRefinement:
             for iteration in range(stage1_iterations):
                 self._log(f"\nStage 1 - Iteration {iteration + 1}/{stage1_iterations}")
                 
+                self._refine_global_parameters()
                 for phase_idx, phase in enumerate(self.phases):
                     self._refine_single_phase(phase_idx)
                 
@@ -361,6 +467,7 @@ class LeBailRefinement:
             stage_label = "Stage 2 - " if (staged_refinement and self.mode == 'polish') else ""
             self._log(f"\n=== {stage_label}Le Bail Iteration {actual_iteration} ===")
             
+            self._refine_global_parameters()
             for phase_idx, phase in enumerate(self.phases):
                 phase_name = phase['data']['phase'].get('mineral', f'Phase_{phase_idx}')
                 self._log(f"Refining {phase_name}...")
@@ -412,13 +519,128 @@ class LeBailRefinement:
             'calculated_pattern': self.refinement_history[-1]['calculated_pattern'],
             'refinement_history': self.refinement_history,
             'two_theta': self.experimental_data['two_theta'].copy(),
-            'experimental_intensity': self.experimental_data['intensity'].copy()
+            'experimental_intensity': self.experimental_data['intensity'].copy(),
+            'global_parameters': dict(self.global_parameters),
+            'intensity_model': self.intensity_model,
+            'phase_summary': self.phase_summary(),
         }
         
         self.r_factors = final_results['final_r_factors']
         
         return final_results
         
+    def _initialize_scales(self):
+        """
+        Solve every phase scale at once by non-negative least squares.
+
+        The scales enter the calculated pattern linearly, so they can be solved
+        outright instead of being searched for. Starting the nonlinear refinement
+        from the right order of magnitude matters: with scales badly wrong, the
+        first fit of the position parameters shifts peaks to compensate and the
+        refinement settles into a poor minimum it never leaves.
+        """
+        if not self._uses_fixed_intensities() or not self.phases:
+            return
+        columns = []
+        for index, phase in enumerate(self.phases):
+            params = dict(phase['parameters'])
+            params['scale_factor'] = 1.0
+            columns.append(self._calculate_phase_pattern(index, params))
+        design = np.column_stack(columns)
+        if not np.any(design > 0):
+            return
+        try:
+            scales, _ = nnls(design, self.experimental_data['intensity'])
+        except Exception as e:
+            self._log(f"Scale initialization failed: {e}")
+            return
+        for phase, scale in zip(self.phases, scales):
+            if scale > 0:
+                phase['parameters']['scale_factor'] = float(scale)
+        self._log(
+            "  Initial scales (least squares): "
+            + ", ".join(f"{p['parameters']['scale_factor']:.4f}" for p in self.phases)
+        )
+
+    # Half-width of the global search window per pass, in degrees. It shrinks
+    # because the phase lattices move underneath and the instrument terms have to
+    # be re-searched, not just nudged, until both have settled.
+    _GLOBAL_SCAN_SCHEDULE = (0.40, 0.10, 0.03, 0.01)
+
+    def _refine_global_parameters(self):
+        """
+        Refine the instrument terms shared by all phases against the full pattern.
+
+        Done in one step over the total calculated pattern rather than per phase,
+        so a zero-point error cannot be soaked up by one phase's lattice.
+
+        Each pass scans a window around the current values before polishing
+        locally. Zero shift and specimen displacement are nearly collinear over a
+        limited 2-theta range, since cos(theta) barely varies, so a local
+        optimizer slides along that degenerate valley into a bound instead of
+        finding the combination that fits both ends of the pattern.
+        """
+        names = []
+        vector = []
+        bounds = []
+        if self.global_parameters.get('refine_zero_shift', False):
+            names.append('zero_shift')
+            vector.append(float(self.global_parameters.get('zero_shift', 0.0)))
+            bounds.append((-0.5, 0.5))
+        if self.global_parameters.get('refine_displacement', False):
+            names.append('displacement')
+            vector.append(float(self.global_parameters.get('displacement', 0.0)))
+            bounds.append((-0.5, 0.5))
+        if not names:
+            return
+
+        saved = {name: self.global_parameters[name] for name in names}
+        observed = self.experimental_data['intensity']
+        errors = self.experimental_data['errors']
+
+        def objective(x):
+            for name, value in zip(names, x):
+                self.global_parameters[name] = float(value)
+            residual = (observed - self._calculate_total_pattern()) / errors
+            return float(np.sum(residual ** 2))
+
+        try:
+            scan_pass = getattr(self, '_global_scan_pass', 0)
+            if scan_pass < len(self._GLOBAL_SCAN_SCHEDULE):
+                half_width = self._GLOBAL_SCAN_SCHEDULE[scan_pass]
+                grids = [
+                    np.clip(
+                        np.linspace(center - half_width, center + half_width, 21),
+                        low, high,
+                    )
+                    for center, (low, high) in zip(vector, bounds)
+                ]
+                best_value = objective(vector)
+                best_point = list(vector)
+                for point in itertools.product(*grids):
+                    value = objective(point)
+                    if value < best_value:
+                        best_value, best_point = value, list(point)
+                vector = best_point
+                self._global_scan_pass = scan_pass + 1
+
+            result = minimize(
+                objective, np.array(vector), bounds=bounds, method='L-BFGS-B',
+                options={'maxiter': 30, 'ftol': 1e-8},
+            )
+            best = result.x if objective(result.x) <= objective(vector) else vector
+            for name, value in zip(names, best):
+                self.global_parameters[name] = float(value)
+            self._log(
+                "  Global: zero shift="
+                f"{self.global_parameters['zero_shift']:+.4f}°, "
+                f"displacement={self.global_parameters['displacement']:+.4f}°"
+            )
+        except Exception as e:
+            for name, value in saved.items():
+                self.global_parameters[name] = value
+            self._log(f"Global parameter refinement failed: {e}")
+
     def _refine_single_phase(self, phase_idx: int):
         """Refine parameters for a single phase"""
         phase = self.phases[phase_idx]
@@ -467,12 +689,20 @@ class LeBailRefinement:
                           f"V={optimized_params['v_param']:.6f}, W={optimized_params['w_param']:.6f}, "
                           f"η={optimized_params['eta_param']:.3f}")
             
-            if 'zero_shift' in optimized_params:
-                self._log(f"  Zero shift: {optimized_params['zero_shift']:.4f}°")
-            
-            if 'cell_a' in optimized_params:
-                cell = optimized_params['unit_cell']
-                self._log(f"  Unit cell: a={cell['a']:.4f}, b={cell['b']:.4f}, c={cell['c']:.4f}")
+            if 'lattice_scale' in optimized_params:
+                cell = optimized_params.get('unit_cell', params.get('unit_cell', {}))
+                self._log(
+                    f"  Lattice scale: {optimized_params['lattice_scale']:.6f} "
+                    f"(a={cell.get('a', 0.0):.4f}, b={cell.get('b', 0.0):.4f}, "
+                    f"c={cell.get('c', 0.0):.4f} Å)"
+                )
+
+            if 'absorption' in optimized_params:
+                self._log(f"  Absorption: {optimized_params['absorption']:.4f}")
+
+            if 'harmonic_coeffs' in optimized_params:
+                coeffs = ", ".join(f"{c:+.3f}" for c in optimized_params['harmonic_coeffs'])
+                self._log(f"  Harmonic coefficients: {coeffs}")
             
             if 'scale_factor' in optimized_params:
                 final_scale = optimized_params['scale_factor']
@@ -481,8 +711,6 @@ class LeBailRefinement:
                     self._log(f"  WARNING: Scale collapsed from {initial_scale:.3f} to {final_scale:.3f}")
             
             phase['parameters'].update(optimized_params)
-            if self.mode == 'polish':
-                self._update_theoretical_peaks(phase_idx)
                 
         except Exception as e:
             self._log(f"Optimization failed for phase {phase_idx}: {e}")
@@ -494,20 +722,23 @@ class LeBailRefinement:
         param_names = []
         
         is_pawley = params.get('refine_intensities', False)
-        use_scaled = params.get('_use_scaled_pattern', False)
+        use_scaled = self._uses_fixed_intensities(params)
         
-        # Refine scale for Pawley OR trial scaled-pattern mode
+        # Scale only means something when calculated intensities are tied to the
+        # reference pattern; Le Bail extraction absorbs it entirely
         if params.get('refine_scale', True) and (is_pawley or use_scaled):
             initial_scale = params['scale_factor']
             param_vector.append(initial_scale)
-            max_scale = params.get('max_scale_bound', 10.0)
-            min_scale = max(0.01, initial_scale * 0.1)
-            max_scale_adjusted = min(max_scale, initial_scale * 10.0)
-            param_bounds.append((min_scale, max_scale_adjusted))
+            # Bounds must not be tied to the current value: a phase that starts
+            # near zero because its peaks were not yet aligned would be locked
+            # there for the rest of the refinement. Zero stays reachable so a
+            # genuinely absent phase can still fall out.
+            upper = max(params.get('max_scale_bound', 10.0), 20.0 * max(initial_scale, 1e-3))
+            param_bounds.append((0.0, upper))
             param_names.append('scale_factor')
-            self._log(f"  Scale bounds: {min_scale:.3f} - {max_scale_adjusted:.3f} (initial: {initial_scale:.3f})")
+            self._log(f"  Scale bounds: 0 - {upper:.3f} (initial: {initial_scale:.4g})")
         elif params.get('refine_scale', True) and not use_scaled:
-            self._log(f"  Scale factor: 1.0 (fixed, using observed intensities)")
+            self._log("  Scale factor: not refinable with Le Bail intensity extraction")
             
         if params.get('refine_profile', True):
             param_vector.extend([
@@ -526,25 +757,24 @@ class LeBailRefinement:
             self._log(f"  Profile params: U={params['u_param']:.6f}, V={params['v_param']:.6f}, "
                       f"W={params['w_param']:.6f}, η={params['eta_param']:.3f}")
             
-        param_vector.append(params['zero_shift'])
-        param_bounds.append((-0.1, 0.1))
-        param_names.append('zero_shift')
-        
+        # Zero shift and specimen displacement are refined globally, not here
         if params.get('refine_cell', True):
-            unit_cell = params['unit_cell']
-            param_vector.extend([
-                unit_cell['a'],
-                unit_cell['b'],
-                unit_cell['c']
-            ])
-            a, b, c = unit_cell['a'], unit_cell['b'], unit_cell['c']
-            param_bounds.extend([
-                (a * 0.95, a * 1.05),
-                (b * 0.95, b * 1.05), 
-                (c * 0.95, c * 1.05)
-            ])
-            param_names.extend(['cell_a', 'cell_b', 'cell_c'])
-        
+            param_vector.append(params.get('lattice_scale', 1.0))
+            param_bounds.append((0.95, 1.05))
+            param_names.append('lattice_scale')
+
+        if params.get('refine_absorption', False) and use_scaled:
+            param_vector.append(params.get('absorption', 0.0))
+            param_bounds.append((-0.5, 0.5))
+            param_names.append('absorption')
+
+        coeffs = params.get('harmonic_coeffs') or []
+        if params.get('refine_harmonics', False) and use_scaled and len(coeffs):
+            for index in range(len(coeffs)):
+                param_vector.append(coeffs[index])
+                param_bounds.append((-0.9, 0.9))
+                param_names.append(f'harmonic_{index}')
+
         if params.get('refine_intensities', False) and params.get('peak_intensity_multipliers') is not None:
             multipliers = params['peak_intensity_multipliers']
             param_vector.extend(multipliers)
@@ -559,6 +789,8 @@ class LeBailRefinement:
         """Convert parameter vector back to parameter dictionary"""
         params = {}
         intensity_multipliers = []
+        harmonics = dict(enumerate(original_params.get('harmonic_coeffs') or []))
+        harmonics_seen = False
         
         for i, name in enumerate(names):
             if name.startswith('cell_'):
@@ -567,11 +799,29 @@ class LeBailRefinement:
                 params['unit_cell'][name[5:]] = vector[i]
             elif name.startswith('intensity_mult_'):
                 intensity_multipliers.append(vector[i])
+            elif name.startswith('harmonic_'):
+                harmonics[int(name.split('_')[1])] = float(vector[i])
+                harmonics_seen = True
             else:
                 params[name] = vector[i]
         
         if intensity_multipliers:
             params['peak_intensity_multipliers'] = np.array(intensity_multipliers)
+        if harmonics_seen:
+            params['harmonic_coeffs'] = [harmonics[k] for k in sorted(harmonics)]
+
+        # A refined lattice dilation is only meaningful if it is also reported as
+        # cell edges, so keep the stored cell in step with it
+        if 'lattice_scale' in params:
+            base = original_params.get('_base_unit_cell') or original_params.get('unit_cell')
+            if base:
+                scale = float(params['lattice_scale'])
+                cell = dict(base)
+                for edge in ('a', 'b', 'c'):
+                    if cell.get(edge):
+                        cell[edge] = float(base[edge]) * scale
+                cell['volume'] = self._cell_volume(cell)
+                params['unit_cell'] = cell
                 
         return params
         
@@ -587,6 +837,76 @@ class LeBailRefinement:
             return positions[mask], intensities[mask]
         return positions, intensities
 
+    def _shift_positions(self, positions: np.ndarray, parameters: Dict) -> np.ndarray:
+        """
+        Reference positions moved by the phase lattice and the shared instrument terms.
+
+        An isotropic lattice dilation scales every d-spacing, so sin(theta) scales
+        by 1/factor. Working in sin(theta) keeps this independent of wavelength.
+        Specimen displacement in Bragg-Brentano geometry adds a cos(theta) term.
+        """
+        positions = np.asarray(positions, dtype=float)
+
+        lattice_scale = float(parameters.get('lattice_scale', 1.0) or 1.0)
+        if lattice_scale > 0 and abs(lattice_scale - 1.0) > 1e-12:
+            sin_theta = np.sin(np.radians(positions / 2.0)) / lattice_scale
+            positions = 2.0 * np.degrees(np.arcsin(np.clip(sin_theta, -1.0, 1.0)))
+
+        positions = positions + float(self.global_parameters.get('zero_shift', 0.0))
+
+        displacement = float(self.global_parameters.get('displacement', 0.0))
+        if displacement != 0.0:
+            positions = positions + displacement * np.cos(np.radians(positions / 2.0))
+        return positions
+
+    def _intensity_corrections(self, positions: np.ndarray, parameters: Dict,
+                               intensities: Optional[np.ndarray] = None) -> np.ndarray:
+        """
+        Per-phase multiplicative intensity corrections.
+
+        Absorption: exp(-a / sin(theta)), the angular form of an absorption or
+        microabsorption loss.
+
+        Texture: an axially symmetric spherical-harmonic expansion over even
+        orders in cos(theta). A full orientation distribution would need Miller
+        indices per reflection, which the stored reference patterns do not carry.
+
+        Both are renormalized so their intensity-weighted mean over this phase's
+        reflections is one. Without that they can rescale the phase wholesale,
+        which is indistinguishable from changing its abundance: the refinement
+        then trades scale against absorption and the weight percents drift. A
+        redistributing correction changes the shape of the phase's intensity
+        envelope, which is what the data can actually determine from one pattern,
+        and leaves the scale factor meaning what it should.
+        """
+        factor = np.ones(len(positions), dtype=float)
+        if len(positions) == 0:
+            return factor
+        theta = np.radians(np.asarray(positions, dtype=float) / 2.0)
+
+        absorption = float(parameters.get('absorption', 0.0) or 0.0)
+        if absorption != 0.0:
+            sin_theta = np.maximum(np.sin(theta), 1e-6)
+            factor *= np.exp(-absorption / sin_theta)
+
+        coeffs = parameters.get('harmonic_coeffs') or []
+        if len(coeffs):
+            cos_theta = np.cos(theta)
+            harmonic = np.ones(len(positions), dtype=float)
+            for index, coefficient in enumerate(coeffs):
+                if coefficient:
+                    harmonic += float(coefficient) * eval_legendre(2 * (index + 1), cos_theta)
+            factor *= np.maximum(harmonic, 0.05)  # never let texture null a peak out
+
+        if intensities is not None and len(intensities) == len(factor):
+            weights = np.asarray(intensities, dtype=float)
+            total = float(np.sum(weights))
+            if total > 0:
+                mean = float(np.sum(weights * factor)) / total
+                if mean > 1e-6:
+                    factor /= mean
+        return factor
+
     def _calculate_phase_pattern(self, phase_idx: int, parameters: Dict) -> np.ndarray:
         """Calculate diffraction pattern for a single phase"""
         phase = self.phases[phase_idx]
@@ -599,17 +919,21 @@ class LeBailRefinement:
         if len(positions) == 0:
             return np.zeros_like(self.experimental_data['two_theta'])
             
-        shifted_positions = positions + parameters.get('zero_shift', 0.0)
+        shifted_positions = self._shift_positions(positions, parameters)
         peak_widths = self._calculate_peak_widths(shifted_positions, parameters)
         scale_factor = parameters.get('scale_factor', 1.0)
         eta = parameters.get('eta_param', 0.5)
         intensity_multipliers = parameters.get('peak_intensity_multipliers')
         is_pawley = intensity_multipliers is not None
-        use_scaled = parameters.get('_use_scaled_pattern', False) or self.mode == 'trial'
+        use_scaled = self._uses_fixed_intensities(parameters)
 
         if use_scaled and not is_pawley:
-            # Fast trial path: scale theoretical intensities (no Le Bail extract)
-            effective = intensities * scale_factor
+            # Calculated intensities stay tied to the reference pattern, so scale
+            # and the correction terms are determinable here
+            effective = (
+                intensities * scale_factor
+                * self._intensity_corrections(shifted_positions, parameters, intensities)
+            )
             return self._accumulate_pseudo_voigt(
                 shifted_positions, peak_widths, effective, eta
             )
@@ -621,10 +945,13 @@ class LeBailRefinement:
             effective = extracted_intensities
         else:
             # Need full peak list for Pawley multipliers — use unfiltered theo peaks
-            all_pos = np.asarray(theo_peaks['two_theta'], dtype=float) + parameters.get('zero_shift', 0.0)
+            all_pos = self._shift_positions(theo_peaks['two_theta'], parameters)
             all_int = np.asarray(theo_peaks['intensity'], dtype=float)
             all_widths = self._calculate_peak_widths(all_pos, parameters)
-            effective = all_int * scale_factor * intensity_multipliers
+            effective = (
+                all_int * scale_factor * intensity_multipliers
+                * self._intensity_corrections(all_pos, parameters, all_int)
+            )
             return self._accumulate_pseudo_voigt(all_pos, all_widths, effective, eta)
 
         return self._accumulate_pseudo_voigt(shifted_positions, peak_widths, effective, eta)
@@ -664,6 +991,15 @@ class LeBailRefinement:
         """
         Le Bail intensity extraction using windowed partitioning.
         Avoids allocating full-length profile arrays per peak.
+
+        Partitioning works with area-normalized profiles, but the caller builds
+        the pattern from unit-height profiles, so the integrated intensities are
+        converted back to heights before returning. Skipping that conversion
+        overpredicts the pattern by the number of points under a peak.
+
+        Each phase is partitioned against its own reflections only, so where two
+        phases overlap both claim the same observed intensity. That is why this
+        mode cannot be used for quantification.
         """
         exp_2theta = self.experimental_data['two_theta']
         exp_intensity = self.experimental_data['intensity']
@@ -679,7 +1015,8 @@ class LeBailRefinement:
 
         # Sparse storage: list of (i_lo, i_hi, normalized_local_profile)
         sparse_profiles = []
-        for pos, width in zip(positions, widths):
+        areas = np.ones(n_peaks)  # points under a unit-height peak
+        for peak_idx, (pos, width) in enumerate(zip(positions, widths)):
             if width <= 0:
                 sparse_profiles.append(None)
                 continue
@@ -695,20 +1032,16 @@ class LeBailRefinement:
             gamma_l = width / 2.0
             lorentzian = 1.0 / (1.0 + ((x_local - pos) / gamma_l) ** 2)
             profile = (1.0 - eta) * gaussian + eta * lorentzian
-            psum = np.sum(profile)
+            psum = float(np.sum(profile))
             if psum > 0:
+                areas[peak_idx] = psum
                 profile = profile / psum
             sparse_profiles.append((i_lo, i_hi, profile))
 
-            # Initial guess from nearest observed intensity
-            closest_idx = int(np.clip(round((pos - x0) / dx), 0, n_pts - 1))
-            extracted[len(sparse_profiles) - 1] = max(0.0, float(exp_intensity[closest_idx]))
-
-        # Fix initial guesses (index was wrong above if some were None) — redo cleanly
-        extracted = np.zeros(n_peaks)
+        # Initial guess from the nearest observed point, as an integrated intensity
         for idx, pos in enumerate(positions):
             closest_idx = int(np.clip(round((pos - x0) / dx), 0, n_pts - 1))
-            extracted[idx] = max(0.0, float(exp_intensity[closest_idx]))
+            extracted[idx] = max(0.0, float(exp_intensity[closest_idx])) * areas[idx]
 
         n_iter = max(1, int(self.extract_iterations))
         for _ in range(n_iter):
@@ -730,7 +1063,7 @@ class LeBailRefinement:
                     fraction = np.where(local_total > 0, contrib / local_total, 0.0)
                 extracted[idx] = float(np.sum(local_obs * fraction))
 
-        return extracted
+        return extracted / np.maximum(areas, 1e-12)
         
     def _calculate_peak_widths(self, two_theta: np.ndarray, parameters: Dict) -> np.ndarray:
         """Calculate peak widths using Caglioti function: FWHM² = U*tan²θ + V*tanθ + W"""
@@ -768,19 +1101,11 @@ class LeBailRefinement:
         
         return profile
         
-    def _update_theoretical_peaks(self, phase_idx: int):
-        """Update theoretical peak positions based on refined unit cell"""
+    def refined_positions(self, phase_idx: int) -> np.ndarray:
+        """Peak positions a phase currently predicts, corrections included."""
         phase = self.phases[phase_idx]
-        params = phase['parameters']
-        
-        if not params.get('refine_cell', True):
-            return
-            
-        zero_shift = params.get('zero_shift', 0.0)
-        original_peaks = phase['data']['theoretical_peaks']
-        
-        phase['theoretical_peaks']['two_theta'] = (
-            original_peaks['two_theta'] + zero_shift
+        return self._shift_positions(
+            phase['theoretical_peaks'].get('two_theta', []), phase['parameters']
         )
         
     def _calculate_total_pattern(self) -> np.ndarray:
@@ -872,7 +1197,11 @@ class LeBailRefinement:
                         'w': phase['parameters']['w_param'],
                         'eta': phase['parameters']['eta_param']
                     },
-                    'zero_shift': phase['parameters']['zero_shift'],
+                    'zero_shift': self.global_parameters.get('zero_shift', 0.0),
+                    'displacement': self.global_parameters.get('displacement', 0.0),
+                    'lattice_scale': phase['parameters'].get('lattice_scale', 1.0),
+                    'absorption': phase['parameters'].get('absorption', 0.0),
+                    'harmonic_coeffs': list(phase['parameters'].get('harmonic_coeffs') or []),
                     'refined_unit_cell': phase['parameters']['unit_cell']
                 },
                 'search_priority': self._calculate_search_priority(phase)
@@ -899,6 +1228,74 @@ class LeBailRefinement:
         
         return priority
         
+    def phase_summary(self) -> List[Dict]:
+        """
+        Per-phase refined values plus RIR weight percents, for display and export.
+
+        Weight percents follow Chung: w_i = (I_i/RIR_i) / sum_j (I_j/RIR_j), with
+        I_i the strongest-line intensity implied by the refined scale. They are
+        only reported for the fixed-intensity model, because Le Bail extraction
+        absorbs the scale factor and leaves nothing to quantify with.
+        """
+        quantitative = self.intensity_model == 'fixed'
+        contributions = self._calculate_phase_contributions() if self.phases else []
+
+        rows = []
+        for index, phase in enumerate(self.phases):
+            params = phase['parameters']
+            info = phase['data'].get('phase', {}) if isinstance(phase.get('data'), dict) else {}
+            theo_intensity = np.asarray(
+                phase['theoretical_peaks'].get('intensity', []), dtype=float
+            )
+            reference_max = float(np.max(theo_intensity)) if len(theo_intensity) else 0.0
+
+            rir = info.get('rir')
+            try:
+                rir = float(rir) if rir is not None else None
+            except (TypeError, ValueError):
+                rir = None
+            if rir is not None and not (np.isfinite(rir) and rir > 0):
+                rir = None
+
+            scale = float(params.get('scale_factor', 1.0))
+            rows.append({
+                'name': info.get('mineral', info.get('mineral_name', f'Phase {index + 1}')),
+                'formula': info.get('formula', info.get('chemical_formula', '')),
+                'scale': scale,
+                'line_intensity': scale * reference_max,
+                'rir': rir,
+                'lattice_scale': float(params.get('lattice_scale', 1.0)),
+                'unit_cell': dict(params.get('unit_cell') or {}),
+                'base_unit_cell': dict(params.get('_base_unit_cell') or {}),
+                'absorption': float(params.get('absorption', 0.0) or 0.0),
+                'harmonic_coeffs': list(params.get('harmonic_coeffs') or []),
+                'profile': {
+                    'u': float(params.get('u_param', 0.0)),
+                    'v': float(params.get('v_param', 0.0)),
+                    'w': float(params.get('w_param', 0.0)),
+                    'eta': float(params.get('eta_param', 0.5)),
+                },
+                'contribution_percent': (
+                    contributions[index]['contribution_percent'] if index < len(contributions) else None
+                ),
+                'integrated_intensity': (
+                    contributions[index]['integrated_intensity'] if index < len(contributions) else None
+                ),
+            })
+
+        terms = [
+            row['line_intensity'] / row['rir']
+            for row in rows
+            if quantitative and row['rir'] and row['line_intensity'] > 0
+        ]
+        total = float(sum(terms))
+        for row in rows:
+            if quantitative and row['rir'] and row['line_intensity'] > 0 and total > 0:
+                row['weight_percent'] = 100.0 * (row['line_intensity'] / row['rir']) / total
+            else:
+                row['weight_percent'] = None
+        return rows
+
     def generate_refinement_report(self) -> str:
         """Generate detailed refinement report"""
         if not self.refinement_history:
@@ -916,7 +1313,17 @@ class LeBailRefinement:
         report.append(f"  Rexp= {final_iteration['r_factors']['Rexp']:.3f}%")
         report.append(f"  GoF = {final_iteration['r_factors']['GoF']:.3f}")
         report.append("")
-        
+
+        report.append("Global parameters:")
+        report.append(f"  Zero shift    = {self.global_parameters.get('zero_shift', 0.0):+.4f}°")
+        report.append(f"  Displacement  = {self.global_parameters.get('displacement', 0.0):+.4f}°")
+        report.append(
+            "  Intensity model = "
+            + ("reference intensities, scale refined" if self.intensity_model == 'fixed'
+               else "Le Bail extraction")
+        )
+        report.append("")
+
         # Phase details
         for i, phase in enumerate(self.phases):
             phase_name = phase['data']['phase'].get('mineral', f'Phase_{i+1}')
@@ -929,17 +1336,30 @@ class LeBailRefinement:
             report.append(f"    V = {params['v_param']:.6f}")
             report.append(f"    W = {params['w_param']:.6f}")
             report.append(f"    η = {params['eta_param']:.3f}")
-            report.append(f"  Zero shift: {params['zero_shift']:.4f}°")
+
+            if params.get('absorption'):
+                report.append(f"  Absorption: {params['absorption']:+.4f}")
+            coeffs = params.get('harmonic_coeffs') or []
+            if any(coeffs):
+                orders = ", ".join(
+                    f"c{2 * (k + 1)}={c:+.3f}" for k, c in enumerate(coeffs)
+                )
+                report.append(f"  Spherical harmonics: {orders}")
             
             if params.get('refine_cell', True):
                 cell = params['unit_cell']
+                base = params.get('_base_unit_cell') or cell
+                scale = params.get('lattice_scale', 1.0)
+                report.append(f"  Lattice scale: {scale:.6f} ({(scale - 1.0) * 100:+.3f}%)")
                 report.append(f"  Unit cell:")
-                report.append(f"    a = {cell['a']:.4f} Å")
-                report.append(f"    b = {cell['b']:.4f} Å") 
-                report.append(f"    c = {cell['c']:.4f} Å")
+                report.append(f"    a = {cell['a']:.4f} Å  (start {base.get('a', 0.0):.4f})")
+                report.append(f"    b = {cell['b']:.4f} Å  (start {base.get('b', 0.0):.4f})")
+                report.append(f"    c = {cell['c']:.4f} Å  (start {base.get('c', 0.0):.4f})")
                 report.append(f"    α = {cell['alpha']:.3f}°")
                 report.append(f"    β = {cell['beta']:.3f}°")
                 report.append(f"    γ = {cell['gamma']:.3f}°")
+                if cell.get('volume'):
+                    report.append(f"    V = {cell['volume']:.3f} Å³")
             
             # Show space group if available
             space_group = phase['data']['phase'].get('space_group', 'Unknown')

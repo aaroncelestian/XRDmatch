@@ -11,6 +11,8 @@ from PyQt5.QtWidgets import (
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
+from utils.two_theta_shift import DISPLACEMENT, describe as describe_shift
+
 
 def _fmt(value, spec: str = "", dash: str = "—") -> str:
     if value is None or value == "":
@@ -134,6 +136,10 @@ class PhaseDetailsDialog(QDialog):
             if missing:
                 preview = ", ".join(f"{m:.2f}°" for m in missing[:6])
                 rows.append(("Missing lines", preview))
+        shift = (theo or {}).get("two_theta_shift") or fp.get("shift")
+        if shift:
+            model = (theo or {}).get("two_theta_shift_model") or fp.get("shift_model")
+            rows.append(("2θ shift", describe_shift(shift, model or DISPLACEMENT)))
         for label, value in rows:
             self.score_form.addRow(label, QLabel(value))
 
@@ -161,7 +167,10 @@ class PhaseDetailsDialog(QDialog):
             return
 
         imax = float(np.max(inten)) if len(inten) and np.max(inten) > 0 else 1.0
-        self.peaks_label.setText(f"Reference peaks ({len(tt)})")
+        # d stays at its database value; only 2θ carries the displacement
+        shift = theo.get("two_theta_shift")
+        note = f" — 2θ shifted {shift:+.3f}°, d as tabulated" if shift else ""
+        self.peaks_label.setText(f"Reference peaks ({len(tt)}){note}")
         self.peaks_table.setRowCount(len(tt))
         for i in range(len(tt)):
             self.peaks_table.setItem(i, 0, QTableWidgetItem(f"{tt[i]:.3f}"))

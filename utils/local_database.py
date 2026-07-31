@@ -941,16 +941,48 @@ class LocalCIFDatabase:
                 conn.close()
             return -1  # Error
 
+    def _iter_dif_blocks(self, path: str) -> list:
+        """
+        Mineral blocks from a bulk DIF file, a zip archive, or a directory.
+
+        AMCSD ships both a single separator-delimited bulk file and archives of
+        one file per mineral, so accept whichever the user has on disk.
+        """
+        if os.path.isdir(path):
+            blocks = []
+            for name in sorted(os.listdir(path)):
+                if not name.lower().endswith(('.dif', '.txt')):
+                    continue
+                with open(os.path.join(path, name), 'r', encoding='utf-8', errors='ignore') as f:
+                    blocks.append(f.read())
+            return blocks
+
+        if path.lower().endswith('.zip'):
+            import zipfile
+            blocks = []
+            with zipfile.ZipFile(path) as archive:
+                for name in archive.namelist():
+                    if name.endswith('/'):
+                        continue
+                    if not name.lower().endswith(('.dif', '.txt')):
+                        continue
+                    blocks.append(archive.read(name).decode('utf-8', 'ignore'))
+            return blocks
+
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+        return self._split_amcsd_dif_blocks(content)
+
     def update_rir_from_dif(self, dif_file_path: str, progress_callback=None) -> Dict[str, int]:
         """
-        Update RIR (and density) on existing minerals from an AMCSD bulk DIF file
+        Update RIR (and density) on existing minerals from AMCSD DIF data
         without re-importing diffraction patterns.
+
+        Accepts a bulk DIF file, a zip archive, or a directory of DIF files.
         """
         stats = {'updated': 0, 'missing': 0, 'no_rir': 0, 'errors': 0}
         try:
-            with open(dif_file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                content = f.read()
-            blocks = self._split_amcsd_dif_blocks(content)
+            blocks = self._iter_dif_blocks(dif_file_path)
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
 

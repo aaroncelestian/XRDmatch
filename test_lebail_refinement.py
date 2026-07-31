@@ -94,7 +94,6 @@ def test_lebail_refinement():
         'v_param': -0.002,
         'w_param': 0.015,
         'eta_param': 0.4,
-        'zero_shift': 0.05,
         'refine_cell': True,
         'refine_profile': True,
         'refine_scale': True
@@ -127,7 +126,9 @@ def test_lebail_refinement():
     print(f"   Profile V: {params['v_param']:.6f}")
     print(f"   Profile W: {params['w_param']:.6f}")
     print(f"   Profile η: {params['eta_param']:.3f}")
-    print(f"   Zero shift: {params['zero_shift']:.4f}°")
+    print(f"   Lattice scale: {params['lattice_scale']:.6f}")
+    print(f"   Zero shift: {results['global_parameters']['zero_shift']:.4f}° (global)")
+    print(f"   Displacement: {results['global_parameters']['displacement']:.4f}° (global)")
     
     # Generate report
     print("\n6. Generating refinement report...")

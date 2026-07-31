@@ -30,6 +30,7 @@ class AnalysisSession(QObject):
         self.matched_phases: List[Dict[str, Any]] = []
         self.selected_phases: List[Dict[str, Any]] = []
         self.lebail_results: Optional[Dict[str, Any]] = None
+        self.rir_results: Optional[Dict[str, Any]] = None
         self.file_path: Optional[str] = None
 
     # --- stage completion helpers ---
@@ -59,6 +60,7 @@ class AnalysisSession(QObject):
         self.matched_phases = []
         self.selected_phases = []
         self.lebail_results = None
+        self.rir_results = None
         self.file_path = pattern.get("file_path")
         if "wavelength" in pattern:
             self.wavelength = float(pattern["wavelength"])
@@ -110,6 +112,10 @@ class AnalysisSession(QObject):
         self.lebail_results = results
         self.refinement_changed.emit()
         self.stage_status_changed.emit()
+
+    def set_rir_results(self, results: Optional[Dict[str, Any]]) -> None:
+        self.rir_results = results
+        self.refinement_changed.emit()
 
     def set_wavelength(self, wavelength: float) -> None:
         self.wavelength = float(wavelength)
