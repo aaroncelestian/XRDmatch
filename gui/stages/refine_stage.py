@@ -58,7 +58,7 @@ class RefineStage(QWidget):
         self.progress.setVisible(False)
         layout.addWidget(self.progress)
 
-        self.status = QLabel("Select matched phases in Search / Match, then refine.")
+        self.status = QLabel("Select matched phases in the Phases tab, then refine.")
         self.status.setObjectName("mutedLabel")
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
@@ -128,7 +128,7 @@ class RefineStage(QWidget):
         n = len(self.session.selected_phases) or len(self.session.matched_phases)
         self.refine_btn.setEnabled(n > 0 and self.session.has_pattern())
         if n == 0:
-            self.status.setText("No phases selected. Match phases in Search / Match first.")
+            self.status.setText("No phases selected. Match phases in the Phases tab first.")
         else:
             self.status.setText(f"{n} phase(s) ready for refinement.")
 

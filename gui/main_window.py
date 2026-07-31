@@ -1,5 +1,5 @@
 """
-Main window for XRD Phase Matching — tabbed analysis workspace.
+Main window for XRD Phase Matching — file browser + tool tabs workspace.
 """
 
 from PyQt5.QtWidgets import (
@@ -12,12 +12,12 @@ from .session import AnalysisSession
 from .workspace import AnalysisWorkspace
 from .dialogs.settings_dialog import SettingsDialog
 from .theme import (
-    apply_theme, toggle_theme, get_current_mode, add_theme_listener, DARK,
+    apply_theme, get_current_mode, add_theme_listener,
 )
 
 
 class XRDMainWindow(QMainWindow):
-    """Main application window hosting the tabbed workspace."""
+    """Main application window hosting the analysis workspace."""
 
     def __init__(self):
         super().__init__()
@@ -45,6 +45,11 @@ class XRDMainWindow(QMainWindow):
         menubar = self.menuBar()
 
         file_menu = menubar.addMenu("&File")
+        open_folder_action = QAction("Open &Folder…", self)
+        open_folder_action.setShortcut("Ctrl+Shift+O")
+        open_folder_action.triggered.connect(self.open_folder)
+        file_menu.addAction(open_folder_action)
+
         open_action = QAction("&Open Pattern...", self)
         open_action.setShortcut(QKeySequence.StandardKey.Open)
         open_action.triggered.connect(self.open_pattern)
@@ -61,31 +66,24 @@ class XRDMainWindow(QMainWindow):
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
 
-        view_menu = menubar.addMenu("&View")
-        self.compress_menu_action = QAction("Compress Control Panel", self)
-        self.compress_menu_action.setShortcut("Ctrl+[")
-        self.compress_menu_action.triggered.connect(self.toggle_compress_panel)
-        view_menu.addAction(self.compress_menu_action)
-
         tools_menu = menubar.addMenu("&Tools")
         peak_action = QAction("&Find Peaks", self)
         peak_action.triggered.connect(self.workspace.find_peaks)
         tools_menu.addAction(peak_action)
 
-        tools_menu.addSeparator()
-        identify_action = QAction("&Identify (Pattern Search)", self)
-        identify_action.triggered.connect(lambda: self.workspace.show_search_tab("identify"))
+        identify_action = QAction("&Phases (Search / Match)", self)
+        identify_action.triggered.connect(lambda: self.workspace.show_bottom_tab("phases"))
         tools_menu.addAction(identify_action)
 
-        quant_action = QAction("&Quant Analysis", self)
-        quant_action.triggered.connect(self.workspace.show_quant_tab)
+        quant_action = QAction("&Quant Analysis…", self)
+        quant_action.triggered.connect(self.workspace.open_quant)
         tools_menu.addAction(quant_action)
 
-        db_action = QAction("&Database", self)
-        db_action.triggered.connect(self.workspace.show_database_tab)
+        tools_menu.addSeparator()
+        db_action = QAction("&Database…", self)
+        db_action.triggered.connect(self.workspace.open_database)
         tools_menu.addAction(db_action)
 
-        tools_menu.addSeparator()
         settings_action = QAction("&Settings…", self)
         settings_action.triggered.connect(self.open_settings)
         tools_menu.addAction(settings_action)
@@ -100,71 +98,37 @@ class XRDMainWindow(QMainWindow):
         toolbar.setMovable(False)
         self.addToolBar(toolbar)
 
-        open_action = QAction("Open", self)
-        open_action.triggered.connect(self.open_pattern)
-        toolbar.addAction(open_action)
-
-        toolbar.addSeparator()
-        find_peaks_action = QAction("Find Peaks", self)
-        find_peaks_action.triggered.connect(self.workspace.find_peaks)
-        toolbar.addAction(find_peaks_action)
-
-        toolbar.addSeparator()
-        self.compress_action = QAction("Compress Panel", self)
-        self.compress_action.setToolTip("Toggle narrow control panel for a wider plot")
-        self.compress_action.triggered.connect(self.toggle_compress_panel)
-        toolbar.addAction(self.compress_action)
-
-        toolbar.addSeparator()
-        self.theme_action = QAction(self._theme_action_label(), self)
-        self.theme_action.setToolTip("Toggle Light / Dark theme")
-        self.theme_action.triggered.connect(self.toggle_app_theme)
-        toolbar.addAction(self.theme_action)
-
-        toolbar.addSeparator()
         settings_action = QAction("Settings", self)
+        settings_action.setToolTip("Application settings (theme and more)")
         settings_action.triggered.connect(self.open_settings)
         toolbar.addAction(settings_action)
 
-    def toggle_compress_panel(self):
-        compressed = self.workspace.toggle_controls_compressed()
-        label = "Expand Panel" if compressed else "Compress Panel"
-        self.compress_action.setText(label)
-        self.compress_menu_action.setText(
-            "Expand Control Panel" if compressed else "Compress Control Panel"
-        )
-        self.status_bar.showMessage(
-            "Control panel compressed" if compressed else "Control panel restored",
-            3000,
-        )
-
-    def _theme_action_label(self) -> str:
-        return "Light Mode" if get_current_mode() == DARK else "Dark Mode"
-
-    def toggle_app_theme(self):
-        toggle_theme(QApplication.instance())
-        if self.settings_dialog is not None:
-            self.settings_dialog.sync_theme_combo(get_current_mode())
+        toolbar.addSeparator()
+        db_action = QAction("Database", self)
+        db_action.setToolTip("Browse and manage the local diffraction database")
+        db_action.triggered.connect(self.workspace.open_database)
+        toolbar.addAction(db_action)
 
     def apply_theme_mode(self, mode: str):
         apply_theme(QApplication.instance(), mode)
 
     def on_theme_changed(self, mode: str):
-        if hasattr(self, "theme_action"):
-            self.theme_action.setText(self._theme_action_label())
         if hasattr(self, "workspace"):
             self.workspace.on_theme_changed(mode)
 
     def setup_statusbar(self):
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage("Ready — load a pattern to begin")
+        self.status_bar.showMessage("Ready — open a folder and select a pattern")
+
+    def open_folder(self):
+        self.workspace.open_folder()
 
     def open_pattern(self):
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "Open Diffraction Pattern",
-            "",
+            self.workspace.file_browser.folder() or "",
             "Data files (*.xy *.xye *.chi *.xml *.txt *.dat *.csv);;All files (*.*)",
         )
         if file_path:
@@ -210,11 +174,10 @@ class XRDMainWindow(QMainWindow):
             "About XRD Phase Matcher",
             """<h3>XRD Phase Matcher</h3>
             <p>XRD phase identification and quantitative analysis</p>
-            <p><b>Tabs:</b> Search / Match · Quant Analysis · Database</p>
             <ul>
-            <li>Pattern loading and preprocessing</li>
-            <li>Ultra-fast pattern search and phase matching</li>
-            <li>Le Bail refinement and export</li>
+            <li>Browse folders and load diffraction patterns</li>
+            <li>Background, peak finding, and phase matching</li>
+            <li>Le Bail refinement in a dedicated Quant window</li>
             <li>Local CIF database management</li>
             </ul>
             <p>Built with PyQt5 and scientific Python libraries</p>""",

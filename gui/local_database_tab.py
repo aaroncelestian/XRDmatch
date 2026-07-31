@@ -7,7 +7,8 @@ from pathlib import Path
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
                              QLabel, QTableWidget, QTableWidgetItem, QGroupBox,
                              QProgressBar, QTextEdit, QFileDialog, QMessageBox,
-                             QSplitter, QLineEdit, QComboBox, QSpinBox, QRadioButton)
+                             QSplitter, QLineEdit, QComboBox, QSpinBox, QRadioButton,
+                             QDoubleSpinBox)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from utils.local_database import LocalCIFDatabase
 
@@ -225,6 +226,28 @@ class LocalDatabaseTab(QWidget):
         grid.addLayout(right_col)
         layout.addLayout(grid)
 
+        # Ultra-fast search index (Phases tab uses this; build/rebuild lives here only)
+        index_row = QHBoxLayout()
+        index_row.addWidget(QLabel("Index grid:"))
+        self.index_grid_spin = QDoubleSpinBox()
+        self.index_grid_spin.setRange(0.005, 0.1)
+        self.index_grid_spin.setDecimals(3)
+        self.index_grid_spin.setValue(0.02)
+        self.index_grid_spin.setSuffix("°")
+        self.index_grid_spin.setMaximumWidth(110)
+        self.index_grid_spin.setToolTip("Grid resolution for the ultra-fast search index")
+        index_row.addWidget(self.index_grid_spin)
+        self.build_index_btn = QPushButton("Build Search Index")
+        self.build_index_btn.setToolTip(
+            "Build or rebuild the ultra-fast pattern search index used by Phases search"
+        )
+        self.build_index_btn.clicked.connect(self.build_search_index)
+        index_row.addWidget(self.build_index_btn)
+        self.index_status_label = QLabel("")
+        self.index_status_label.setObjectName("mutedLabel")
+        index_row.addWidget(self.index_status_label, 1)
+        layout.addLayout(index_row)
+
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         layout.addWidget(self.progress_bar)
@@ -344,6 +367,55 @@ class LocalDatabaseTab(QWidget):
                 
         except Exception as e:
             self.stats_label.setText(f"Database error: {e}")
+
+    def build_search_index(self):
+        """Build or rebuild the ultra-fast pattern search index."""
+        try:
+            from utils.fast_pattern_search import FastPatternSearchEngine
+
+            self.build_index_btn.setEnabled(False)
+            self.build_index_btn.setText("Building…")
+            self.index_status_label.setText("Building index…")
+            self.progress_bar.setVisible(True)
+            self.progress_bar.setRange(0, 0)
+            self.status_label.setText("Building search index…")
+
+            engine = FastPatternSearchEngine()
+            ok = engine.build_search_index(
+                grid_resolution=self.index_grid_spin.value(),
+                force_rebuild=True,
+            )
+            if ok:
+                stats = engine.get_search_statistics()
+                self.index_status_label.setText(
+                    f"Ready · {stats.get('database_size', '?')} patterns · "
+                    f"{stats.get('matrix_size_mb', 0):.0f} MB"
+                )
+                QMessageBox.information(
+                    self,
+                    "Index Built",
+                    "Search index built successfully.\n\n"
+                    f"Database size: {stats.get('database_size', '?')} patterns\n"
+                    f"Grid points: {stats.get('grid_points', '?')}\n"
+                    f"Build time: {stats.get('index_build_time_s', 0):.2f}s\n"
+                    f"Memory usage: {stats.get('matrix_size_mb', 0):.1f} MB",
+                )
+                self.status_label.setText("Search index ready")
+            else:
+                self.index_status_label.setText("Build failed")
+                QMessageBox.warning(
+                    self, "Build Failed",
+                    "Failed to build search index. Check the console for details.",
+                )
+                self.status_label.setText("Search index build failed")
+        except Exception as e:
+            self.index_status_label.setText("Build failed")
+            QMessageBox.critical(self, "Build Error", f"Error building index:\n{e}")
+            self.status_label.setText("Search index build failed")
+        finally:
+            self.build_index_btn.setEnabled(True)
+            self.build_index_btn.setText("Build Search Index")
+            self.progress_bar.setVisible(False)
     
     def import_single_dif(self):
         """Import a single DIF file"""

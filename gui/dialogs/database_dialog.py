@@ -1,5 +1,6 @@
 """Database Manager dialog — hosts LocalDatabaseTab outside the main workflow."""
 
+from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QDialog, QVBoxLayout, QDialogButtonBox
 
 from gui.local_database_tab import LocalDatabaseTab
@@ -9,6 +10,8 @@ class DatabaseManagerDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Database Manager")
+        self.setWindowModality(Qt.NonModal)
+        self.setAttribute(Qt.WA_DeleteOnClose, False)
         self.resize(900, 700)
 
         layout = QVBoxLayout(self)

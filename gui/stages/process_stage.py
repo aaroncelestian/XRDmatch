@@ -1,13 +1,13 @@
-"""Process stage — background subtraction and peak finding."""
+"""Process stage — background subtraction and peak finding (split panels)."""
 
 from __future__ import annotations
 
 import numpy as np
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
-    QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout,
-    QLabel, QMessageBox, QPushButton, QSizePolicy, QSlider, QSpinBox, QToolBox,
-    QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QHBoxLayout,
+    QLabel, QMessageBox, QPushButton, QScrollArea, QSizePolicy, QSlider,
+    QSpinBox, QToolBox, QVBoxLayout, QWidget,
 )
 from scipy.ndimage import median_filter, uniform_filter1d
 from scipy.signal import find_peaks
@@ -32,8 +32,7 @@ def als_baseline(y, lam=1e5, p=0.01, niter=10):
         return np.zeros_like(y)
 
 
-def _compact_field(widget, max_width: int = 120):
-    """Keep spinboxes/combos from stretching across the control column."""
+def _compact_field(widget, max_width: int = 140):
     widget.setMaximumWidth(max_width)
     widget.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
     return widget
@@ -45,34 +44,46 @@ def _compact_form(form: QFormLayout):
     form.setLabelAlignment(Qt.AlignLeft)
 
 
+def _wrap_scroll(content: QWidget) -> QScrollArea:
+    scroll = QScrollArea()
+    scroll.setWidgetResizable(True)
+    scroll.setFrameShape(QScrollArea.NoFrame)
+    scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    scroll.setWidget(content)
+    return scroll
+
+
 class ProcessStage(QWidget):
+    """Coordinator for background + peak finding; UI lives in split panels."""
+
     def __init__(self, session, workspace, parent=None):
         super().__init__(parent)
         self.session = session
         self.workspace = workspace
         self._background = None
-        self._build_ui()
+        self.background_panel = self._build_background_panel()
+        self.peaks_panel = self._build_peaks_panel()
+        # Keep a trivial layout so the QWidget is valid if ever shown alone
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(QLabel("Process controls live in Background / Peaks tabs."))
 
-    def _build_ui(self):
-        layout = QVBoxLayout(self)
+    def _build_background_panel(self) -> QWidget:
+        content = QWidget()
+        layout = QVBoxLayout(content)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(8)
 
-        # --- Background & smoothing ---
-        bg_group = QGroupBox("Background & Smoothing")
-        bg_layout = QVBoxLayout(bg_group)
-        bg_layout.setSpacing(6)
-
         self.enable_bg = QCheckBox("Background subtraction (ALS)")
         self.enable_bg.setChecked(True)
-        bg_layout.addWidget(self.enable_bg)
+        layout.addWidget(self.enable_bg)
 
         bg_form = QFormLayout()
         _compact_form(bg_form)
         self.lambda_slider = QSlider(Qt.Horizontal)
         self.lambda_slider.setRange(2, 8)
         self.lambda_slider.setValue(5)
-        self.lambda_slider.setMaximumWidth(160)
+        self.lambda_slider.setMaximumWidth(220)
         self.lambda_label = QLabel("1e5")
         self.lambda_slider.valueChanged.connect(
             lambda v: self.lambda_label.setText(f"1e{v}")
@@ -112,13 +123,26 @@ class ProcessStage(QWidget):
         self.displacement.setSingleStep(0.001)
         self.displacement.setValue(0.0)
         bg_form.addRow("2θ offset (°):", self.displacement)
-        bg_layout.addLayout(bg_form)
-        layout.addWidget(bg_group)
+        layout.addLayout(bg_form)
 
-        # --- Peak finding ---
-        peak_group = QGroupBox("Peak Finding")
-        peak_layout = QVBoxLayout(peak_group)
-        peak_layout.setSpacing(6)
+        self.apply_btn = QPushButton("Apply Processing")
+        self.apply_btn.setObjectName("primaryButton")
+        self.apply_btn.setToolTip("Apply background subtraction and smoothing")
+        self.apply_btn.clicked.connect(self.apply_processing)
+        layout.addWidget(self.apply_btn)
+
+        self.bg_status = QLabel("Load a pattern first.")
+        self.bg_status.setObjectName("mutedLabel")
+        self.bg_status.setWordWrap(True)
+        layout.addWidget(self.bg_status)
+        layout.addStretch()
+        return _wrap_scroll(content)
+
+    def _build_peaks_panel(self) -> QWidget:
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
 
         peak_form = QFormLayout()
         _compact_form(peak_form)
@@ -150,10 +174,8 @@ class ProcessStage(QWidget):
             "High/Medium/Low sets relative prominence to ~1% / 2% / 5% of max intensity"
         )
         peak_form.addRow("Sensitivity:", self.sensitivity)
-        peak_layout.addLayout(peak_form)
-        layout.addWidget(peak_group)
+        layout.addLayout(peak_form)
 
-        # --- Advanced (peak detection extras) ---
         toolbox = QToolBox()
         adv = QWidget()
         adv_layout = QFormLayout(adv)
@@ -176,35 +198,33 @@ class ProcessStage(QWidget):
         toolbox.addItem(adv, "Advanced")
         layout.addWidget(toolbox)
 
-        # Actions below advanced
-        btn_row = QHBoxLayout()
-        self.apply_btn = QPushButton("Apply Processing")
-        self.apply_btn.setObjectName("primaryButton")
-        self.apply_btn.setToolTip("Apply background subtraction and smoothing")
-        self.apply_btn.clicked.connect(self.apply_processing)
-        btn_row.addWidget(self.apply_btn)
-
         self.peaks_btn = QPushButton("Find Peaks")
         self.peaks_btn.setObjectName("primaryButton")
         self.peaks_btn.setToolTip("Detect peaks on the processed pattern")
         self.peaks_btn.clicked.connect(self.find_peaks)
-        btn_row.addWidget(self.peaks_btn)
-        layout.addLayout(btn_row)
+        layout.addWidget(self.peaks_btn)
 
-        self.status = QLabel("Load a pattern first.")
-        self.status.setObjectName("mutedLabel")
-        self.status.setWordWrap(True)
-        layout.addWidget(self.status)
+        self.peak_status = QLabel("Apply background, then find peaks.")
+        self.peak_status.setObjectName("mutedLabel")
+        self.peak_status.setWordWrap(True)
+        layout.addWidget(self.peak_status)
         layout.addStretch()
+        return _wrap_scroll(content)
+
+    @property
+    def status(self):
+        """Back-compat alias used by older call sites."""
+        return self.peak_status
 
     def on_enter(self):
         if self.session.has_pattern():
-            self.status.setText("Apply background/smoothing, then Find Peaks.")
+            self.bg_status.setText("Adjust background, then Apply Processing.")
+            self.peak_status.setText("Apply background/smoothing, then Find Peaks.")
             if self.session.processed_pattern is None:
-                # Seed processed = raw for plotting
                 self.apply_processing(silent=True)
         else:
-            self.status.setText("Load a pattern first.")
+            self.bg_status.setText("Load a pattern first.")
+            self.peak_status.setText("Load a pattern first.")
 
     def apply_processing(self, silent=False):
         raw = self.session.raw_pattern
@@ -216,7 +236,6 @@ class ProcessStage(QWidget):
         intensity = np.asarray(raw["intensity"], dtype=float).copy()
         two_theta = np.asarray(raw["two_theta"], dtype=float).copy()
 
-        # Displacement
         offset = self.displacement.value()
         if abs(offset) > 1e-12:
             two_theta = two_theta + offset
@@ -250,7 +269,7 @@ class ProcessStage(QWidget):
         self.session.set_processed_pattern(processed, background=background)
         self.workspace.refresh_plot()
         if not silent:
-            self.status.setText("Processing applied.")
+            self.bg_status.setText("Processing applied.")
             self.workspace.set_status("Processing applied")
 
     def find_peaks(self):
@@ -273,7 +292,6 @@ class ProcessStage(QWidget):
         min_sep = self.min_sep.value()
         sensitivity = self.sensitivity.currentIndex()
 
-        # Detection signal: optional light smooth to kill shoulder spikes
         detect = intensity.copy()
         if self.detect_smooth.isChecked():
             win = max(3, min(11, int(round(0.08 / max(self._median_step(two_theta), 1e-6)))))
@@ -284,13 +302,11 @@ class ProcessStage(QWidget):
         imax = float(np.max(detect)) if len(detect) else 1.0
         noise = self._estimate_noise(detect)
 
-        # Relative prominence by sensitivity (High / Medium / Low)
         rel_frac = (0.01, 0.025, 0.05)[sensitivity]
         prominence_threshold = max(float(min_prominence), rel_frac * imax, 3.0 * noise)
         height_threshold = max(float(min_height), 2.0 * noise)
 
         step = self._median_step(two_theta)
-        # scipy distance is in samples; convert ° → points (at least 2)
         dist_pts = max(2, int(np.ceil(min_sep / max(step, 1e-6))))
 
         peaks_idx, _ = find_peaks(
@@ -302,12 +318,10 @@ class ProcessStage(QWidget):
         )
         peaks_idx = [int(i) for i in peaks_idx if two_theta[int(i)] >= 3.0]
 
-        # Snap each candidate to the true local max on the unsmoothed curve
         peaks_idx = [
             self._refine_to_local_max(intensity, i, half_window=max(2, dist_pts // 2))
             for i in peaks_idx
         ]
-        # Deduplicate after snap, then keep strongest within min_sep °
         peaks_idx = sorted(set(peaks_idx))
         peaks_idx = self._merge_nearby_peaks(peaks_idx, two_theta, intensity, min_sep)
 
@@ -321,7 +335,6 @@ class ProcessStage(QWidget):
         peak_tt = two_theta[peaks_idx]
         peak_int = intensity[peaks_idx]
         wl = self.session.wavelength
-        # Guard against sin(0)
         with np.errstate(divide="ignore", invalid="ignore"):
             d_spacing = wl / (2.0 * np.sin(np.radians(peak_tt / 2.0)))
             d_spacing = np.where(np.isfinite(d_spacing), d_spacing, np.nan)
@@ -334,7 +347,7 @@ class ProcessStage(QWidget):
             "wavelength": self.session.wavelength,
         }
         self.session.set_peaks(peaks)
-        self.status.setText(
+        self.peak_status.setText(
             f"Found {len(peaks_idx)} peaks "
             f"(sep≥{min_sep:.2f}°, prom≥{prominence_threshold:.0f})."
         )
@@ -350,13 +363,11 @@ class ProcessStage(QWidget):
 
     @staticmethod
     def _estimate_noise(intensity: np.ndarray) -> float:
-        """Robust noise from the quieter end of the pattern."""
         y = np.asarray(intensity, dtype=float)
         n = len(y)
         if n < 10:
             return float(np.std(y)) if n else 1.0
         chunk = y[: max(20, min(200, n // 8))]
-        # MAD ≈ robust σ
         med = np.median(chunk)
         mad = np.median(np.abs(chunk - med))
         return float(max(1.4826 * mad, np.std(chunk) * 0.5, 1.0))
@@ -369,7 +380,6 @@ class ProcessStage(QWidget):
 
     @staticmethod
     def _merge_nearby_peaks(idxs, two_theta, intensity, min_sep_deg: float):
-        """Greedy keep-strongest merge for peaks closer than min_sep_deg."""
         if not idxs:
             return []
         order = sorted(idxs, key=lambda i: float(intensity[i]), reverse=True)

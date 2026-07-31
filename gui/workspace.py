@@ -1,303 +1,259 @@
-"""Analysis workspace — Search/Match, Quant Analysis, and Database tabs."""
+"""Analysis workspace — file browser, plot, and Background / Peaks / Phases tabs."""
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+import os
+from typing import Optional
 
 import numpy as np
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
-    QCheckBox, QLabel, QScrollArea, QSplitter,
-    QTabWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QCheckBox, QHBoxLayout, QLabel, QMessageBox, QPushButton, QScrollArea,
+    QSplitter, QTabWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
-from matplotlib.figure import Figure
 
 from matplotlib_config import apply_plot_style, get_plot_palette
 from gui.theme import get_current_mode
-from gui.widgets.section import CollapsibleSection
-from gui.stages import LoadStage, ProcessStage, IdentifyStage, RefineStage
-from gui.local_database_tab import LocalDatabaseTab
+from gui.widgets.file_browser import FileBrowser
+from gui.widgets.plot_host import create_plot_host
+from gui.stages import ProcessStage, IdentifyStage
+from gui.pattern_io import load_pattern_file
 
 
-# Narrow control column — plot gets most of the window
-RATIO_DEFAULT = (0.28, 0.72)
-RATIO_COMPRESSED = (0.18, 0.82)
-LEFT_MIN_WIDTH = 240
-LEFT_MAX_WIDTH = 360
+LEFT_MIN_WIDTH = 220
+LEFT_DEFAULT = 280
+BOTTOM_DEFAULT = 260
 
 
 class AnalysisWorkspace(QWidget):
-    """Tabbed workspace with controls | data splitters."""
+    """Main analysis layout: files | plot + bottom tool tabs."""
 
-    TAB_SEARCH = 0
-    TAB_QUANT = 1
-    TAB_DATABASE = 2
+    TAB_BACKGROUND = 0
+    TAB_PEAKS = 1
+    TAB_PHASES = 2
 
     def __init__(self, session, parent=None):
         super().__init__(parent)
         self.session = session
         self._status_callback = None
-        self._compressed = False
         self._candidate_results = []
-        self._sections = {}
+        self._results_mode = None  # "candidates" | "matches"
+        self._quant_dialog = None
+        self._database_dialog = None
+
+        self.process_stage = ProcessStage(session, self)
+        self.identify_stage = IdentifyStage(session, self)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        self.tabs = QTabWidget()
-        root.addWidget(self.tabs)
+        self.main_splitter = QSplitter(Qt.Horizontal)
+        self.main_splitter.setChildrenCollapsible(False)
 
-        self.load_stage = LoadStage(session, self)
-        self.process_stage = ProcessStage(session, self)
-        self.identify_stage = IdentifyStage(session, self)
-        self.refine_stage = RefineStage(session, self)
+        self.file_browser = FileBrowser()
+        self.file_browser.setMinimumWidth(LEFT_MIN_WIDTH)
+        self.file_browser.file_activated.connect(self.open_pattern_file)
+        self.file_browser.wavelength_changed.connect(self._on_wavelength_changed)
+        self.main_splitter.addWidget(self.file_browser)
 
-        self.search_splitter = self._build_search_tab()
-        self.quant_splitter = self._build_quant_tab()
-        self.db_tab = LocalDatabaseTab()
-        self.db_tab.phases_selected.connect(self._on_db_phases)
+        self.right_splitter = QSplitter(Qt.Vertical)
+        self.right_splitter.setChildrenCollapsible(False)
 
-        self.tabs.addTab(self.search_splitter, "Search / Match")
-        self.tabs.addTab(self.quant_splitter, "Quant Analysis")
-        self.tabs.addTab(self.db_tab, "Database")
+        plot_host, self.figure, self.canvas, self.toolbar = create_plot_host(
+            self, figsize=(10, 7)
+        )
+        self.ax = self.figure.add_subplot(111)
+        # Back-compat aliases (search plot == main plot)
+        self.search_figure = self.figure
+        self.search_canvas = self.canvas
+        self.search_ax = self.ax
+        self.right_splitter.addWidget(plot_host)
 
-        self.tabs.currentChanged.connect(self._on_tab_changed)
+        self.bottom_tabs = QTabWidget()
+        self.bottom_tabs.addTab(self._build_background_tab(), "Background")
+        self.bottom_tabs.addTab(self._build_peaks_tab(), "Peaks")
+        self.bottom_tabs.addTab(self._build_phases_tab(), "Phases")
+        self.right_splitter.addWidget(self.bottom_tabs)
+
+        self.main_splitter.addWidget(self.right_splitter)
+        self.main_splitter.setStretchFactor(0, 0)
+        self.main_splitter.setStretchFactor(1, 1)
+        root.addWidget(self.main_splitter)
 
         session.pattern_changed.connect(self._on_session_changed)
         session.peaks_changed.connect(self._on_session_changed)
         session.candidates_changed.connect(self._on_session_changed)
         session.matches_changed.connect(self._on_session_changed)
-        session.refinement_changed.connect(self.refresh_plot)
-
-        # Back-compat aliases used by refine export / theme
-        self.figure = self.search_figure
-        self.canvas = self.search_canvas
-        self.ax = self.search_ax
 
         self.refresh_plot()
-        QTimer.singleShot(0, lambda: self._apply_split_ratio(RATIO_DEFAULT))
+        QTimer.singleShot(0, self._apply_default_sizes)
 
-    # --- layout builders ---
+    # --- tab builders ---
 
-    def _build_search_tab(self) -> QSplitter:
+    def _build_background_tab(self) -> QWidget:
+        return self.process_stage.background_panel
+
+    def _build_peaks_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QHBoxLayout(tab)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.addWidget(self.process_stage.peaks_panel)
+
+        table_wrap = QWidget()
+        tw = QVBoxLayout(table_wrap)
+        tw.setContentsMargins(6, 6, 6, 6)
+        tw.setSpacing(4)
+        self.peaks_label = QLabel("Peaks")
+        self.peaks_label.setObjectName("mutedLabel")
+        tw.addWidget(self.peaks_label)
+        self.peaks_table = QTableWidget()
+        self.peaks_table.setAlternatingRowColors(True)
+        self.peaks_table.horizontalHeader().setStretchLastSection(True)
+        tw.addWidget(self.peaks_table, 1)
+        splitter.addWidget(table_wrap)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([320, 600])
+        layout.addWidget(splitter)
+        return tab
+
+    def _build_phases_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QHBoxLayout(tab)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
         splitter = QSplitter(Qt.Horizontal)
         splitter.setChildrenCollapsible(False)
 
-        left = QWidget()
-        left.setMinimumWidth(LEFT_MIN_WIDTH)
-        left.setMaximumWidth(LEFT_MAX_WIDTH)
-        left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(0)
-
+        # Identify controls in a scroll area
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QScrollArea.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-
-        controls = QWidget()
-        controls_layout = QVBoxLayout(controls)
-        controls_layout.setContentsMargins(4, 4, 4, 4)
-        controls_layout.setSpacing(6)
-
-        self._sections["load"] = CollapsibleSection("Load", self.load_stage, expanded=True)
-        self._sections["process"] = CollapsibleSection("Process", self.process_stage, expanded=True)
-        self._sections["identify"] = CollapsibleSection("Identify", self.identify_stage, expanded=True)
-        for key in ("load", "process", "identify"):
-            controls_layout.addWidget(self._sections[key])
-        controls_layout.addStretch()
-
-        scroll.setWidget(controls)
-        left_layout.addWidget(scroll)
-        splitter.addWidget(left)
+        scroll.setWidget(self.identify_stage)
+        scroll.setMinimumWidth(280)
+        scroll.setMaximumWidth(420)
+        splitter.addWidget(scroll)
 
         right = QWidget()
-        right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(2)
+        rw = QVBoxLayout(right)
+        rw.setContentsMargins(6, 6, 6, 6)
+        rw.setSpacing(4)
 
-        mode = get_current_mode()
-        palette = get_plot_palette(mode)
-        self.search_figure = Figure(figsize=(10, 7), facecolor=palette["figure_facecolor"])
-        self.search_canvas = FigureCanvas(self.search_figure)
-        self.search_toolbar = NavigationToolbar(self.search_canvas, right)
-        right_layout.addWidget(self.search_toolbar)
-        right_layout.addWidget(self.search_canvas, 1)
-        self.search_ax = self.search_figure.add_subplot(111)
-        apply_plot_style(self.search_figure, mode)
+        header = QHBoxLayout()
+        self.phases_label = QLabel("Phases")
+        self.phases_label.setObjectName("mutedLabel")
+        header.addWidget(self.phases_label, 1)
+        self.clear_unselected_btn = QPushButton("Clear Unselected")
+        self.clear_unselected_btn.setToolTip(
+            "Remove unchecked phases from the list; keep only your selections"
+        )
+        self.clear_unselected_btn.clicked.connect(self.clear_unselected_phases)
+        header.addWidget(self.clear_unselected_btn)
+        self.quant_btn = QPushButton("Open Quant…")
+        self.quant_btn.setToolTip("Open Le Bail / quantitative analysis window")
+        self.quant_btn.clicked.connect(self.open_quant)
+        header.addWidget(self.quant_btn)
+        rw.addLayout(header)
 
-        results_wrap = QWidget()
-        results_layout = QVBoxLayout(results_wrap)
-        results_layout.setContentsMargins(4, 0, 4, 4)
-        results_layout.setSpacing(2)
-        self.results_label = QLabel("Results")
-        self.results_label.setObjectName("mutedLabel")
-        results_layout.addWidget(self.results_label)
-
+        # Back-compat: results_table / results_label used by older helpers
+        self.results_label = self.phases_label
         self.results_table = QTableWidget()
-        self.results_table.setMaximumHeight(160)
         self.results_table.setAlternatingRowColors(True)
         self.results_table.horizontalHeader().setStretchLastSection(True)
-        results_layout.addWidget(self.results_table)
-        right_layout.addWidget(results_wrap)
+        rw.addWidget(self.results_table, 1)
 
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        return splitter
+        splitter.setSizes([340, 600])
+        layout.addWidget(splitter)
+        return tab
 
-    def _build_quant_tab(self) -> QSplitter:
-        splitter = QSplitter(Qt.Horizontal)
-        splitter.setChildrenCollapsible(False)
+    def _apply_default_sizes(self):
+        total_w = max(self.main_splitter.width(), 1200)
+        left = min(max(LEFT_DEFAULT, LEFT_MIN_WIDTH), 360)
+        self.main_splitter.setSizes([left, max(400, total_w - left)])
+        total_h = max(self.right_splitter.height(), 700)
+        bottom = min(BOTTOM_DEFAULT, total_h // 3)
+        self.right_splitter.setSizes([max(300, total_h - bottom), bottom])
 
-        left = QWidget()
-        left.setMinimumWidth(LEFT_MIN_WIDTH)
-        left.setMaximumWidth(LEFT_MAX_WIDTH)
-        left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(0)
+    # --- navigation ---
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QScrollArea.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-
-        controls = QWidget()
-        controls_layout = QVBoxLayout(controls)
-        controls_layout.setContentsMargins(4, 4, 4, 4)
-        controls_layout.setSpacing(6)
-        controls_layout.addWidget(self.refine_stage)
-        controls_layout.addStretch()
-        scroll.setWidget(controls)
-        left_layout.addWidget(scroll)
-        splitter.addWidget(left)
-
-        right = QWidget()
-        right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(2)
-
-        mode = get_current_mode()
-        palette = get_plot_palette(mode)
-        self.quant_figure = Figure(figsize=(10, 7), facecolor=palette["figure_facecolor"])
-        self.quant_canvas = FigureCanvas(self.quant_figure)
-        self.quant_toolbar = NavigationToolbar(self.quant_canvas, right)
-        right_layout.addWidget(self.quant_toolbar)
-        right_layout.addWidget(self.quant_canvas, 1)
-        self.quant_ax = self.quant_figure.add_subplot(111)
-        apply_plot_style(self.quant_figure, mode)
-
-        quant_results = QWidget()
-        qr_layout = QVBoxLayout(quant_results)
-        qr_layout.setContentsMargins(4, 0, 4, 4)
-        qr_layout.setSpacing(2)
-        self.quant_results_label = QLabel("Refinement")
-        self.quant_results_label.setObjectName("mutedLabel")
-        qr_layout.addWidget(self.quant_results_label)
-        self.quant_results_table = QTableWidget()
-        self.quant_results_table.setMaximumHeight(120)
-        self.quant_results_table.setAlternatingRowColors(True)
-        self.quant_results_table.horizontalHeader().setStretchLastSection(True)
-        qr_layout.addWidget(self.quant_results_table)
-        right_layout.addWidget(quant_results)
-
-        splitter.addWidget(right)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        return splitter
-
-    # --- splitter ratios ---
-
-    def _active_splitter(self) -> Optional[QSplitter]:
-        idx = self.tabs.currentIndex()
-        if idx == self.TAB_SEARCH:
-            return self.search_splitter
-        if idx == self.TAB_QUANT:
-            return self.quant_splitter
-        return None
-
-    def _apply_split_ratio(self, ratio: Tuple[float, float], splitter: Optional[QSplitter] = None):
-        targets = [splitter] if splitter is not None else [self.search_splitter, self.quant_splitter]
-        for sp in targets:
-            if sp is None:
-                continue
-            total = max(sp.width(), 800)
-            left = int(total * ratio[0])
-            left = max(LEFT_MIN_WIDTH, min(LEFT_MAX_WIDTH, left))
-            right = max(100, total - left)
-            sp.setSizes([left, right])
-
-    def set_controls_compressed(self, compressed: bool):
-        self._compressed = compressed
-        ratio = RATIO_COMPRESSED if compressed else RATIO_DEFAULT
-        active = self._active_splitter()
-        if active is not None:
-            self._apply_split_ratio(ratio, active)
-        else:
-            # Database tab: still update both so they match when returning
-            self._apply_split_ratio(ratio)
-
-    def toggle_controls_compressed(self) -> bool:
-        self.set_controls_compressed(not self._compressed)
-        return self._compressed
-
-    def is_controls_compressed(self) -> bool:
-        return self._compressed
-
-    # --- navigation helpers ---
-
-    def show_search_tab(self, section: Optional[str] = None):
-        self.tabs.setCurrentIndex(self.TAB_SEARCH)
-        if section and section in self._sections:
-            self._sections[section].set_expanded(True)
-        self.refresh_plot()
-
-    def show_quant_tab(self):
-        self.tabs.setCurrentIndex(self.TAB_QUANT)
-        if hasattr(self.refine_stage, "on_enter"):
-            self.refine_stage.on_enter()
-        self.refresh_plot()
-
-    def show_database_tab(self):
-        self.tabs.setCurrentIndex(self.TAB_DATABASE)
+    def show_bottom_tab(self, key: str):
+        mapping = {
+            "background": self.TAB_BACKGROUND,
+            "process": self.TAB_BACKGROUND,
+            "load": self.TAB_BACKGROUND,
+            "peaks": self.TAB_PEAKS,
+            "identify": self.TAB_PHASES,
+            "phases": self.TAB_PHASES,
+        }
+        idx = mapping.get(key, self.TAB_BACKGROUND)
+        self.bottom_tabs.setCurrentIndex(idx)
+        if idx == self.TAB_BACKGROUND:
+            self.process_stage.on_enter()
+        elif idx == self.TAB_PEAKS:
+            self.process_stage.on_enter()
+        elif idx == self.TAB_PHASES:
+            self.identify_stage.on_enter()
 
     def set_stage(self, key: str):
-        """Compatibility shim for older call sites (load/process/identify/refine)."""
+        """Compatibility shim for older call sites."""
         if key == "refine":
-            self.show_quant_tab()
-        elif key in ("load", "process", "identify"):
-            self.show_search_tab(section=key)
+            self.open_quant()
         else:
-            self.show_search_tab()
+            self.show_bottom_tab(key)
 
-    def _on_tab_changed(self, index: int):
-        if index == self.TAB_SEARCH:
-            for stage in (self.load_stage, self.process_stage, self.identify_stage):
-                if hasattr(stage, "on_enter"):
-                    stage.on_enter()
-            self.figure = self.search_figure
-            self.canvas = self.search_canvas
-            self.ax = self.search_ax
-        elif index == self.TAB_QUANT:
-            if hasattr(self.refine_stage, "on_enter"):
-                self.refine_stage.on_enter()
-            self.figure = self.quant_figure
-            self.canvas = self.quant_canvas
-            self.ax = self.quant_ax
-        self.refresh_plot()
-        # Re-apply current compress ratio to the newly visible splitter
-        ratio = RATIO_COMPRESSED if self._compressed else RATIO_DEFAULT
-        active = self._active_splitter()
-        if active is not None:
-            self._apply_split_ratio(ratio, active)
+    def show_search_tab(self, section: Optional[str] = None):
+        self.show_bottom_tab(section or "phases")
+
+    def show_quant_tab(self):
+        self.open_quant()
+
+    def show_database_tab(self):
+        self.open_database()
+
+    # --- dialogs ---
+
+    def open_quant(self):
+        from gui.dialogs.quant_dialog import QuantDialog
+
+        if self._quant_dialog is None:
+            parent = self.window()
+            self._quant_dialog = QuantDialog(
+                self.session, parent=parent, status_callback=self.set_status
+            )
+        self._quant_dialog.show()
+        self._quant_dialog.raise_()
+        self._quant_dialog.activateWindow()
+        if hasattr(self._quant_dialog.refine_stage, "on_enter"):
+            self._quant_dialog.refine_stage.on_enter()
+        self._quant_dialog.refresh_plot()
+
+    def open_database(self):
+        from gui.dialogs.database_dialog import DatabaseManagerDialog
+
+        if self._database_dialog is None:
+            parent = self.window()
+            self._database_dialog = DatabaseManagerDialog(parent)
+            self._database_dialog.phases_selected.connect(self._on_db_phases)
+        self._database_dialog.show()
+        self._database_dialog.raise_()
+        self._database_dialog.activateWindow()
 
     def _on_db_phases(self, phases: list):
         self.identify_stage.add_phases_from_database(phases)
-        self.show_search_tab(section="identify")
+        self.show_bottom_tab("phases")
         self.set_status(f"Added {len(phases)} phase(s) from database")
+
+    # --- status / theme ---
 
     def set_status_callback(self, callback):
         self._status_callback = callback
@@ -310,37 +266,77 @@ class AnalysisWorkspace(QWidget):
         self.refresh_plot()
 
     def on_theme_changed(self, mode: str):
-        apply_plot_style(self.search_figure, mode)
-        apply_plot_style(self.quant_figure, mode)
+        apply_plot_style(self.figure, mode)
+        self.refresh_plot()
+        if self._quant_dialog is not None:
+            self._quant_dialog.on_theme_changed(mode)
+
+    # --- file loading ---
+
+    def _on_wavelength_changed(self, wl: float):
+        self.session.set_wavelength(wl)
         self.refresh_plot()
 
+    def open_folder(self, path: Optional[str] = None):
+        if path:
+            self.file_browser.set_folder(path)
+        else:
+            self.file_browser.choose_folder()
+
     def find_peaks(self):
-        self.show_search_tab(section="process")
+        self.show_bottom_tab("peaks")
         self.process_stage.find_peaks()
 
     def open_pattern_file(self, path: str):
-        self.show_search_tab(section="load")
-        self.load_stage.load_file(path)
+        try:
+            wl = self.file_browser.current_wavelength()
+            pattern = load_pattern_file(path, wl)
+            if pattern.get("file_format") == "XML":
+                self.file_browser.set_custom_wavelength(pattern["wavelength"])
+            else:
+                pattern["wavelength"] = wl
 
-    # --- results strip helpers ---
+            self.session.set_raw_pattern(pattern)
+            name = os.path.basename(path)
+            n = len(pattern["two_theta"])
+            t0, t1 = float(pattern["two_theta"][0]), float(pattern["two_theta"][-1])
+            meta = (
+                f"{pattern['file_format']} · {n} points · "
+                f"2θ {t0:.2f}–{t1:.2f}° · λ {pattern['wavelength']:.4f} Å"
+            )
+            self.file_browser.set_file_info(name, meta)
+            self.file_browser.reveal_file(path)
+            self.process_stage.on_enter()
+            self.identify_stage.on_enter()
+            self.show_bottom_tab("background")
+            self.refresh_plot()
+            self.set_status(f"Loaded {name}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Could not load pattern:\n{e}")
+
+    # --- results helpers ---
 
     def set_results_peaks(self, peaks: dict):
-        self.results_label.setText(f"Peaks ({len(peaks.get('two_theta', []))})")
-        self.results_table.clear()
-        self.results_table.setColumnCount(3)
-        self.results_table.setHorizontalHeaderLabels(["2θ (°)", "Intensity", "d (Å)"])
+        self.show_bottom_tab("peaks")
+        n = len(peaks.get("two_theta", []))
+        self.peaks_label.setText(f"Peaks ({n})")
+        self.peaks_table.clear()
+        self.peaks_table.setColumnCount(3)
+        self.peaks_table.setHorizontalHeaderLabels(["2θ (°)", "Intensity", "d (Å)"])
         tt = peaks.get("two_theta", [])
         inten = peaks.get("intensity", [])
         d = peaks.get("d_spacing", [])
-        self.results_table.setRowCount(len(tt))
+        self.peaks_table.setRowCount(len(tt))
         for i in range(len(tt)):
-            self.results_table.setItem(i, 0, QTableWidgetItem(f"{tt[i]:.3f}"))
-            self.results_table.setItem(i, 1, QTableWidgetItem(f"{inten[i]:.0f}"))
-            self.results_table.setItem(i, 2, QTableWidgetItem(f"{d[i]:.4f}"))
+            self.peaks_table.setItem(i, 0, QTableWidgetItem(f"{tt[i]:.3f}"))
+            self.peaks_table.setItem(i, 1, QTableWidgetItem(f"{inten[i]:.0f}"))
+            self.peaks_table.setItem(i, 2, QTableWidgetItem(f"{d[i]:.4f}"))
 
     def set_results_candidates(self, results: list):
+        self._results_mode = "candidates"
         self._candidate_results = list(results)
-        self.results_label.setText(f"Search candidates ({len(results)})")
+        self.show_bottom_tab("phases")
+        self.phases_label.setText(f"Search candidates ({len(results)}) — select to match")
         self.results_table.clear()
         self.results_table.setColumnCount(5)
         self.results_table.setHorizontalHeaderLabels(
@@ -351,37 +347,54 @@ class AnalysisWorkspace(QWidget):
             self.results_table.setItem(i, 0, QTableWidgetItem(str(r.get("mineral_name", ""))))
             self.results_table.setItem(i, 1, QTableWidgetItem(str(r.get("chemical_formula", ""))))
             self.results_table.setItem(i, 2, QTableWidgetItem(str(r.get("space_group", ""))))
-            score = r.get("ensemble_score", r.get("combined_score", r.get("correlation", r.get("match_score", 0))))
+            score = r.get(
+                "ensemble_score",
+                r.get("combined_score", r.get("correlation", r.get("match_score", 0))),
+            )
             self.results_table.setItem(i, 3, QTableWidgetItem(f"{float(score):.3f}"))
             cb = QCheckBox()
-            cb.setChecked(i < 20)
+            cb.setChecked(False)  # user must opt in
             self.results_table.setCellWidget(i, 4, cb)
 
     def get_selected_candidates(self) -> list:
-        """Return phase dicts for checked search candidates (or all session candidates)."""
-        results = getattr(self, "_candidate_results", None)
-        if not results:
-            return list(self.session.search_candidates)
+        """Return only explicitly checked candidates (no auto-fallback)."""
+        results = getattr(self, "_candidate_results", None) or []
+        if self._results_mode != "candidates" or not results:
+            return []
         selected = []
         for i, r in enumerate(results):
             cb = self.results_table.cellWidget(i, 4)
-            if cb is None or cb.isChecked():
+            if cb is not None and cb.isChecked():
                 selected.append(self.identify_stage._result_to_phase(r))
         return selected
 
-    def set_results_matches(self, results: list):
-        self.results_label.setText(f"Matched phases ({len(results)})")
+    def set_results_matches(self, results: list, preselect: Optional[list] = None):
+        """
+        Show matched phases. Nothing is checked unless `preselect` provides
+        keys/names (or match objects) that should stay selected.
+        """
+        self._results_mode = "matches"
+        self.show_bottom_tab("phases")
+        self.phases_label.setText(f"Matched phases ({len(results)}) — select to keep / plot")
         self.results_table.clear()
         self.results_table.setColumnCount(5)
         self.results_table.setHorizontalHeaderLabels(
             ["Select", "Phase", "Score", "Coverage", "Matches"]
         )
         self.results_table.setRowCount(len(results))
+
+        from utils.residual_search import mineral_key
+
+        preselect_keys = set()
+        if preselect:
+            for p in preselect:
+                preselect_keys.add(mineral_key(p))
+
         for i, r in enumerate(results):
             phase = r.get("phase", r)
             name = phase.get("mineral", phase.get("mineral_name", f"Phase {i+1}"))
             cb = QCheckBox()
-            cb.setChecked(i < 5)
+            cb.setChecked(bool(preselect_keys) and mineral_key(r) in preselect_keys)
             cb.stateChanged.connect(self._sync_selected_from_table)
             self.results_table.setCellWidget(i, 0, cb)
             self.results_table.setItem(i, 1, QTableWidgetItem(str(name)))
@@ -393,7 +406,65 @@ class AnalysisWorkspace(QWidget):
             self.results_table.setItem(i, 4, QTableWidgetItem(str(nmatch)))
         self._sync_selected_from_table()
 
+    def get_selected_matches(self) -> list:
+        if self._results_mode != "matches":
+            return list(self.session.selected_phases)
+        selected = []
+        matches = self.session.matched_phases
+        for i in range(self.results_table.rowCount()):
+            cb = self.results_table.cellWidget(i, 0)
+            if cb and cb.isChecked() and i < len(matches):
+                selected.append(matches[i])
+        return selected
+
+    def clear_unselected_phases(self):
+        """Drop unchecked rows; keep only user-selected phases."""
+        if self._results_mode == "candidates":
+            kept_results = []
+            kept_phases = []
+            for i, r in enumerate(self._candidate_results):
+                cb = self.results_table.cellWidget(i, 4)
+                if cb is not None and cb.isChecked():
+                    kept_results.append(r)
+                    kept_phases.append(self.identify_stage._result_to_phase(r))
+            if not kept_phases:
+                from PyQt5.QtWidgets import QMessageBox
+                QMessageBox.information(
+                    self, "Nothing Selected",
+                    "Select one or more candidates first, then Clear Unselected.",
+                )
+                return
+            self.session.set_candidates(kept_phases)
+            self.set_results_candidates(kept_results)
+            # Re-check the kept ones so the user doesn't lose selection
+            for i in range(self.results_table.rowCount()):
+                cb = self.results_table.cellWidget(i, 4)
+                if cb:
+                    cb.setChecked(True)
+            self.set_status(f"Kept {len(kept_phases)} candidate(s)")
+            return
+
+        if self._results_mode == "matches":
+            kept = self.get_selected_matches()
+            if not kept:
+                from PyQt5.QtWidgets import QMessageBox
+                QMessageBox.information(
+                    self, "Nothing Selected",
+                    "Select one or more matched phases first, then Clear Unselected.",
+                )
+                return
+            self.session.set_matched_phases(kept)
+            self.session.set_selected_phases(kept)
+            self.set_results_matches(kept, preselect=kept)
+            self.set_status(f"Kept {len(kept)} matched phase(s)")
+            return
+
+        from PyQt5.QtWidgets import QMessageBox
+        QMessageBox.information(self, "No List", "Run a search or match first.")
+
     def _sync_selected_from_table(self):
+        if self._results_mode != "matches":
+            return
         selected = []
         matches = self.session.matched_phases
         for i in range(self.results_table.rowCount()):
@@ -407,11 +478,7 @@ class AnalysisWorkspace(QWidget):
 
     def refresh_plot(self):
         mode = get_current_mode()
-        self._refresh_search_plot(mode)
-        self._refresh_quant_plot(mode)
-
-    def _refresh_search_plot(self, mode: str):
-        ax = self.search_ax
+        ax = self.ax
         ax.clear()
         palette = get_plot_palette(mode)
 
@@ -422,54 +489,16 @@ class AnalysisWorkspace(QWidget):
         else:
             self._plot_load(ax, palette)
 
-        apply_plot_style(self.search_figure, mode)
-        self.search_canvas.draw_idle()
-
-    def _refresh_quant_plot(self, mode: str):
-        ax = self.quant_ax
-        ax.clear()
-        palette = get_plot_palette(mode)
-        self._plot_refine(ax, palette)
-        apply_plot_style(self.quant_figure, mode)
-        self.quant_canvas.draw_idle()
-
-        # Update quant results strip from lebail
-        results = self.session.lebail_results
-        if results and results.get("success"):
-            refined = results.get("refined_phases") or []
-            rr = results.get("refinement_results") or {}
-            rwp = rr.get("rwp") or results.get("rwp")
-            label = "Refinement"
-            if rwp is not None:
-                label = f"Refinement (Rwp={float(rwp):.2f}%)"
-            self.quant_results_label.setText(label)
-            self.quant_results_table.clear()
-            self.quant_results_table.setColumnCount(2)
-            self.quant_results_table.setHorizontalHeaderLabels(["Phase", "Scale / info"])
-            if refined:
-                self.quant_results_table.setRowCount(len(refined))
-                for i, p in enumerate(refined):
-                    name = p.get("mineral", p.get("mineral_name", f"Phase {i+1}")) if isinstance(p, dict) else str(p)
-                    info = ""
-                    if isinstance(p, dict):
-                        scale = p.get("scale", p.get("scale_factor"))
-                        if scale is not None:
-                            info = f"scale={float(scale):.4g}"
-                    self.quant_results_table.setItem(i, 0, QTableWidgetItem(str(name)))
-                    self.quant_results_table.setItem(i, 1, QTableWidgetItem(info))
-            else:
-                self.quant_results_table.setRowCount(0)
-        else:
-            self.quant_results_label.setText("Refinement")
-            self.quant_results_table.setRowCount(0)
+        apply_plot_style(self.figure, mode)
+        self.canvas.draw_idle()
 
     def _plot_load(self, ax, palette):
         pattern = self.session.raw_pattern
         ax.set_title("XRD Pattern")
         if not pattern:
             ax.text(
-                0.5, 0.5, "Load a pattern to begin", ha="center", va="center",
-                transform=ax.transAxes,
+                0.5, 0.5, "Choose a folder and click a pattern file",
+                ha="center", va="center", transform=ax.transAxes,
                 color=palette.get("muted", palette["tick"]),
             )
             ax.set_xlabel("2θ (degrees)")
@@ -524,11 +553,13 @@ class AnalysisWorkspace(QWidget):
         inten = np.asarray(pattern["intensity"], dtype=float)
         max_i = np.max(inten) if len(inten) else 1.0
         norm = (inten / max_i * 100.0) if max_i > 0 else inten
-        ax.plot(pattern["two_theta"], norm, color=palette["exp_line"],
-                lw=1.2, label="Experimental")
+        ax.plot(
+            pattern["two_theta"], norm, color=palette["exp_line"],
+            lw=1.2, label="Experimental",
+        )
 
         colors = ["#c45c26", "#7a5cff", "#2a7a4b", "#b33a3a", "#5a6a7a"]
-        selected = self.session.selected_phases or self.session.matched_phases[:3]
+        selected = self.session.selected_phases
         for i, result in enumerate(selected[:5]):
             theo = result.get("theoretical_peaks")
             if not theo or len(theo.get("two_theta", [])) == 0:
@@ -559,39 +590,3 @@ class AnalysisWorkspace(QWidget):
         ax.set_ylim(0, 110)
         if ax.get_legend_handles_labels()[0]:
             ax.legend(loc="upper right", fontsize=8)
-
-    def _plot_refine(self, ax, palette):
-        results = self.session.lebail_results
-        pattern = self.session.active_pattern()
-        if results and results.get("success"):
-            rr = results.get("refinement_results") or {}
-            tt = rr.get("two_theta", pattern["two_theta"] if pattern else None)
-            exp = rr.get("experimental_intensity")
-            calc = rr.get("calculated_pattern")
-            if tt is not None and exp is not None:
-                ax.plot(tt, exp, color=palette["exp_line"], lw=1.2, label="Experimental")
-            if tt is not None and calc is not None:
-                ax.plot(tt, calc, color=palette["calc_line"], lw=1.2, label="Calculated")
-                if exp is not None:
-                    diff = np.asarray(exp) - np.asarray(calc)
-                    offset = -0.15 * (np.max(exp) if len(exp) else 0)
-                    ax.plot(tt, diff + offset, color=palette["diff_line"],
-                            lw=0.8, label="Difference")
-            ax.set_title("Le Bail Refinement")
-        elif pattern is not None:
-            ax.plot(
-                pattern["two_theta"], pattern["intensity"],
-                color=palette["exp_line"], lw=1.2, label="Experimental",
-            )
-            ax.set_title("Quant — run Le Bail to see fit")
-        else:
-            ax.text(
-                0.5, 0.5, "Match phases, then run Le Bail",
-                ha="center", va="center", transform=ax.transAxes,
-                color=palette.get("muted", palette["tick"]),
-            )
-            ax.set_title("Quant Analysis")
-        ax.set_xlabel("2θ (degrees)")
-        ax.set_ylabel("Intensity")
-        if ax.get_legend_handles_labels()[0]:
-            ax.legend(loc="upper right")
