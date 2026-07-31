@@ -33,10 +33,6 @@ class IdentifyStage(QWidget):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(8)
 
-        title = QLabel("Identify")
-        title.setStyleSheet("font-weight: 600; font-size: 14px;")
-        layout.addWidget(title)
-
         form = QFormLayout()
         self.method_combo = QComboBox()
         self.method_combo.addItems([
@@ -147,17 +143,6 @@ class IdentifyStage(QWidget):
 
         toolbox.addItem(adv, "Advanced")
         layout.addWidget(toolbox)
-
-        nav = QHBoxLayout()
-        back = QPushButton("← Process")
-        back.clicked.connect(lambda: self.workspace.set_stage("process"))
-        nav.addWidget(back)
-        nav.addStretch()
-        self.next_btn = QPushButton("Continue to Refine →")
-        self.next_btn.setEnabled(False)
-        self.next_btn.clicked.connect(lambda: self.workspace.set_stage("refine"))
-        nav.addWidget(self.next_btn)
-        layout.addLayout(nav)
         layout.addStretch()
 
     def on_enter(self):
@@ -340,7 +325,6 @@ class IdentifyStage(QWidget):
         self.session.set_selected_phases(selected)
         self.workspace.set_results_matches(filtered)
         self.multi_btn.setEnabled(len(filtered) > 1)
-        self.next_btn.setEnabled(len(filtered) > 0)
         self.status.setText(f"Matched {len(filtered)} phases (top {len(selected)} selected).")
         self.workspace.set_status(f"Matched {len(filtered)} phases")
         self.workspace.refresh_plot()
@@ -382,7 +366,6 @@ class IdentifyStage(QWidget):
                 self.session.set_matched_phases(wrapped)
                 self.session.set_selected_phases(wrapped)
                 self.workspace.set_results_matches(wrapped)
-                self.next_btn.setEnabled(True)
                 self.status.setText(f"Multi-phase kept {len(wrapped)} phase(s).")
             else:
                 self.status.setText("Multi-phase analysis returned no phases.")

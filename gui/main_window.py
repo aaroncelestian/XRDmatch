@@ -1,5 +1,5 @@
 """
-Main window for XRD Phase Matching — guided analysis workspace.
+Main window for XRD Phase Matching — tabbed analysis workspace.
 """
 
 from PyQt5.QtWidgets import (
@@ -10,7 +10,6 @@ from PyQt5.QtGui import QKeySequence
 
 from .session import AnalysisSession
 from .workspace import AnalysisWorkspace
-from .dialogs.database_dialog import DatabaseManagerDialog
 from .dialogs.settings_dialog import SettingsDialog
 from .theme import (
     apply_theme, toggle_theme, get_current_mode, add_theme_listener, DARK,
@@ -18,12 +17,11 @@ from .theme import (
 
 
 class XRDMainWindow(QMainWindow):
-    """Main application window hosting the guided workspace."""
+    """Main application window hosting the tabbed workspace."""
 
     def __init__(self):
         super().__init__()
         self.session = AnalysisSession(self)
-        self.db_dialog = None
         self.settings_dialog = None
         self.init_ui()
         self.setup_menus()
@@ -63,6 +61,12 @@ class XRDMainWindow(QMainWindow):
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
 
+        view_menu = menubar.addMenu("&View")
+        self.compress_menu_action = QAction("Compress Control Panel", self)
+        self.compress_menu_action.setShortcut("Ctrl+[")
+        self.compress_menu_action.triggered.connect(self.toggle_compress_panel)
+        view_menu.addAction(self.compress_menu_action)
+
         tools_menu = menubar.addMenu("&Tools")
         peak_action = QAction("&Find Peaks", self)
         peak_action.triggered.connect(self.workspace.find_peaks)
@@ -70,11 +74,15 @@ class XRDMainWindow(QMainWindow):
 
         tools_menu.addSeparator()
         identify_action = QAction("&Identify (Pattern Search)", self)
-        identify_action.triggered.connect(lambda: self.workspace.set_stage("identify"))
+        identify_action.triggered.connect(lambda: self.workspace.show_search_tab("identify"))
         tools_menu.addAction(identify_action)
 
-        db_action = QAction("&Database Manager…", self)
-        db_action.triggered.connect(self.open_database_manager)
+        quant_action = QAction("&Quant Analysis", self)
+        quant_action.triggered.connect(self.workspace.show_quant_tab)
+        tools_menu.addAction(quant_action)
+
+        db_action = QAction("&Database", self)
+        db_action.triggered.connect(self.workspace.show_database_tab)
         tools_menu.addAction(db_action)
 
         tools_menu.addSeparator()
@@ -102,6 +110,12 @@ class XRDMainWindow(QMainWindow):
         toolbar.addAction(find_peaks_action)
 
         toolbar.addSeparator()
+        self.compress_action = QAction("Compress Panel", self)
+        self.compress_action.setToolTip("Toggle narrow control panel for a wider plot")
+        self.compress_action.triggered.connect(self.toggle_compress_panel)
+        toolbar.addAction(self.compress_action)
+
+        toolbar.addSeparator()
         self.theme_action = QAction(self._theme_action_label(), self)
         self.theme_action.setToolTip("Toggle Light / Dark theme")
         self.theme_action.triggered.connect(self.toggle_app_theme)
@@ -111,6 +125,18 @@ class XRDMainWindow(QMainWindow):
         settings_action = QAction("Settings", self)
         settings_action.triggered.connect(self.open_settings)
         toolbar.addAction(settings_action)
+
+    def toggle_compress_panel(self):
+        compressed = self.workspace.toggle_controls_compressed()
+        label = "Expand Panel" if compressed else "Compress Panel"
+        self.compress_action.setText(label)
+        self.compress_menu_action.setText(
+            "Expand Control Panel" if compressed else "Compress Control Panel"
+        )
+        self.status_bar.showMessage(
+            "Control panel compressed" if compressed else "Control panel restored",
+            3000,
+        )
 
     def _theme_action_label(self) -> str:
         return "Light Mode" if get_current_mode() == DARK else "Dark Mode"
@@ -169,19 +195,6 @@ class XRDMainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Save Error", str(e))
 
-    def open_database_manager(self):
-        if self.db_dialog is None:
-            self.db_dialog = DatabaseManagerDialog(self)
-            self.db_dialog.phases_selected.connect(self._on_db_phases)
-        self.db_dialog.show()
-        self.db_dialog.raise_()
-        self.db_dialog.activateWindow()
-
-    def _on_db_phases(self, phases: list):
-        self.workspace.identify_stage.add_phases_from_database(phases)
-        self.workspace.set_stage("identify")
-        self.status_bar.showMessage(f"Added {len(phases)} phase(s) from database")
-
     def open_settings(self):
         if self.settings_dialog is None:
             self.settings_dialog = SettingsDialog(self)
@@ -196,13 +209,13 @@ class XRDMainWindow(QMainWindow):
             self,
             "About XRD Phase Matcher",
             """<h3>XRD Phase Matcher</h3>
-            <p>Guided XRD phase identification workspace</p>
-            <p><b>Workflow:</b> Load → Process → Identify → Refine</p>
+            <p>XRD phase identification and quantitative analysis</p>
+            <p><b>Tabs:</b> Search / Match · Quant Analysis · Database</p>
             <ul>
             <li>Pattern loading and preprocessing</li>
-            <li>Ultra-fast pattern search</li>
-            <li>Phase matching and multi-phase ID</li>
+            <li>Ultra-fast pattern search and phase matching</li>
             <li>Le Bail refinement and export</li>
+            <li>Local CIF database management</li>
             </ul>
             <p>Built with PyQt5 and scientific Python libraries</p>""",
         )

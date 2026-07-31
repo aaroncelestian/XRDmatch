@@ -58,7 +58,7 @@ class RefineStage(QWidget):
         self.progress.setVisible(False)
         layout.addWidget(self.progress)
 
-        self.status = QLabel("Select matched phases in Identify, then refine.")
+        self.status = QLabel("Select matched phases in Search / Match, then refine.")
         self.status.setObjectName("mutedLabel")
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
@@ -122,20 +122,13 @@ class RefineStage(QWidget):
 
         toolbox.addItem(adv, "Advanced")
         layout.addWidget(toolbox)
-
-        nav = QHBoxLayout()
-        back = QPushButton("← Identify")
-        back.clicked.connect(lambda: self.workspace.set_stage("identify"))
-        nav.addWidget(back)
-        nav.addStretch()
-        layout.addLayout(nav)
         layout.addStretch()
 
     def on_enter(self):
         n = len(self.session.selected_phases) or len(self.session.matched_phases)
         self.refine_btn.setEnabled(n > 0 and self.session.has_pattern())
         if n == 0:
-            self.status.setText("No phases selected. Complete Identify first.")
+            self.status.setText("No phases selected. Match phases in Search / Match first.")
         else:
             self.status.setText(f"{n} phase(s) ready for refinement.")
 
@@ -225,7 +218,8 @@ class RefineStage(QWidget):
         if not path:
             return
         try:
-            self.workspace.figure.savefig(path, dpi=self.dpi.value(), bbox_inches="tight")
+            fig = getattr(self.workspace, "quant_figure", None) or self.workspace.figure
+            fig.savefig(path, dpi=self.dpi.value(), bbox_inches="tight")
             self.workspace.set_status(f"Exported {path}")
         except Exception as e:
             QMessageBox.critical(self, "Export Error", str(e))
