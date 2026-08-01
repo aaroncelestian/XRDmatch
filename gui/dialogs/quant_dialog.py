@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
-    QDialog, QHBoxLayout, QLabel, QSplitter, QTableWidget, QTableWidgetItem,
-    QVBoxLayout, QWidget,
+    QDialog, QHBoxLayout, QLabel, QPushButton, QSplitter, QVBoxLayout, QWidget,
 )
 
 from matplotlib_config import apply_plot_style, draw_error_bars, get_plot_palette
-from gui import display_settings
+from gui import display_settings, refinement_table
 from gui.theme import get_current_mode
+from gui.dialogs.refinement_details_dialog import RefinementDetailsDialog
+from gui.widgets.copyable_table import CopyableTable
 from gui.widgets.plot_host import create_plot_host
 from gui.stages.refine_stage import RefineStage
 
@@ -62,13 +65,28 @@ class QuantDialog(QDialog):
         qr = QVBoxLayout(results_wrap)
         qr.setContentsMargins(4, 0, 4, 4)
         qr.setSpacing(2)
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 0, 0)
         self.quant_results_label = QLabel("Refinement")
         self.quant_results_label.setObjectName("mutedLabel")
-        qr.addWidget(self.quant_results_label)
-        self.quant_results_table = QTableWidget()
+        # The line ends with caveats about how the numbers were arrived at, so
+        # it has to wrap rather than clip the very part that qualifies them
+        self.quant_results_label.setWordWrap(True)
+        header_row.addWidget(self.quant_results_label, 1)
+        self.details_btn = QPushButton("All parameters…")
+        self.details_btn.setToolTip(
+            "Every refined parameter for every phase, in a window of its own"
+        )
+        self.details_btn.clicked.connect(self.show_details)
+        header_row.addWidget(self.details_btn)
+        qr.addLayout(header_row)
+
+        self.quant_results_table = CopyableTable()
         self.quant_results_table.setMaximumHeight(190)
-        self.quant_results_table.setAlternatingRowColors(True)
         self.quant_results_table.horizontalHeader().setStretchLastSection(True)
+        self.quant_results_table.setToolTip(
+            "Ctrl-C copies the selection, or the whole table when nothing is selected"
+        )
         qr.addWidget(self.quant_results_table)
         right_layout.addWidget(results_wrap)
 
@@ -78,9 +96,18 @@ class QuantDialog(QDialog):
         splitter.setSizes([320, 780])
         root.addWidget(splitter)
 
+        self._details_dialog = None
+
         session.refinement_changed.connect(self.refresh_plot)
         session.matches_changed.connect(self._on_phases_changed)
         session.pattern_changed.connect(self._on_phases_changed)
+
+    def show_details(self):
+        if self._details_dialog is None:
+            self._details_dialog = RefinementDetailsDialog(self.session, self)
+        self._details_dialog.show()
+        self._details_dialog.raise_()
+        self._details_dialog.activateWindow()
 
     def set_status(self, message: str):
         if self._status_callback:
@@ -117,12 +144,6 @@ class QuantDialog(QDialog):
         self.quant_canvas.draw_idle()
         self._update_results_table()
 
-    REFINE_COLUMNS = [
-        "Phase", "wt%", "Scale", "a (Å)", "c (Å)", "V (Å³)",
-        "Lattice Δ%", "Absorb.", "Harmonics", "Contrib.%",
-    ]
-    RIR_COLUMNS = ["Phase", "wt%", "Scale", "Fitted I", "RIR", "Pattern share %"]
-
     def _update_results_table(self):
         """Refinement details: Le Bail when it has run, otherwise RIR quant."""
         results = self.session.lebail_results
@@ -134,73 +155,26 @@ class QuantDialog(QDialog):
             self.quant_results_label.setText(
                 "Refinement — run Le Bail, or RIR Quant in the Phases tab"
             )
-            self.quant_results_table.clear()
-            self.quant_results_table.setRowCount(0)
-            self.quant_results_table.setColumnCount(0)
-
-    def _set_columns(self, columns):
-        self.quant_results_table.clear()
-        self.quant_results_table.setColumnCount(len(columns))
-        self.quant_results_table.setHorizontalHeaderLabels(columns)
-
-    @staticmethod
-    def _cell(text: str, tooltip: str = "") -> QTableWidgetItem:
-        item = QTableWidgetItem(text)
-        if tooltip:
-            item.setToolTip(tooltip)
-        return item
+            self.quant_results_table.set_content([], [])
+        self.details_btn.setEnabled(bool(results and results.get("success")))
 
     def _show_lebail_details(self, results: dict):
-        inner = results.get("refinement_results") or {}
-        factors = inner.get("final_r_factors") or results.get("r_factors") or {}
-        summary = inner.get("phase_summary") or []
-        globals_ = inner.get("global_parameters") or {}
+        parts = refinement_table.summary_headline(results)
+        self.quant_results_label.setText("Refinement — " + "  ·  ".join(parts))
+        self.quant_results_label.setToolTip(
+            refinement_table.weight_basis_note(results) or ""
+        )
 
-        header = []
-        for key, label in (("Rwp", "Rwp"), ("Rp", "Rp"), ("GoF", "GoF")):
-            value = factors.get(key)
-            if value is not None:
-                header.append(f"{label}={float(value):.2f}" + ("%" if key != "GoF" else ""))
-        header.append(f"zero={globals_.get('zero_shift', 0.0):+.4f}°")
-        header.append(f"disp={globals_.get('displacement', 0.0):+.4f}°")
-        if inner.get("iterations"):
-            header.append(f"{inner['iterations']} cycles")
-        if inner.get("intensity_model") == "extract":
-            header.append("Le Bail extraction — wt% unavailable")
-        self.quant_results_label.setText("Refinement — " + "  ·  ".join(header))
-
-        self._set_columns(self.REFINE_COLUMNS)
-        self.quant_results_table.setRowCount(len(summary))
-        for row, phase in enumerate(summary):
-            cell = phase.get("unit_cell") or {}
-            base = phase.get("base_unit_cell") or {}
-            lattice = phase.get("lattice_scale", 1.0)
-            coeffs = phase.get("harmonic_coeffs") or []
-            wt = phase.get("weight_percent")
-            contribution = phase.get("contribution_percent")
-
-            values = [
-                (str(phase.get("name", f"Phase {row + 1}")), phase.get("formula", "")),
-                (f"{wt:.1f}" if wt is not None else "—",
-                 "No RIR value in the database" if phase.get("rir") is None
-                 else "Chung RIR weight percent"),
-                (f"{phase.get('scale', 0.0):.4g}", ""),
-                (f"{cell.get('a', 0.0):.4f}", f"start {base.get('a', 0.0):.4f} Å"),
-                (f"{cell.get('c', 0.0):.4f}", f"start {base.get('c', 0.0):.4f} Å"),
-                (f"{cell.get('volume', 0.0):.2f}", ""),
-                (f"{(lattice - 1.0) * 100:+.3f}", "Isotropic lattice dilation"),
-                (f"{phase.get('absorption', 0.0):+.4f}", ""),
-                (", ".join(f"{c:+.3f}" for c in coeffs) if any(coeffs) else "—",
-                 "Even-order harmonic coefficients c2, c4, c6"),
-                (f"{contribution:.1f}" if contribution is not None else "—",
-                 "Share of the calculated pattern intensity"),
-            ]
-            for column, (text, tooltip) in enumerate(values):
-                self.quant_results_table.setItem(row, column, self._cell(text, tooltip))
-        self.quant_results_table.resizeColumnsToContents()
+        labels = [label for label, _ in refinement_table.SUMMARY_COLUMNS]
+        tips = [tip for _, tip in refinement_table.SUMMARY_COLUMNS]
+        self.quant_results_table.set_content(
+            labels,
+            refinement_table.summary_rows(results),
+            tooltips=refinement_table.summary_tooltips(results),
+            header_tooltips=tips,
+        )
 
     def _show_rir_details(self, result: dict):
-        phases = result.get("phases") or []
         header = [
             f"fit Rwp={result.get('rwp', float('nan')):.1f}%",
             f"{result.get('explained_fraction', 0.0) * 100:.0f}% of intensity explained",
@@ -210,25 +184,16 @@ class QuantDialog(QDialog):
             header.append(f"no RIR: {', '.join(result['missing_rir'][:3])}")
         self.quant_results_label.setText("RIR quantification — " + "  ·  ".join(header))
 
-        self._set_columns(self.RIR_COLUMNS)
-        self.quant_results_table.setRowCount(len(phases))
-        total_pattern = sum(p.get("pattern_intensity", 0.0) for p in phases) or 1.0
-        for row, phase in enumerate(phases):
-            wt = phase.get("weight_percent")
-            rir = phase.get("rir")
-            values = [
-                (str(phase.get("name", f"Phase {row + 1}")), ""),
-                (f"{wt:.1f}" if wt is not None else "—",
-                 "No RIR value in the database" if rir is None else "Chung RIR weight percent"),
-                (f"{phase.get('scale', 0.0):.4g}", ""),
-                (f"{phase.get('line_intensity', 0.0):.4g}", "Strongest-line intensity from the fit"),
-                (f"{rir:.3f}" if rir else "—", "I/I_corundum from AMCSD"),
-                (f"{phase.get('pattern_intensity', 0.0) / total_pattern * 100:.1f}",
-                 "Share of the fitted pattern intensity, before the RIR conversion"),
-            ]
-            for column, (text, tooltip) in enumerate(values):
-                self.quant_results_table.setItem(row, column, self._cell(text, tooltip))
-        self.quant_results_table.resizeColumnsToContents()
+        self.quant_results_table.set_content(
+            [label for label, _ in refinement_table.RIR_COLUMNS],
+            refinement_table.rir_rows(result),
+            header_tooltips=[tip for _, tip in refinement_table.RIR_COLUMNS],
+        )
+
+    def _plot_title(self, text: str) -> str:
+        """Name the data file so an exported figure identifies itself."""
+        name = os.path.basename(self.session.file_path or "")
+        return f"{text} ({name})" if name else text
 
     def _plot_refine(self, ax, palette):
         results = self.session.lebail_results
@@ -251,7 +216,7 @@ class QuantDialog(QDialog):
                         tt, diff + offset, color=palette["diff_line"],
                         lw=diff_lw, label="Difference",
                     )
-            ax.set_title("Le Bail Refinement")
+            ax.set_title(self._plot_title("Le Bail Refinement"))
         elif self.session.rir_results:
             rir = self.session.rir_results
             tt = rir["two_theta"]
@@ -264,7 +229,11 @@ class QuantDialog(QDialog):
                 tt, exp - calc + offset, color=palette["diff_line"],
                 lw=diff_lw, label="Difference",
             )
-            ax.set_title("RIR Quantification — fixed reference patterns, scale only")
+            ax.set_title(
+                self._plot_title(
+                    "RIR Quantification — fixed reference patterns, scale only"
+                )
+            )
         elif pattern is not None:
             ax.plot(
                 pattern["two_theta"], pattern["intensity"],
@@ -275,7 +244,7 @@ class QuantDialog(QDialog):
                     ax, pattern["two_theta"], pattern["intensity"],
                     pattern.get("intensity_error"), palette["exp_line"],
                 )
-            ax.set_title("Quant — run Le Bail to see fit")
+            ax.set_title(self._plot_title("Quant — run Le Bail to see fit"))
         else:
             ax.text(
                 0.5, 0.5, "Match phases, then run Le Bail",

@@ -252,8 +252,8 @@ class PhaseMatchingThread(QThread):
             
             # Check if this phase is from local database and has pre-calculated patterns
             if phase.get('local_db') and phase.get('id'):
-                from utils.local_database import LocalCIFDatabase
-                local_db = LocalCIFDatabase()
+                from utils.local_database import get_local_database
+                local_db = get_local_database()
                 
                 # Try to get pre-calculated pattern first
                 pre_calculated = local_db.get_diffraction_pattern(

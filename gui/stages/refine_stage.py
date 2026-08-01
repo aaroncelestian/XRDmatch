@@ -6,19 +6,34 @@ import csv
 
 import numpy as np
 from PyQt5.QtWidgets import (
-    QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout,
-    QLabel, QMessageBox, QProgressBar, QPushButton, QSpinBox, QToolBox,
-    QVBoxLayout, QWidget,
+    QAbstractButton, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
+    QFormLayout, QHBoxLayout, QLabel, QMessageBox, QProgressBar,
+    QPushButton, QSpinBox, QToolBox, QVBoxLayout, QWidget,
 )
 
 from utils.multi_phase_analyzer import MultiPhaseAnalyzer
 from utils.lebail_refinement import LeBailRefinement
-from matplotlib_config import get_plot_palette
-from gui import display_settings
-from gui.theme import get_current_mode
+from gui import display_settings, refinement_table
+from gui.widgets.section import CollapsibleSection
+from gui.dialogs.refinement_progress_dialog import (
+    RefinementProgressDialog, RefinementWorker,
+)
 
 
 class RefineStage(QWidget):
+    _MAX_SCALE_HINT = (
+        "Upper bound on the overall scale factor of a phase. The lower bound is "
+        "always zero, so a phase that is not really present can refine away.\n\n"
+        "Raise it if a phase pins at the bound. The effective limit is never less "
+        "than twenty times the starting scale, so a phase that begins large keeps "
+        "headroom regardless of this value."
+    )
+    _MAX_SCALE_PAWLEY_HINT = (
+        "The Pawley solve frees every reflection intensity, which absorbs the "
+        "overall scale factor entirely. No scale is refined, so this bound is "
+        "unused."
+    )
+
     def __init__(self, session, workspace, parent=None):
         super().__init__(parent)
         self.session = session
@@ -77,23 +92,24 @@ class RefineStage(QWidget):
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
 
-        export_row = QHBoxLayout()
-        self.export_png = QPushButton("Export PNG")
-        self.export_png.clicked.connect(lambda: self.export_plot("png"))
-        export_row.addWidget(self.export_png)
-        self.export_pdf = QPushButton("Export PDF")
-        self.export_pdf.clicked.connect(lambda: self.export_plot("pdf"))
-        export_row.addWidget(self.export_pdf)
-        self.export_csv = QPushButton("Export CSV")
-        self.export_csv.clicked.connect(self.export_csv_data)
-        export_row.addWidget(self.export_csv)
-        layout.addLayout(export_row)
-
         toolbox = QToolBox()
 
         # --- Global parameters: one value for the whole pattern ---
         glob = QWidget()
         glob_form = QFormLayout(glob)
+
+        self.continue_previous = QCheckBox("Start from previous refinement")
+        self.continue_previous.setChecked(True)
+        self.continue_previous.setToolTip(
+            "Begin each run at the values the last one reached, so a parameter "
+            "whose box you have since unticked stays at its refined value "
+            "instead of returning to a default.\n\n"
+            "This is what lets you refine in stages: free the sample "
+            "displacement, let it settle, untick it, then refine the unit cell "
+            "against the displacement you just found.\n\n"
+            "Untick to start every run from the defaults instead."
+        )
+        glob_form.addRow(self.continue_previous)
 
         self.refine_zero_shift = QCheckBox("Refine zero shift")
         self.refine_zero_shift.setChecked(True)
@@ -113,21 +129,43 @@ class RefineStage(QWidget):
         )
         glob_form.addRow(self.refine_displacement)
 
-        self.refine_profile = QCheckBox("Refine peak profile (U, V, W, η)")
-        self.refine_profile.setChecked(True)
-        glob_form.addRow(self.refine_profile)
-
-        self.eta = QDoubleSpinBox()
-        self.eta.setRange(0.0, 1.0)
-        self.eta.setSingleStep(0.1)
-        self.eta.setValue(0.5)
-        glob_form.addRow("Peak shape η:", self.eta)
+        self.refine_instrument = QCheckBox("Refine instrument profile (U, V, W)")
+        self.refine_instrument.setChecked(False)
+        self.refine_instrument.setToolTip(
+            "The instrument resolution curve is shared by every phase and is "
+            "held fixed by default. Turning this on is rarely useful: U, V and "
+            "W are strongly correlated and can be driven into a non-physical "
+            "region that freezes the refinement. Prefer calibrating them from a "
+            "standard, or leave the defaults alone."
+        )
+        glob_form.addRow(self.refine_instrument)
 
         toolbox.addItem(glob, "Global parameters")
 
         # --- Phase-specific parameters ---
         per_phase = QWidget()
         phase_form = QFormLayout(per_phase)
+
+        self.refine_strain = QCheckBox("Refine microstrain")
+        self.refine_strain.setChecked(True)
+        self.refine_strain.setToolTip(
+            "Per-phase Lorentzian broadening proportional to tan θ, the "
+            "signature of a distribution of lattice constants. Strictly "
+            "positive and well separated from crystallite-size broadening, "
+            "so it is far more stable under refinement than the instrument "
+            "U, V, W polynomial."
+        )
+        phase_form.addRow(self.refine_strain)
+
+        self.refine_size = QCheckBox("Refine crystallite size")
+        self.refine_size.setChecked(False)
+        self.refine_size.setToolTip(
+            "Per-phase Lorentzian broadening proportional to 1/cos θ "
+            "(Scherrer). Negligible for most hand-ground minerals; turn on "
+            "for nanomaterials or precipitates. Refining size and strain "
+            "together needs peaks over a wide 2θ range."
+        )
+        phase_form.addRow(self.refine_size)
 
         self.refine_cell = QCheckBox("Refine unit cell")
         self.refine_cell.setChecked(True)
@@ -182,11 +220,12 @@ class RefineStage(QWidget):
         self.max_scale = QDoubleSpinBox()
         self.max_scale.setRange(1.0, 1000.0)
         self.max_scale.setValue(100.0)
-        phase_form.addRow("Max scale:", self.max_scale)
+        self.max_scale_label = QLabel("Max scale:")
+        phase_form.addRow(self.max_scale_label, self.max_scale)
 
         toolbox.addItem(per_phase, "Phase parameters")
 
-        # --- Range and export ---
+        # --- Fitted 2θ range ---
         adv = QWidget()
         adv_form = QFormLayout(adv)
 
@@ -203,21 +242,77 @@ class RefineStage(QWidget):
         self.max_2th.setSuffix("°")
         adv_form.addRow("Max 2θ:", self.max_2th)
 
-        self.dpi = QSpinBox()
-        self.dpi.setRange(72, 600)
-        self.dpi.setValue(display_settings.export_dpi())
-        self.dpi.valueChanged.connect(
-            lambda value: display_settings.update({"plot_dpi": value})
-        )
-        adv_form.addRow("Export DPI:", self.dpi)
-
-        toolbox.addItem(adv, "Range & export")
+        toolbox.addItem(adv, "Fitted range")
+        self._fix_toolbox_tab_heights(toolbox)
         layout.addWidget(toolbox)
         layout.addStretch()
+        layout.addWidget(self._build_export_group())
 
         self.intensity_model.currentIndexChanged.connect(self._on_intensity_model_changed)
         self.refine_harmonics.toggled.connect(self._on_intensity_model_changed)
         self._on_intensity_model_changed()
+
+        self.refine_intensities.toggled.connect(self._on_pawley_toggled)
+        self._on_pawley_toggled()
+
+    def _build_export_group(self):
+        content = QWidget()
+        group_layout = QVBoxLayout(content)
+        group_layout.setContentsMargins(8, 4, 8, 4)
+
+        button_row = QHBoxLayout()
+        self.export_png = QPushButton("PNG")
+        self.export_png.setToolTip("Save the plot as a raster image.")
+        self.export_png.clicked.connect(lambda: self.export_plot("png"))
+        button_row.addWidget(self.export_png)
+        self.export_pdf = QPushButton("PDF")
+        self.export_pdf.setToolTip("Save the plot as a vector figure.")
+        self.export_pdf.clicked.connect(lambda: self.export_plot("pdf"))
+        button_row.addWidget(self.export_pdf)
+        group_layout.addLayout(button_row)
+
+        self.export_csv = QPushButton("Results table")
+        self.export_csv.setToolTip(
+            "Write the per-phase results as CSV, under the statistics that "
+            "qualify them."
+        )
+        self.export_csv.clicked.connect(self.export_csv_data)
+        group_layout.addWidget(self.export_csv)
+
+        self.export_pattern_btn = QPushButton("Pattern data")
+        self.export_pattern_btn.setToolTip(
+            "Write the pattern point by point as CSV: observed, and the "
+            "calculated and difference curves once a refinement has run."
+        )
+        self.export_pattern_btn.clicked.connect(self.export_pattern_csv)
+        group_layout.addWidget(self.export_pattern_btn)
+
+        dpi_form = QFormLayout()
+        self.dpi = QSpinBox()
+        self.dpi.setRange(72, 600)
+        self.dpi.setValue(display_settings.export_dpi())
+        self.dpi.setToolTip("Resolution of the PNG export.")
+        self.dpi.valueChanged.connect(
+            lambda value: display_settings.update({"plot_dpi": value})
+        )
+        dpi_form.addRow("Image DPI:", self.dpi)
+        group_layout.addLayout(dpi_form)
+
+        self.export_section = CollapsibleSection("Export", content, expanded=False)
+        return self.export_section
+
+    @staticmethod
+    def _fix_toolbox_tab_heights(toolbox):
+        """Keep the tab labels from clipping.
+
+        The tab buttons size themselves from the font alone, so the padding the
+        stylesheet adds eats into the text rather than growing the button.
+        """
+        for button in toolbox.findChildren(QAbstractButton):
+            if button.parent() is toolbox:
+                button.setMinimumHeight(
+                    button.fontMetrics().height() + 16
+                )
 
     def _on_intensity_model_changed(self, *_args):
         """Absorption and texture are only determinable with fixed intensities."""
@@ -233,6 +328,15 @@ class RefineStage(QWidget):
             self.refine_absorption.setToolTip(hint)
             self.refine_harmonics.setToolTip(hint)
 
+    def _on_pawley_toggled(self, *_args):
+        """Pawley intensities absorb the scale factor, so its bound does nothing."""
+        enabled = not self.refine_intensities.isChecked()
+        hint = self._MAX_SCALE_HINT if enabled else self._MAX_SCALE_PAWLEY_HINT
+        self.max_scale.setEnabled(enabled)
+        self.max_scale.setToolTip(hint)
+        self.max_scale_label.setEnabled(enabled)
+        self.max_scale_label.setToolTip(hint)
+
     def on_enter(self):
         n = len(self.session.selected_phases) or len(self.session.matched_phases)
         self.refine_btn.setEnabled(n > 0 and self.session.has_pattern())
@@ -243,6 +347,47 @@ class RefineStage(QWidget):
 
     def _phases_for_refine(self):
         return self.session.selected_phases or self.session.matched_phases
+
+    # Values a run hands to the next one. Everything here is a quantity the
+    # refinement itself determines, so restarting it from a default would throw
+    # away the result of the previous stage.
+    _CARRIED_PHASE_KEYS = (
+        ("scale_factor", "scale"),
+        ("crystallite_size", "crystallite_size"),
+        ("microstrain", "microstrain"),
+        ("lattice_scale", "lattice_scale"),
+        ("absorption", "absorption"),
+        ("harmonic_coeffs", "harmonic_coeffs"),
+    )
+
+    def _carried_values(self):
+        """Starting values from the last refinement: (per phase, global)."""
+        results = self.session.lebail_results
+        if not self.continue_previous.isChecked():
+            return {}, {}
+        if not (results and results.get("success")):
+            return {}, {}
+
+        inner = results.get("refinement_results") or {}
+        per_phase = {}
+        for row in inner.get("phase_summary") or []:
+            name = row.get("name")
+            if not name:
+                continue
+            per_phase[name] = {
+                key: row.get(source) for key, source in self._CARRIED_PHASE_KEYS
+            }
+
+        previous = inner.get("global_parameters") or {}
+        carried_globals = {
+            key: previous.get(key) for key in ("zero_shift", "displacement")
+        }
+        # The instrument widths are seeded from the Initial FWHM box, so only
+        # carry them when the previous run actually refined them away from it.
+        if previous.get("refine_instrument_profile"):
+            for key in ("u_param", "v_param", "w_param"):
+                carried_globals[key] = previous.get(key)
+        return per_phase, carried_globals
 
     def run_lebail(self):
         pattern = self.session.active_pattern()
@@ -281,45 +426,88 @@ class RefineStage(QWidget):
                 fwhm = 0.015
                 self.fwhm.setValue(fwhm)
 
+            # Seed the instrument Gaussian with the user's FWHM estimate; the
+            # sample Lorentzian terms start from GSAS-II defaults and refine
+            # from there. Keeping the instrument fixed is what keeps the
+            # size/strain fit stable.
             initial_w = fwhm ** 2
+            refine_size = self.refine_size.isChecked()
+            refine_strain = self.refine_strain.isChecked()
+            carry_over, carry_globals = self._carried_values()
             refinement_params = {
+                "carry_over": carry_over,
+                "carry_globals": carry_globals,
                 "initial_u": initial_w * 0.05,
                 "initial_v": 0.0,
                 "initial_w": initial_w,
-                "initial_eta": self.eta.value(),
                 "max_scale": self.max_scale.value(),
                 "refine_cell": self.refine_cell.isChecked(),
-                "refine_profile": self.refine_profile.isChecked(),
+                "refine_profile": refine_size or refine_strain,
+                "refine_size": refine_size,
+                "refine_strain": refine_strain,
+                "refine_instrument_profile": self.refine_instrument.isChecked(),
                 "refine_intensities": self.refine_intensities.isChecked(),
                 "intensity_model": self.intensity_model.currentData() or "fixed",
                 "refine_zero_shift": self.refine_zero_shift.isChecked(),
                 "refine_displacement": self.refine_displacement.isChecked(),
                 "refine_absorption": self.refine_absorption.isChecked(),
                 "refine_harmonics": self.refine_harmonics.isChecked(),
-                "harmonic_order": (
-                    self.harmonic_order.currentData()
-                    if self.refine_harmonics.isChecked() else 0
-                ),
+                # The order stays set even when the coefficients are not being
+                # refined, so that a texture correction already found is still
+                # applied. All-zero coefficients make the correction a no-op.
+                "harmonic_order": self.harmonic_order.currentData(),
             }
 
             LeBailRefinement.plot_callback = None
-            results = self.analyzer.perform_lebail_refinement(
-                experimental_data,
-                phase_list,
-                max_iterations=self.max_iter.value(),
-                two_theta_range=two_theta_range,
-                refinement_params=refinement_params,
+            results, error = self._run_watched(
+                experimental_data, phase_list, two_theta_range, refinement_params
             )
+            if error:
+                raise RuntimeError(error)
+            if results is None:
+                self.status.setText("Refinement cancelled.")
+                return
+
             self.session.set_lebail_results(results)
             self.status.setText(self._completion_message(results))
             self.workspace.refresh_plot()
-            self.workspace.set_status("Le Bail refinement complete")
+            self.workspace.set_status(
+                "Le Bail refinement stopped early" if results.get("cancelled")
+                else "Le Bail refinement complete"
+            )
         except Exception as e:
             QMessageBox.critical(self, "Refinement Error", str(e))
             self.status.setText("Refinement failed.")
         finally:
             self.progress.setVisible(False)
             self.refine_btn.setEnabled(True)
+
+    def _run_watched(self, experimental_data, phase_list, two_theta_range,
+                     refinement_params):
+        """
+        Run the refinement behind a progress window, and wait for it.
+
+        The window is modal and runs its own event loop, so this call still
+        returns the finished results to its caller while the refinement itself
+        happens on a worker thread and the window stays live.
+        """
+        worker = RefinementWorker(self.analyzer, {
+            "experimental_data": experimental_data,
+            "identified_phases": phase_list,
+            "max_iterations": self.max_iter.value(),
+            "two_theta_range": two_theta_range,
+            "refinement_params": refinement_params,
+        })
+        dialog = RefinementProgressDialog(worker, self)
+        dialog.set_observed(
+            experimental_data["two_theta"], experimental_data["intensity"]
+        )
+        try:
+            dialog.exec_()
+        finally:
+            worker.cancel()
+            worker.wait(5000)
+        return dialog.results, dialog.error
 
     @staticmethod
     def _completion_message(results) -> str:
@@ -360,21 +548,74 @@ class RefineStage(QWidget):
             QMessageBox.critical(self, "Export Error", str(e))
 
     def export_csv_data(self):
-        pattern = self.session.active_pattern()
-        if not pattern:
-            QMessageBox.warning(self, "No Data", "No pattern to export.")
+        """Write the results table, under the statistics that qualify it."""
+        results = self.session.lebail_results
+        if not (results and results.get("success")):
+            QMessageBox.warning(
+                self, "No Results",
+                "Run a Le Bail refinement before exporting the results table.",
+            )
             return
+
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export CSV", "xrd_data.csv", "CSV (*.csv);;All files (*.*)"
+            self, "Export Results Table", "refinement_results.csv",
+            "CSV (*.csv);;All files (*.*)",
         )
         if not path:
             return
         try:
-            with open(path, "w", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow(["two_theta", "intensity"])
-                for x, y in zip(pattern["two_theta"], pattern["intensity"]):
-                    writer.writerow([float(x), float(y)])
+            with open(path, "w", newline="", encoding="utf-8") as handle:
+                writer = csv.writer(handle)
+                for name, value in refinement_table.global_rows(results):
+                    writer.writerow([name, value])
+                writer.writerow([])
+                writer.writerow(
+                    [label for label, _ in refinement_table.SUMMARY_COLUMNS]
+                )
+                writer.writerows(refinement_table.summary_rows(results))
+            self.workspace.set_status(f"Exported {path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", str(e))
+
+    def export_pattern_csv(self):
+        """Write the pattern itself: observed, calculated and difference."""
+        pattern = self.session.active_pattern()
+        if not pattern:
+            QMessageBox.warning(self, "No Data", "No pattern to export.")
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Pattern CSV", "xrd_pattern.csv",
+            "CSV (*.csv);;All files (*.*)",
+        )
+        if not path:
+            return
+
+        two_theta = np.asarray(pattern["two_theta"], dtype=float)
+        observed = np.asarray(pattern["intensity"], dtype=float)
+        calculated = None
+        results = self.session.lebail_results
+        if results and results.get("success"):
+            inner = results.get("refinement_results") or {}
+            candidate = inner.get("calculated_pattern")
+            # The refinement may have run over a narrowed 2theta range, in which
+            # case its grid no longer lines up with the pattern
+            if candidate is not None and len(candidate) == len(observed):
+                calculated = np.asarray(candidate, dtype=float)
+
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as handle:
+                writer = csv.writer(handle)
+                if calculated is None:
+                    writer.writerow(["two_theta", "intensity"])
+                    writer.writerows(zip(two_theta, observed))
+                else:
+                    writer.writerow(
+                        ["two_theta", "observed", "calculated", "difference"]
+                    )
+                    writer.writerows(
+                        zip(two_theta, observed, calculated, observed - calculated)
+                    )
             self.workspace.set_status(f"Exported {path}")
         except Exception as e:
             QMessageBox.critical(self, "Export Error", str(e))

@@ -122,10 +122,12 @@ def test_lebail_refinement():
     params = refined_phase['parameters']
     print(f"\n   Refined Parameters:")
     print(f"   Scale factor: {params['scale_factor']:.4f}")
-    print(f"   Profile U: {params['u_param']:.6f}")
-    print(f"   Profile V: {params['v_param']:.6f}")
-    print(f"   Profile W: {params['w_param']:.6f}")
-    print(f"   Profile η: {params['eta_param']:.3f}")
+    g = lebail.global_parameters
+    print(f"   Instrument U: {g['u_param']:.6f}")
+    print(f"   Instrument V: {g['v_param']:.6f}")
+    print(f"   Instrument W: {g['w_param']:.6f}")
+    print(f"   Crystallite size: {params.get('crystallite_size', 0.0):.4g} um")
+    print(f"   Microstrain: {params.get('microstrain', 0.0):.4g}")
     print(f"   Lattice scale: {params['lattice_scale']:.6f}")
     print(f"   Zero shift: {results['global_parameters']['zero_shift']:.4f}° (global)")
     print(f"   Displacement: {results['global_parameters']['displacement']:.4f}° (global)")

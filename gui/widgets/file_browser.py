@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from typing import Optional
+from typing import List, Optional
 
 from PyQt5.QtCore import QDir, QModelIndex, QSettings, Qt, pyqtSignal
 from PyQt5.QtGui import QDragEnterEvent, QDropEvent
@@ -20,6 +20,8 @@ class FileBrowser(QWidget):
 
     file_activated = pyqtSignal(str)
     wavelength_changed = pyqtSignal(float)
+    # Paths to overlay for comparison; empty once the selection is back to one
+    comparison_changed = pyqtSignal(list)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -55,9 +57,11 @@ class FileBrowser(QWidget):
         self.tree.setAnimated(False)
         self.tree.setSortingEnabled(True)
         self.tree.setHeaderHidden(False)
-        self.tree.setSelectionMode(QTreeView.SingleSelection)
+        # Ctrl- or shift-click gathers several patterns to compare at once
+        self.tree.setSelectionMode(QTreeView.ExtendedSelection)
         self.tree.doubleClicked.connect(self._on_activated)
         self.tree.clicked.connect(self._on_clicked)
+        self.tree.selectionModel().selectionChanged.connect(self._on_selection_changed)
         # Show name column only
         for col in range(1, 4):
             self.tree.hideColumn(col)
@@ -88,7 +92,10 @@ class FileBrowser(QWidget):
         form.addRow("", self.custom_wavelength)
         layout.addLayout(form)
 
-        self.file_label = QLabel("Select a folder, then click a pattern file.")
+        self.file_label = QLabel(
+            "Select a folder, then click a pattern file.\n"
+            "Ctrl- or shift-click several to overlay them for comparison."
+        )
         self.file_label.setObjectName("mutedLabel")
         self.file_label.setWordWrap(True)
         layout.addWidget(self.file_label)
@@ -133,7 +140,9 @@ class FileBrowser(QWidget):
         self.path_edit.setText(path)
         root = self.model.setRootPath(path)
         self.tree.setRootIndex(root)
-        self.file_label.setText("Click a pattern file to load.")
+        self.file_label.setText(
+            "Click a pattern file to load, or ctrl-click several to compare."
+        )
         QSettings().setValue("file_browser/last_folder", path)
 
     def folder(self) -> str:
@@ -163,7 +172,28 @@ class FileBrowser(QWidget):
             return path
         return None
 
+    def selected_pattern_paths(self) -> List[str]:
+        """Every selected row that is a readable pattern file, in tree order."""
+        model = self.tree.selectionModel()
+        if model is None:
+            return []
+        paths = []
+        for index in model.selectedRows(0):
+            path = self._path_from_index(index)
+            if path:
+                paths.append(path)
+        return paths
+
+    def _on_selection_changed(self, *_args):
+        """Announce a multi-file selection, or its end, for comparison."""
+        paths = self.selected_pattern_paths()
+        self.comparison_changed.emit(paths if len(paths) > 1 else [])
+
     def _on_clicked(self, index: QModelIndex):
+        # A ctrl- or shift-click is building a comparison set, not asking to
+        # replace the pattern being worked on
+        if len(self.selected_pattern_paths()) > 1:
+            return
         path = self._path_from_index(index)
         if path:
             self.file_activated.emit(path)

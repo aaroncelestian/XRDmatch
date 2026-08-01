@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from collections import Counter
 from typing import Optional
 
 import numpy as np
@@ -15,13 +16,15 @@ from PyQt5.QtWidgets import (
 
 from matplotlib.widgets import SpanSelector
 
-from matplotlib_config import apply_plot_style, draw_error_bars, get_plot_palette
+from matplotlib_config import (
+    apply_plot_style, draw_error_bars, get_overlay_colors, get_plot_palette,
+)
 from gui import display_settings
 from gui.theme import get_current_mode
 from gui.widgets.file_browser import FileBrowser
 from gui.widgets.plot_host import create_plot_host
 from gui.stages import ProcessStage, IdentifyStage
-from gui.pattern_io import load_pattern_file
+from gui.pattern_io import load_pattern_file, normalize_for_comparison
 from utils import emphasis
 from utils.two_theta_shift import DISPLACEMENT, describe as describe_shift
 
@@ -57,10 +60,14 @@ class AnalysisWorkspace(QWidget):
         self._database_dialog = None
         self._details_dialog = None
         self._preview = None  # {"name", "two_theta", "intensity"}
+        self._comparison = []  # normalized patterns overlaid for comparison only
         self._peak_highlight = None  # {"two_theta", "intensity", "d_spacing"}
         self._peak_edit = False  # clicks on the plot add/remove peaks
         self._emphasis_mode = False  # drags on the plot mark priority regions
         self._emphasis_selector = None
+        # The phase list and the shortlist mirror each other's check marks;
+        # this stops one half of that from being read as a fresh user click
+        self._syncing_checks = False
 
         self.process_stage = ProcessStage(session, self)
         self.identify_stage = IdentifyStage(session, self)
@@ -75,6 +82,7 @@ class AnalysisWorkspace(QWidget):
         self.file_browser = FileBrowser()
         self.file_browser.setMinimumWidth(LEFT_MIN_WIDTH)
         self.file_browser.file_activated.connect(self.open_pattern_file)
+        self.file_browser.comparison_changed.connect(self.set_comparison_patterns)
         self.file_browser.wavelength_changed.connect(self._on_wavelength_changed)
         self.main_splitter.addWidget(self.file_browser)
 
@@ -240,10 +248,12 @@ class AnalysisWorkspace(QWidget):
 
         self.shortlist_btn = QPushButton("Add to Shortlist")
         self.shortlist_btn.setToolTip(
-            "Keep the checked phases — or the highlighted one — on the Shortlist "
-            "tab.\n\n"
-            "The shortlist is saved between sessions and survives loading another "
-            "pattern, so a mineral only has to be found once."
+            "Keep the highlighted phase on the Shortlist tab without checking it "
+            "in this list first.\n\n"
+            "Checking a phase already shortlists it, so this is only needed for a "
+            "mineral you want to note but not include in the analysis yet. The "
+            "shortlist is saved between sessions and survives loading another "
+            "pattern."
         )
         self.shortlist_btn.clicked.connect(self.add_selection_to_shortlist)
         stage.add_action_widget(self.shortlist_btn)
@@ -400,6 +410,7 @@ class AnalysisWorkspace(QWidget):
         self.process_stage.find_peaks()
 
     def open_pattern_file(self, path: str):
+        self._comparison = []
         try:
             wl = self.file_browser.current_wavelength()
             pattern = load_pattern_file(path, wl)
@@ -426,6 +437,80 @@ class AnalysisWorkspace(QWidget):
             self.set_status(f"Loaded {name}")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Could not load pattern:\n{e}")
+
+    # --- multi-pattern comparison ---
+
+    # Past this many curves the plot is unreadable and the load is slow enough
+    # to notice, so a stray select-all does not lock up the window.
+    MAX_COMPARISON = 24
+
+    def set_comparison_patterns(self, paths):
+        """
+        Overlay several patterns, normalized, purely to look at them side by side.
+
+        This deliberately leaves the session alone. The pattern being processed
+        or refined stays loaded and untouched, so a comparison can be made
+        part-way through an analysis and dismissed without losing anything;
+        selecting a single file again returns to the normal view.
+        """
+        paths = list(paths or [])
+        if len(paths) < 2:
+            if self._comparison:
+                self._comparison = []
+                self.refresh_plot()
+            return
+
+        truncated = len(paths) > self.MAX_COMPARISON
+        wavelength = self.file_browser.current_wavelength()
+
+        loaded, failed = [], []
+        for path in paths[: self.MAX_COMPARISON]:
+            try:
+                pattern = load_pattern_file(path, wavelength)
+            except Exception:
+                failed.append(os.path.basename(path))
+                continue
+            loaded.append({
+                "name": os.path.basename(path),
+                "two_theta": pattern["two_theta"],
+                "intensity": normalize_for_comparison(pattern["intensity"]),
+                "wavelength": pattern["wavelength"],
+            })
+
+        self._comparison = loaded
+        self.refresh_plot()
+
+        if not loaded:
+            self.set_status("None of the selected patterns could be read")
+            return
+
+        message = f"Comparing {len(loaded)} patterns (normalized)"
+        if truncated:
+            message += f", first {self.MAX_COMPARISON} of {len(paths)}"
+        if failed:
+            message += f" — could not read {', '.join(failed)}"
+        self.set_status(message)
+
+    def _plot_comparison(self, ax, palette):
+        """Draw the compared patterns on a shared 0-100 scale."""
+        colors = get_overlay_colors(get_current_mode(), len(self._comparison))
+        for entry, color in zip(self._comparison, colors):
+            ax.plot(
+                entry["two_theta"], entry["intensity"], color=color,
+                lw=display_settings.line_width(0.9), alpha=0.85,
+                label=entry["name"],
+            )
+
+        ax.set_xlabel("2θ (degrees)")
+        ax.set_ylabel("Normalized intensity")
+
+        title = f"Comparing {len(self._comparison)} patterns"
+        # Comparing 2-theta across wavelengths lines up the wrong reflections,
+        # which is worth saying out loud rather than leaving to be noticed
+        wavelengths = {round(float(e["wavelength"]), 4) for e in self._comparison}
+        if len(wavelengths) > 1:
+            title += " — mixed wavelengths, 2θ not comparable"
+        ax.set_title(title)
 
     # --- results helpers ---
 
@@ -567,6 +652,9 @@ class AnalysisWorkspace(QWidget):
             return
         # Pan and zoom own the mouse while a toolbar tool is armed
         if str(getattr(self.toolbar, "mode", "")):
+            return
+        # The comparison view is not showing the pattern the peaks belong to
+        if self._comparison:
             return
         if self._emphasis_mode and event.button == 3:
             self._remove_emphasis_at(float(event.xdata))
@@ -803,13 +891,45 @@ class AnalysisWorkspace(QWidget):
         return item
 
     @staticmethod
-    def _mineral_item(name: str, result: dict) -> QTableWidgetItem:
+    def _record_id(result: dict):
+        phase = result.get("phase", result)
+        for src in (result, phase):
+            if not isinstance(src, dict):
+                continue
+            for key in ("mineral_id", "id", "amcsd_id"):
+                val = src.get(key)
+                if val not in (None, ""):
+                    return val
+        return None
+
+    @classmethod
+    def _repeated_names(cls, results: list) -> set:
+        """Names held by more than one database record in this list."""
+        counts = Counter()
+        for r in results:
+            phase = r.get("phase", r) if isinstance(r, dict) else {}
+            name = phase.get("mineral") or phase.get("mineral_name") or r.get("mineral_name")
+            if name:
+                counts[str(name)] += 1
+        return {n for n, c in counts.items() if c > 1}
+
+    @classmethod
+    def _mineral_item(cls, name: str, result: dict,
+                      repeated: Optional[set] = None) -> QTableWidgetItem:
         """Name cell carrying formula and cell data in its tooltip."""
-        item = QTableWidgetItem(str(name))
+        record = cls._record_id(result)
+        label = str(name)
+        # Several records per mineral is normal; show which one this row is
+        # whenever the same name appears twice in the list
+        if repeated and label in repeated and record is not None:
+            label = f"{label}  ·  #{record}"
+        item = QTableWidgetItem(label)
         phase = result.get("phase", result)
         src = {**result, **phase} if isinstance(phase, dict) else result
         formula = src.get("chemical_formula") or src.get("formula") or "—"
         tip = [str(name), f"Formula: {formula}", f"Space group: {src.get('space_group') or '—'}"]
+        if record is not None:
+            tip.append(f"Database record: {record}")
         cell = [src.get("cell_a"), src.get("cell_b"), src.get("cell_c")]
         if all(v for v in cell):
             tip.append("a, b, c: " + ", ".join(f"{float(v):.4f}" for v in cell))
@@ -831,8 +951,11 @@ class AnalysisWorkspace(QWidget):
         self.results_table.setColumnCount(4)
         self.results_table.setHorizontalHeaderLabels(["Mineral", "Score", "Lines", "✓"])
         self.results_table.setRowCount(len(results))
+        repeated = self._repeated_names(results)
         for i, r in enumerate(results):
-            self.results_table.setItem(i, 0, self._mineral_item(r.get("mineral_name", ""), r))
+            self.results_table.setItem(
+                i, 0, self._mineral_item(r.get("mineral_name", ""), r, repeated)
+            )
             score = r.get(
                 "fingerprint_score",
                 r.get("ensemble_score",
@@ -842,23 +965,40 @@ class AnalysisWorkspace(QWidget):
             self.results_table.setItem(i, 2, self._lines_cell(r))
             cb = QCheckBox()
             cb.setChecked(False)  # user must opt in
-            cb.stateChanged.connect(self._on_candidate_checked)
+            cb.stateChanged.connect(
+                lambda state, row=i: self._on_candidate_checked(row, state)
+            )
             self.results_table.setCellWidget(i, CAND_SELECT_COL, cb)
         self.results_table.blockSignals(False)
         self._size_results_columns(stretch_cols=(0,))
-        self.identify_stage.update_action_states()
+        # Rows for shortlisted minerals come up checked, so the selection has
+        # to be recomputed rather than assumed empty
+        self.apply_shortlist_checks()
+        self.sync_selected_phases()
 
     def check_candidate_rows(self, names: list):
         """Check rows whose mineral name matches (used for manually added phases)."""
         if self._results_mode != "candidates" or not names:
             return
         wanted = {str(n).lower() for n in names if n}
-        for i in range(self.results_table.rowCount()):
-            item = self.results_table.item(i, 0)
-            if item and item.text().lower() in wanted:
+        for i, r in enumerate(self._candidate_results):
+            name = str(r.get("mineral_name", "")).lower()
+            if name and name in wanted:
                 cb = self.results_table.cellWidget(i, CAND_SELECT_COL)
                 if cb:
                     cb.setChecked(True)
+
+    def check_candidate_result(self, result: dict):
+        """Check the row holding this exact result, and scroll it into view."""
+        if self._results_mode != "candidates":
+            return
+        for i, r in enumerate(self._candidate_results):
+            if r is result:
+                cb = self.results_table.cellWidget(i, CAND_SELECT_COL)
+                if cb:
+                    cb.setChecked(True)
+                self.results_table.selectRow(i)
+                return
 
     def get_selected_candidates(self) -> list:
         """Return only explicitly checked candidates (no auto-fallback)."""
@@ -892,19 +1032,32 @@ class AnalysisWorkspace(QWidget):
 
         from utils.residual_search import mineral_key
 
-        preselect_keys = set()
-        if preselect:
-            for p in preselect:
+        # Preselect the exact records that were kept, not every row sharing
+        # their mineral name — sibling records of the same mineral are separate
+        # candidates the user is still deciding on
+        preselect_ids, preselect_keys = set(), set()
+        for p in preselect or []:
+            rid = self._record_id(p)
+            if rid is not None:
+                preselect_ids.add(str(rid))
+            elif mineral_key(p):
                 preselect_keys.add(mineral_key(p))
 
+        repeated = self._repeated_names(results)
         for i, r in enumerate(results):
             phase = r.get("phase", r)
             name = phase.get("mineral", phase.get("mineral_name", f"Phase {i+1}"))
+            rid = self._record_id(r)
+            checked = str(rid) in preselect_ids if rid is not None else False
+            if not checked and preselect_keys:
+                checked = mineral_key(r) in preselect_keys
             cb = QCheckBox()
-            cb.setChecked(bool(preselect_keys) and mineral_key(r) in preselect_keys)
-            cb.stateChanged.connect(self._sync_selected_from_table)
+            cb.setChecked(checked)
+            cb.stateChanged.connect(
+                lambda state, row=i: self._on_match_checked(row, state)
+            )
             self.results_table.setCellWidget(i, MATCH_SELECT_COL, cb)
-            item = self._mineral_item(name, r)
+            item = self._mineral_item(name, r, repeated)
             cov = r.get("coverage", 0)
             if cov:
                 item.setToolTip(f"{item.toolTip()}\nCoverage: {float(cov):.2f}")
@@ -919,7 +1072,11 @@ class AnalysisWorkspace(QWidget):
             self.results_table.setItem(i, 3, self._lines_cell(r))
         self.results_table.blockSignals(False)
         self._size_results_columns(stretch_cols=(1,))
-        self._sync_selected_from_table()
+        # Preselected rows were checked before their signals were connected,
+        # so nothing has told the shortlist about them yet
+        self.shortlist_phases(self.get_selected_matches())
+        self.apply_shortlist_checks()
+        self.sync_selected_phases()
 
     def _size_results_columns(self, stretch_cols=(0,)):
         """Give the name columns the slack instead of the checkbox column."""
@@ -963,6 +1120,18 @@ class AnalysisWorkspace(QWidget):
         result = self._result_at_row(row)
         if result is None:
             return
+        self.preview_phase(result)
+
+    def preview_phase(self, result: Optional[dict]):
+        """Overlay one phase's reference lines on the pattern, or clear the overlay.
+
+        Takes anything that carries a database record — a search hit, a match
+        result, a raw `minerals` row — so the mineral picker can drive the same
+        overlay the results table does.
+        """
+        if result is None:
+            self.clear_preview()
+            return
         theo = self.identify_stage.reference_peaks_for(result)
         if not theo or len(theo.get("two_theta", [])) == 0:
             self._preview = None
@@ -982,6 +1151,14 @@ class AnalysisWorkspace(QWidget):
             "intensity": np.asarray(theo["intensity"], dtype=float),
             "result": result,
         }
+        self.refresh_plot()
+
+    def current_preview(self) -> Optional[dict]:
+        """The overlay in place, for callers that put back what they replaced."""
+        return self._preview
+
+    def restore_preview(self, payload: Optional[dict]):
+        self._preview = payload
         self.refresh_plot()
 
     def clear_preview(self):
@@ -1139,15 +1316,17 @@ class AnalysisWorkspace(QWidget):
         from PyQt5.QtWidgets import QMessageBox
         QMessageBox.information(self, "No List", "Run a search or match first.")
 
-    def _sync_selected_from_table(self):
-        if self._results_mode != "matches":
+    def _on_match_checked(self, row: int, state):
+        if self._results_mode != "matches" or self._syncing_checks:
             return
+        self._mirror_check_to_shortlist(row, state == Qt.Checked)
         self.sync_selected_phases()
 
-    def _on_candidate_checked(self, *_):
+    def _on_candidate_checked(self, row: int, state):
         """Checked candidates count as accepted phases: plot them and enable actions."""
-        if self._results_mode != "candidates":
+        if self._results_mode != "candidates" or self._syncing_checks:
             return
+        self._mirror_check_to_shortlist(row, state == Qt.Checked)
         self.sync_selected_phases()
 
     def sync_selected_phases(self):
@@ -1164,16 +1343,73 @@ class AnalysisWorkspace(QWidget):
 
     # --- shortlist ---
 
+    def _mirror_check_to_shortlist(self, row: int, checked: bool):
+        """
+        A check mark in the phase list is a decision about the mineral itself.
+
+        Checking a phase here says it is part of this pattern's answer, which
+        is exactly what the shortlist records, so it goes on the list without
+        being asked for. Forgetting to keep a mineral before moving on to the
+        residual round used to lose it for good.
+        """
+        panel = getattr(self, "shortlist_panel", None)
+        result = self._result_at_row(row)
+        if panel is None or result is None:
+            return
+        self._syncing_checks = True
+        try:
+            panel.set_result_checked(result, checked)
+        finally:
+            self._syncing_checks = False
+
+    def apply_shortlist_checks(self):
+        """
+        Show the shortlist's check marks on any rows for the same mineral.
+
+        A mineral checked on the shortlist is in the analysis whether or not
+        the current list shows it, so when it does appear — in a new search, or
+        after loading another pattern — it has to come up checked. Rows for
+        minerals that are not on the shortlist are left as the user set them.
+        """
+        panel = getattr(self, "shortlist_panel", None)
+        if panel is None or self._results_mode is None:
+            return
+        col = CAND_SELECT_COL if self._results_mode == "candidates" else MATCH_SELECT_COL
+        self._syncing_checks = True
+        try:
+            for row in range(self.results_table.rowCount()):
+                cb = self.results_table.cellWidget(row, col)
+                result = self._result_at_row(row)
+                if cb is None or result is None:
+                    continue
+                state = panel.checked_state(result)
+                if state is not None and cb.isChecked() != state:
+                    cb.setChecked(state)
+        finally:
+            self._syncing_checks = False
+
+    def shortlist_phases(self, phases: list) -> int:
+        """Put every one of these phases on the shortlist, checked."""
+        panel = getattr(self, "shortlist_panel", None)
+        if panel is None or not phases:
+            return 0
+        self._syncing_checks = True
+        try:
+            return panel.add_results(phases)
+        finally:
+            self._syncing_checks = False
+
     def add_row_to_shortlist(self, row: int):
         result = self._result_at_row(row)
         if result is None:
             return
-        added = self.shortlist_panel.add_result(result)
+        added = self.shortlist_phases([result])
         name = result.get("phase", result).get("mineral") or result.get("mineral_name") or "phase"
         self.set_status(
             f"Added {name} to the shortlist" if added
             else f"{name} is already on the shortlist"
         )
+        self.apply_shortlist_checks()
         self.sync_selected_phases()
 
     def add_selection_to_shortlist(self):
@@ -1197,8 +1433,8 @@ class AnalysisWorkspace(QWidget):
             )
             return
 
-        added = sum(1 for r in results if self.shortlist_panel.add_result(r))
-        self.shortlist_panel.reload()
+        added = self.shortlist_phases(results)
+        self.apply_shortlist_checks()
         self.sync_selected_phases()
         self.set_status(
             f"Shortlisted {added} mineral(s)" if added
@@ -1213,17 +1449,26 @@ class AnalysisWorkspace(QWidget):
         ax.clear()
         palette = get_plot_palette(mode)
 
-        if self.session.has_matches() or self.session.selected_phases:
+        comparing = bool(self._comparison)
+        if comparing:
+            self._plot_comparison(ax, palette)
+        elif self.session.has_matches() or self.session.selected_phases:
             self._plot_identify(ax, palette)
         elif self.session.processed_pattern is not None or self.session.has_peaks():
             self._plot_process(ax, palette)
         else:
             self._plot_load(ax, palette)
 
-        self._draw_emphasis(ax)
-        self._draw_preview(ax)
-        self._draw_peak_highlight(ax)
-        if display_settings.show_legend() and ax.get_legend_handles_labels()[0]:
+        if not comparing:
+            # These all annotate the session pattern, which the comparison view
+            # is not showing
+            self._draw_emphasis(ax)
+            self._draw_preview(ax)
+            self._draw_peak_highlight(ax)
+
+        # Overlaid patterns are told apart by the legend alone, so it stays on
+        # even when the user has legends switched off elsewhere
+        if (comparing or display_settings.show_legend()) and ax.get_legend_handles_labels()[0]:
             ax.legend(loc="upper right", fontsize=8)
 
         apply_plot_style(self.figure, mode, show_grid=display_settings.show_grid())

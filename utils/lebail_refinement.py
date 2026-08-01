@@ -6,11 +6,15 @@ Implements proper crystallographic refinement with profile functions and unit ce
 import numpy as np
 import itertools
 
-from scipy.optimize import least_squares, nnls
+from scipy.optimize import least_squares, lsq_linear, nnls
+from scipy.sparse import coo_matrix, diags
 from scipy.special import eval_legendre
 from typing import Dict, List, Tuple, Optional
 import copy
 import warnings
+
+from utils.profile_functions import phase_widths
+
 warnings.filterwarnings('ignore')
 
 class LeBailRefinement:
@@ -36,6 +40,15 @@ class LeBailRefinement:
         self.two_theta_range = None  # Optional 2-theta range (min, max)
         self.quiet = False
         self.mode = 'polish'  # 'trial' | 'polish'
+
+        # Optional hooks for a caller watching the refinement run. progress is
+        # handed a snapshot after every cycle, log every message, and cancel is
+        # consulted between cycles and between phases -- the points at which the
+        # refinement is in a consistent state and can be stopped without leaving
+        # a phase half-fitted.
+        self.progress_callback = None
+        self.log_callback = None
+        self.cancel_check = None
         self.peak_intensity_cutoff = 0.0  # fraction of Imax; trial uses ~0.02
         self.extract_iterations = 3
         self._profile_cache = {}  # (phase_idx, cache_key) -> sparse profile parts
@@ -53,12 +66,27 @@ class LeBailRefinement:
 
         # Instrument terms shared by every phase. Fitting these per phase lets
         # one phase absorb an instrument error and drift off its true cell.
+        #
+        # The profile terms are here, not on the phases, because peak width is
+        # part instrument and part sample and nothing in a single pattern says
+        # where the line falls. Held fixed, they give the sample terms a stable
+        # baseline to work against; refined, they are three strongly correlated
+        # coefficients of an unbounded polynomial that can be driven negative,
+        # which is the usual cause of a profile refinement blowing up. So they
+        # default to fixed, and refining them is opt-in.
         self.global_parameters = {
             'zero_shift': 0.0,      # constant 2-theta offset (degrees)
             'displacement': 0.0,    # specimen displacement: d(2-theta) = disp * cos(theta)
+            'u_param': 0.002,       # Caglioti Gaussian, instrument resolution curve
+            'v_param': -0.0005,
+            'w_param': 0.004,
+            'x_param': 0.0,         # instrument Lorentzian; normally zero
+            'y_param': 0.0,
             'refine_zero_shift': True,
             'refine_displacement': False,
+            'refine_instrument_profile': False,
         }
+        self.wavelength = 1.5406
 
         # 'extract': classic Le Bail, intensities partitioned out of the observed
         #            pattern. Best profile/cell fit, but scale and the intensity
@@ -93,7 +121,8 @@ class LeBailRefinement:
         
     def set_experimental_data(self, two_theta: np.ndarray, intensity: np.ndarray, 
                             errors: Optional[np.ndarray] = None,
-                            two_theta_range: Optional[Tuple[float, float]] = None):
+                            two_theta_range: Optional[Tuple[float, float]] = None,
+                            wavelength: Optional[float] = None):
         """Set experimental diffraction data
         
         Args:
@@ -104,7 +133,12 @@ class LeBailRefinement:
                       to avoid fitting the background as part of the diffraction pattern
             errors: Optional error values (defaults to sqrt(intensity))
             two_theta_range: Optional (min, max) 2-theta range to limit refinement
+            wavelength: Radiation wavelength in angstroms; used by the Scherrer
+                        size term. Defaults to Cu K-alpha when omitted.
         """
+        if wavelength is not None and wavelength > 0:
+            self.wavelength = float(wavelength)
+
         # Normalize intensity to 0-100 scale for better numerical stability
         intensity = np.array(intensity)
         max_intensity = np.max(intensity)
@@ -156,10 +190,15 @@ class LeBailRefinement:
         # Default refinement parameters
         default_params = {
             'scale_factor': initial_scale,
-            'u_param': 0.01,      # Peak width parameter U
-            'v_param': -0.001,    # Peak width parameter V  
-            'w_param': 0.01,      # Peak width parameter W
-            'eta_param': 0.5,     # Pseudo-Voigt mixing parameter
+            # Sample broadening, the part of the width that belongs to this
+            # phase. Both are strictly positive and carry distinct angular
+            # signatures -- size goes as 1/cos(theta), strain as tan(theta) --
+            # which is what lets them be told apart, and what makes them far
+            # better behaved under refinement than the instrument polynomial.
+            'crystallite_size': 1.0,   # micrometres; ~1 um broadens negligibly
+            'microstrain': 1000.0,     # delta-d/d x 1e6
+            'refine_size': False,      # size matters mainly for nanomaterials
+            'refine_strain': True,     # microstrain is the usual dominant term
             'zero_shift': 0.0,    # legacy per-phase offset; the global term is used now
             'unit_cell': self._extract_unit_cell(phase_data),
             # Isotropic lattice dilation: every d-spacing scales by this factor.
@@ -179,14 +218,21 @@ class LeBailRefinement:
         
         if initial_parameters:
             default_params.update(initial_parameters)
-        
-        # Initialize individual peak intensity multipliers for Pawley refinement
-        n_peaks = len(phase_data['theoretical_peaks'].get('two_theta', []))
-        if default_params.get('refine_intensities', False):
-            # Start all intensity multipliers at 1.0
-            default_params['peak_intensity_multipliers'] = np.ones(n_peaks)
-        else:
-            default_params['peak_intensity_multipliers'] = None
+
+        # Callers that predate the instrument/sample split still hand the
+        # Caglioti terms to the phase. They describe the instrument, so route
+        # them there rather than silently ignoring the width the caller asked
+        # for. The last phase to supply them wins, which is harmless because
+        # every caller passes the same values to every phase.
+        for legacy, target in (('u_param', 'u_param'), ('v_param', 'v_param'),
+                               ('w_param', 'w_param')):
+            if legacy in default_params:
+                self.global_parameters[target] = float(default_params.pop(legacy))
+        default_params.pop('eta_param', None)  # now derived, not fitted
+
+        # Pawley intensities are solved, not searched, so they need no starting
+        # vector here; the cache is filled on the first alternation step.
+        default_params.pop('peak_intensity_multipliers', None)
 
         order = int(default_params.get('harmonic_order', 0) or 0)
         n_harmonics = max(0, order // 2)
@@ -196,7 +242,17 @@ class LeBailRefinement:
         default_params['harmonic_coeffs'] = coeffs
         # Lattice dilation is refined against the starting cell, so keep a copy
         default_params['_base_unit_cell'] = dict(default_params['unit_cell'])
-            
+
+        # A dilation carried over from an earlier run has to be applied to the
+        # reported cell here, because the cell is otherwise only recomputed when
+        # lattice_scale is among the parameters actually being refined.
+        carried_scale = float(default_params.get('lattice_scale', 1.0) or 1.0)
+        if abs(carried_scale - 1.0) > 1e-12:
+            default_params['unit_cell'] = self._scaled_unit_cell(
+                default_params['_base_unit_cell'], carried_scale
+            )
+
+
         phase = {
             'data': phase_data,
             'parameters': default_params,
@@ -235,8 +291,38 @@ class LeBailRefinement:
 
     def _log(self, message: str):
         """Print unless quiet mode is enabled"""
+        if self.log_callback is not None:
+            try:
+                self.log_callback(message)
+            except Exception:
+                pass  # a watcher must never be able to stop the refinement
         if not self.quiet:
             print(message)
+
+    def _phase_name(self, phase_idx: int) -> str:
+        try:
+            info = self.phases[phase_idx]['data']['phase']
+            return info.get('mineral') or info.get('mineral_name') or f'Phase {phase_idx + 1}'
+        except (IndexError, KeyError, TypeError, AttributeError):
+            return f'Phase {phase_idx + 1}'
+
+    def _cancelled(self) -> bool:
+        """True when the caller has asked the refinement to stop."""
+        if self.cancel_check is None:
+            return False
+        try:
+            return bool(self.cancel_check())
+        except Exception:
+            return False
+
+    def _report_progress(self, **payload):
+        """Hand a caller a snapshot of where the refinement has got to."""
+        if self.progress_callback is None:
+            return
+        try:
+            self.progress_callback(payload)
+        except Exception as e:
+            self._log(f"Warning: progress callback failed: {e}")
 
     def clear_phases(self):
         """Remove all phases and profile cache"""
@@ -401,17 +487,14 @@ class LeBailRefinement:
         self._log(f"Starting Le Bail refinement ({self.mode}) with {len(self.phases)} phases")
         self._log(f"Experimental data: {len(self.experimental_data['two_theta'])} points")
         
-        # Check for Pawley mode and warn if too many peaks
         total_pawley_params = 0
         for phase in self.phases:
             if phase['parameters'].get('refine_intensities', False):
                 n_peaks = len(phase['theoretical_peaks'].get('two_theta', []))
                 total_pawley_params += n_peaks
-        
+
         if total_pawley_params > 0:
-            self._log(f"Pawley mode enabled: refining {total_pawley_params} individual peak intensities")
-            if total_pawley_params > 100:
-                self._log(f"WARNING: {total_pawley_params} intensity parameters may cause slow/unstable refinement")
+            self._log(f"Pawley mode enabled: solving {total_pawley_params} peak intensities by NNLS")
         
         if staged_refinement and self.mode == 'polish':
             self._log("Using staged refinement: unit cell → profile parameters")
@@ -420,6 +503,19 @@ class LeBailRefinement:
         self.refinement_history = []
         previous_rwp = float('inf')
         rwp_change = float('inf')
+        cancelled = False
+
+        # Cycles a watcher can expect, so it can show a meaningful progress bar
+        staged = staged_refinement and self.mode == 'polish'
+        stage1_iterations = max(3, max_iterations // 3) if staged else 0
+        total_cycles = (
+            stage1_iterations + (max_iterations - stage1_iterations)
+            if staged else max_iterations
+        )
+        self._report_progress(
+            phase_of_work='start', stage=0, iteration=0,
+            total_iterations=total_cycles, message='Aligning pattern…',
+        )
 
         # Align the pattern before solving the scales. Fitting scales against
         # misaligned peaks drives a real phase towards zero, and a phase that
@@ -436,12 +532,22 @@ class LeBailRefinement:
                 saved_intensity_settings.append(phase['parameters'].get('refine_intensities', False))
                 phase['parameters']['refine_intensities'] = False
             
-            stage1_iterations = max(3, max_iterations // 3)
             for iteration in range(stage1_iterations):
+                if self._cancelled():
+                    cancelled = True
+                    break
                 self._log(f"\nStage 1 - Iteration {iteration + 1}/{stage1_iterations}")
                 
                 self._refine_global_parameters()
                 for phase_idx, phase in enumerate(self.phases):
+                    if self._cancelled():
+                        cancelled = True
+                        break
+                    self._report_progress(
+                        phase_of_work='phase', stage=1, iteration=iteration + 1,
+                        total_iterations=total_cycles,
+                        message=f"Cell — {self._phase_name(phase_idx)}",
+                    )
                     self._refine_single_phase(phase_idx)
                 
                 calculated_pattern = self._calculate_total_pattern()
@@ -456,7 +562,15 @@ class LeBailRefinement:
                     'calculated_pattern': calculated_pattern.copy()
                 }
                 self.refinement_history.append(iteration_result)
-            
+                self._report_progress(
+                    phase_of_work='cycle', stage=1, iteration=iteration + 1,
+                    total_iterations=total_cycles, r_factors=r_factors.copy(),
+                    calculated_pattern=calculated_pattern.copy(),
+                    message="Stage 1 — unit cell & zero shift",
+                )
+                if cancelled:
+                    break
+
             self._log("\n=== STAGE 2: Profile Parameter Refinement ===")
             for idx, phase in enumerate(self.phases):
                 phase['parameters']['refine_profile'] = True
@@ -471,14 +585,25 @@ class LeBailRefinement:
         
         # Main refinement loop
         for iteration in range(remaining_iterations):
+            if cancelled or self._cancelled():
+                cancelled = True
+                break
             actual_iteration = start_iteration + iteration + 1
             stage_label = "Stage 2 - " if (staged_refinement and self.mode == 'polish') else ""
             self._log(f"\n=== {stage_label}Le Bail Iteration {actual_iteration} ===")
             
             self._refine_global_parameters()
             for phase_idx, phase in enumerate(self.phases):
+                if self._cancelled():
+                    cancelled = True
+                    break
                 phase_name = phase['data']['phase'].get('mineral', f'Phase_{phase_idx}')
                 self._log(f"Refining {phase_name}...")
+                self._report_progress(
+                    phase_of_work='phase', stage=2 if staged else 0,
+                    iteration=actual_iteration, total_iterations=total_cycles,
+                    message=f"Profile — {phase_name}",
+                )
                 self._refine_single_phase(phase_idx)
                 
             calculated_pattern = self._calculate_total_pattern()
@@ -510,16 +635,39 @@ class LeBailRefinement:
                     self.plot_callback(iteration_result, self.experimental_data)
                 except Exception as e:
                     self._log(f"Warning: Plot callback failed: {e}")
-            
+
+            self._report_progress(
+                phase_of_work='cycle', stage=2 if staged else 0,
+                iteration=actual_iteration, total_iterations=total_cycles,
+                r_factors=r_factors.copy(),
+                calculated_pattern=calculated_pattern.copy(),
+                message="Stage 2 — profile & intensities" if staged else "Refining",
+            )
+
             rwp_change = abs(previous_rwp - r_factors['Rwp'])
             if rwp_change < convergence_threshold:
                 self._log(f"Converged after {iteration + 1} iterations (ΔRwp = {rwp_change:.6f})")
                 break
                 
             previous_rwp = r_factors['Rwp']
-            
+
+        if cancelled:
+            self._log("Refinement stopped at the user's request")
+        if not self.refinement_history:
+            # Cancelled before the first cycle finished; report the state the
+            # pre-alignment left behind rather than failing outright
+            calculated_pattern = self._calculate_total_pattern()
+            self.refinement_history.append({
+                'iteration': 0,
+                'stage': 0,
+                'r_factors': self._calculate_r_factors(calculated_pattern),
+                'parameters': copy.deepcopy([p['parameters'] for p in self.phases]),
+                'calculated_pattern': calculated_pattern.copy(),
+            })
+
         final_results = {
-            'converged': rwp_change < convergence_threshold,
+            'cancelled': cancelled,
+            'converged': (not cancelled) and rwp_change < convergence_threshold,
             'iterations': len(self.refinement_history),
             'mode': self.mode,
             'final_r_factors': self.refinement_history[-1]['r_factors'],
@@ -706,10 +854,13 @@ class LeBailRefinement:
 
             optimized_params = self._vector_to_parameters(working, param_names, params)
 
-            if 'u_param' in optimized_params:
-                self._log(f"  Profile refined: U={optimized_params['u_param']:.6f}, "
-                          f"V={optimized_params['v_param']:.6f}, W={optimized_params['w_param']:.6f}, "
-                          f"η={optimized_params['eta_param']:.3f}")
+            if 'crystallite_size' in optimized_params or 'microstrain' in optimized_params:
+                size = optimized_params.get('crystallite_size',
+                                            params.get('crystallite_size', 0.0))
+                strain = optimized_params.get('microstrain',
+                                              params.get('microstrain', 0.0))
+                self._log(f"  Sample broadening refined: size={size:.4g} um, "
+                          f"microstrain={strain:.4g}")
 
             if 'lattice_scale' in optimized_params:
                 cell = optimized_params.get('unit_cell', params.get('unit_cell', {}))
@@ -794,8 +945,9 @@ class LeBailRefinement:
         use_scaled = self._uses_fixed_intensities(params)
         
         # Scale only means something when calculated intensities are tied to the
-        # reference pattern; Le Bail extraction absorbs it entirely
-        if params.get('refine_scale', True) and (is_pawley or use_scaled):
+        # reference pattern; Le Bail extraction and the Pawley solve both absorb
+        # it entirely, leaving it a flat direction if it were refined anyway
+        if params.get('refine_scale', True) and use_scaled and not is_pawley:
             initial_scale = params['scale_factor']
             param_vector.append(initial_scale)
             # Bounds must not be tied to the current value: a phase that starts
@@ -806,26 +958,29 @@ class LeBailRefinement:
             param_bounds.append((0.0, upper))
             param_names.append('scale_factor')
             self._log(f"  Scale bounds: 0 - {upper:.3f} (initial: {initial_scale:.4g})")
-        elif params.get('refine_scale', True) and not use_scaled:
-            self._log("  Scale factor: not refinable with Le Bail intensity extraction")
+        elif params.get('refine_scale', True):
+            absorbed = "the Pawley solve" if is_pawley else "Le Bail intensity extraction"
+            self._log(f"  Scale factor: not refinable, absorbed by {absorbed}")
             
+        # Sample broadening. Bounds follow the range a diffractometer can
+        # actually resolve: below 0.01 um the peaks are too broad to refine
+        # against, above 10 um the broadening is imperceptible.
         if params.get('refine_profile', True):
-            param_vector.extend([
-                params['u_param'],
-                params['v_param'], 
-                params['w_param'],
-                params['eta_param']
-            ])
-            param_bounds.extend([
-                (0.0, 0.05),
-                (-0.01, 0.01),
-                (0.00001, 0.05),
-                (0.0, 1.0)
-            ])
-            param_names.extend(['u_param', 'v_param', 'w_param', 'eta_param'])
-            self._log(f"  Profile params: U={params['u_param']:.6f}, V={params['v_param']:.6f}, "
-                      f"W={params['w_param']:.6f}, η={params['eta_param']:.3f}")
-            
+            if params.get('refine_size', False):
+                param_vector.append(float(params.get('crystallite_size', 1.0)))
+                param_bounds.append((0.01, 10.0))
+                param_names.append('crystallite_size')
+            if params.get('refine_strain', True):
+                param_vector.append(float(params.get('microstrain', 1000.0)))
+                param_bounds.append((0.0, 50000.0))
+                param_names.append('microstrain')
+            if 'crystallite_size' in param_names or 'microstrain' in param_names:
+                self._log(
+                    f"  Sample broadening: size={params.get('crystallite_size', 1.0):.4g} um, "
+                    f"microstrain={params.get('microstrain', 1000.0):.4g}"
+                )
+
+
         # Zero shift and specimen displacement are refined globally, not here
         if params.get('refine_cell', True):
             param_vector.append(params.get('lattice_scale', 1.0))
@@ -844,20 +999,15 @@ class LeBailRefinement:
                 param_bounds.append((-0.9, 0.9))
                 param_names.append(f'harmonic_{index}')
 
-        if params.get('refine_intensities', False) and params.get('peak_intensity_multipliers') is not None:
-            multipliers = params['peak_intensity_multipliers']
-            param_vector.extend(multipliers)
-            for i in range(len(multipliers)):
-                param_bounds.append((0.1, 10.0))
-                param_names.append(f'intensity_mult_{i}')
-            
+        # Pawley intensities are absent by design: they are linear in the pattern
+        # and are solved by NNLS in the alternation step instead.
+
         return np.array(param_vector), param_bounds, param_names
         
     def _vector_to_parameters(self, vector: np.ndarray, names: List[str], 
                             original_params: Dict) -> Dict:
         """Convert parameter vector back to parameter dictionary"""
         params = {}
-        intensity_multipliers = []
         harmonics = dict(enumerate(original_params.get('harmonic_coeffs') or []))
         harmonics_seen = False
         
@@ -866,16 +1016,12 @@ class LeBailRefinement:
                 if 'unit_cell' not in params:
                     params['unit_cell'] = original_params['unit_cell'].copy()
                 params['unit_cell'][name[5:]] = vector[i]
-            elif name.startswith('intensity_mult_'):
-                intensity_multipliers.append(vector[i])
             elif name.startswith('harmonic_'):
                 harmonics[int(name.split('_')[1])] = float(vector[i])
                 harmonics_seen = True
             else:
                 params[name] = vector[i]
         
-        if intensity_multipliers:
-            params['peak_intensity_multipliers'] = np.array(intensity_multipliers)
         if harmonics_seen:
             params['harmonic_coeffs'] = [harmonics[k] for k in sorted(harmonics)]
 
@@ -884,15 +1030,20 @@ class LeBailRefinement:
         if 'lattice_scale' in params:
             base = original_params.get('_base_unit_cell') or original_params.get('unit_cell')
             if base:
-                scale = float(params['lattice_scale'])
-                cell = dict(base)
-                for edge in ('a', 'b', 'c'):
-                    if cell.get(edge):
-                        cell[edge] = float(base[edge]) * scale
-                cell['volume'] = self._cell_volume(cell)
-                params['unit_cell'] = cell
-                
+                params['unit_cell'] = self._scaled_unit_cell(
+                    base, float(params['lattice_scale'])
+                )
+
         return params
+
+    def _scaled_unit_cell(self, base: Dict, scale: float) -> Dict:
+        """The starting cell under an isotropic dilation; angles are unchanged."""
+        cell = dict(base)
+        for edge in ('a', 'b', 'c'):
+            if cell.get(edge):
+                cell[edge] = float(base[edge]) * float(scale)
+        cell['volume'] = self._cell_volume(cell)
+        return cell
         
     def _filter_peaks(self, theo_peaks: Dict) -> Tuple[np.ndarray, np.ndarray]:
         """Apply intensity cutoff; return positions and intensities"""
@@ -989,11 +1140,9 @@ class LeBailRefinement:
             return np.zeros_like(self.experimental_data['two_theta'])
             
         shifted_positions = self._shift_positions(positions, parameters)
-        peak_widths = self._calculate_peak_widths(shifted_positions, parameters)
+        peak_widths, eta = self._calculate_peak_widths(shifted_positions, parameters)
         scale_factor = parameters.get('scale_factor', 1.0)
-        eta = parameters.get('eta_param', 0.5)
-        intensity_multipliers = parameters.get('peak_intensity_multipliers')
-        is_pawley = intensity_multipliers is not None
+        is_pawley = bool(parameters.get('refine_intensities', False))
         use_scaled = self._uses_fixed_intensities(parameters)
 
         if use_scaled and not is_pawley:
@@ -1007,25 +1156,115 @@ class LeBailRefinement:
                 shifted_positions, peak_widths, effective, eta
             )
 
-        if not is_pawley:
+        if is_pawley:
+            effective = self._pawley_intensities(
+                phase_idx, shifted_positions, peak_widths, eta
+            )
+        else:
             effective = self._partitioned_intensities(
                 phase, shifted_positions, peak_widths, eta
             )
-        else:
-            # Need full peak list for Pawley multipliers — use unfiltered theo peaks
-            all_pos = self._shift_positions(theo_peaks['two_theta'], parameters)
-            all_int = np.asarray(theo_peaks['intensity'], dtype=float)
-            all_widths = self._calculate_peak_widths(all_pos, parameters)
-            effective = (
-                all_int * scale_factor * intensity_multipliers
-                * self._intensity_corrections(all_pos, parameters, all_int)
-            )
-            return self._accumulate_pseudo_voigt(all_pos, all_widths, effective, eta)
 
         return self._accumulate_pseudo_voigt(shifted_positions, peak_widths, effective, eta)
 
+    def _pawley_intensities(self, phase_idx: int, positions: np.ndarray,
+                            widths: np.ndarray, eta) -> np.ndarray:
+        """
+        This phase's Pawley intensities, re-solved unless they are frozen.
+
+        Pawley shares Le Bail's alternation -- intensities at the current profile,
+        then the profile against those intensities held fixed -- and differs only
+        in how the intensities are obtained. Le Bail partitions the observed counts
+        between overlapping reflections in the ratio the previous cycle gave them;
+        Pawley solves for them outright.
+        """
+        phase = self.phases[phase_idx]
+        cached = phase.get('_pawley_intensities')
+        usable = cached is not None and len(cached) == len(positions)
+
+        if self._freeze_extracted:
+            # A stale or missing cache during a frozen pass means this phase is
+            # only being evaluated as another phase's contribution; the reference
+            # intensities stand in for it and stop the solve from re-entering.
+            return cached if usable else self._reference_intensities(phase, positions)
+
+        solved = self._solve_pawley_intensities(phase_idx, positions, widths, eta)
+        phase['_pawley_intensities'] = solved
+        return solved
+
+    def _reference_intensities(self, phase: Dict, positions: np.ndarray) -> np.ndarray:
+        """Scaled reference intensities, the starting point before any solve."""
+        params = phase['parameters']
+        _, intensities = self._filter_peaks(phase['theoretical_peaks'])
+        if len(intensities) != len(positions):
+            return np.ones(len(positions))
+        return intensities * params.get('scale_factor', 1.0) * self._intensity_corrections(
+            positions, params, intensities
+        )
+
+    def _solve_pawley_intensities(self, phase_idx: int, positions: np.ndarray,
+                                  widths: np.ndarray, eta) -> np.ndarray:
+        """
+        Reflection intensities by non-negative least squares.
+
+        Every reflection enters the calculated pattern linearly, so with the
+        profile fixed the intensities are the solution of a bounded linear problem
+        rather than something to hunt for with a general optimizer. Solving them
+        directly costs one factorization; refining them nonlinearly costs one
+        pattern rebuild per reflection per Jacobian, which is where Pawley
+        refinement otherwise spends nearly all of its time.
+
+        Non-negativity is the only constraint imposed. It matters because heavily
+        overlapped reflections are individually underdetermined -- their sum is
+        well constrained but the split between them is not -- and without a floor
+        the solution runs off to a large positive intensity cancelled by a large
+        negative one on its neighbour.
+        """
+        observed = self.experimental_data['intensity']
+        errors = self.experimental_data.get('errors')
+        if errors is None:
+            errors = np.ones_like(observed)
+
+        # Whatever the other phases contribute is not this phase's to fit. They
+        # are evaluated frozen so that a second Pawley phase reuses its cache
+        # instead of re-entering this solve.
+        frozen, self._freeze_extracted = self._freeze_extracted, True
+        try:
+            others = np.zeros_like(observed)
+            for index, other in enumerate(self.phases):
+                if index != phase_idx:
+                    others = others + self._calculate_phase_pattern(
+                        index, other['parameters']
+                    )
+        finally:
+            self._freeze_extracted = frozen
+
+        target = observed - others
+
+        indices, profiles, _ = self._peak_windows(positions, widths, eta)
+        n_peaks = len(positions)
+        n_points = len(observed)
+
+        # Each column is one reflection's unit-height profile. The windows are
+        # narrow, so the design is overwhelmingly sparse; coo_matrix sums the
+        # duplicate entries that window clamping leaves at the pattern edges.
+        rows = np.asarray(indices).ravel()
+        cols = np.repeat(np.arange(n_peaks), np.asarray(indices).shape[1])
+        design = coo_matrix(
+            (np.asarray(profiles).ravel(), (rows, cols)), shape=(n_points, n_peaks)
+        ).tocsr()
+
+        weights = 1.0 / np.maximum(errors, 1e-9)
+        design = diags(weights) @ design
+
+        result = lsq_linear(
+            design, target * weights, bounds=(0.0, np.inf),
+            method='trf', tol=1e-8, max_iter=50, lsq_solver='lsmr', verbose=0,
+        )
+        return np.maximum(result.x, 0.0)
+
     def _partitioned_intensities(self, phase: Dict, positions: np.ndarray,
-                                 widths: np.ndarray, eta: float) -> np.ndarray:
+                                 widths: np.ndarray, eta) -> np.ndarray:
         """
         This phase's Le Bail intensities, re-partitioned unless they are frozen.
 
@@ -1045,18 +1284,29 @@ class LeBailRefinement:
         return extracted
 
     def _refresh_extracted(self, phase_idx: Optional[int] = None):
-        """Re-partition intensities at the current parameters"""
+        """Re-partition (Le Bail) or re-solve (Pawley) intensities at the current parameters"""
         targets = range(len(self.phases)) if phase_idx is None else [phase_idx]
         frozen, self._freeze_extracted = self._freeze_extracted, False
         try:
             for index in targets:
                 self.phases[index].pop('_extracted_intensities', None)
+                self.phases[index].pop('_pawley_intensities', None)
                 self._calculate_phase_pattern(index, self.phases[index]['parameters'])
         finally:
             self._freeze_extracted = frozen
 
+    @staticmethod
+    def _as_column(values, count: int):
+        """Broadcast a scalar or per-reflection array against a window axis."""
+        array = np.asarray(values, dtype=float)
+        if array.ndim == 0:
+            return float(array)
+        if array.size == 1:
+            return float(array.reshape(-1)[0])
+        return array.reshape(count, 1)
+
     def _peak_windows(self, positions: np.ndarray, widths: np.ndarray,
-                      eta: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+                      eta) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Unit-height pseudo-Voigt profiles for every reflection, in one array.
 
@@ -1067,6 +1317,10 @@ class LeBailRefinement:
         of a Python loop that repeats the same handful of array operations
         hundreds of times. The profile is rebuilt on every objective evaluation
         during refinement, so this is the inner loop of the whole engine.
+
+        `eta` may be a scalar or one value per reflection: once the mixing is
+        derived from the Gaussian and Lorentzian widths it varies with angle,
+        so every reflection carries its own.
 
         Returns the grid indices each window covers, the profiles, and the
         number of grid points under each unit-height peak.
@@ -1095,16 +1349,17 @@ class LeBailRefinement:
         offset = x[indices] - positions[:, None]
         sigma = widths[:, None] / (2.0 * np.sqrt(2.0 * np.log(2.0)))
         gamma = widths[:, None] / 2.0
+        mixing = self._as_column(eta, positions.size)
         profiles = (
-            (1.0 - eta) * np.exp(-0.5 * (offset / sigma) ** 2)
-            + eta / (1.0 + (offset / gamma) ** 2)
+            (1.0 - mixing) * np.exp(-0.5 * (offset / sigma) ** 2)
+            + mixing / (1.0 + (offset / gamma) ** 2)
         )
         profiles *= on_grid & (np.abs(offset) <= cutoff[:, None])
 
         return indices, profiles, profiles.sum(axis=1)
 
     def _accumulate_pseudo_voigt(self, positions: np.ndarray, widths: np.ndarray,
-                                  intensities: np.ndarray, eta: float) -> np.ndarray:
+                                  intensities: np.ndarray, eta) -> np.ndarray:
         """Windowed accumulation of pseudo-Voigt peaks into a dense pattern"""
         if self._n == 0 or len(positions) == 0:
             return np.zeros(self._n)
@@ -1116,8 +1371,8 @@ class LeBailRefinement:
             indices.ravel(), weights=contributions.ravel(), minlength=self._n
         )
     
-    def _extract_lebail_intensities(self, positions: np.ndarray, widths: np.ndarray, 
-                                     eta: float) -> np.ndarray:
+    def _extract_lebail_intensities(self, positions: np.ndarray, widths: np.ndarray,
+                                     eta) -> np.ndarray:
         """
         Le Bail intensity extraction using windowed partitioning.
         Avoids allocating full-length profile arrays per peak.
@@ -1166,18 +1421,27 @@ class LeBailRefinement:
 
         return extracted / areas
         
-    def _calculate_peak_widths(self, two_theta: np.ndarray, parameters: Dict) -> np.ndarray:
-        """Calculate peak widths using Caglioti function: FWHM² = U*tan²θ + V*tanθ + W"""
-        U = parameters.get('u_param', 0.01)
-        V = parameters.get('v_param', -0.001)
-        W = parameters.get('w_param', 0.01)
-        
-        theta_rad = np.radians(two_theta / 2)
-        tan_theta = np.tan(theta_rad)
-        
-        fwhm_squared = U * tan_theta**2 + V * tan_theta + W
-        fwhm_squared = np.maximum(fwhm_squared, 0.001)
-        return np.sqrt(fwhm_squared)
+    def _calculate_peak_widths(self, two_theta: np.ndarray,
+                               parameters: Dict) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Peak width and Gaussian/Lorentzian mixing for one phase's reflections.
+
+        The instrument supplies a Gaussian width via the Caglioti curve, the
+        phase supplies Lorentzian size and strain terms, and Thompson-Cox-
+        Hastings combines them. The mixing parameter falls out of that
+        combination instead of being fitted, which removes a parameter that
+        would otherwise trade directly against the widths.
+        """
+        return phase_widths(
+            two_theta,
+            self.global_parameters,
+            {
+                'crystallite_size': parameters.get('crystallite_size', 0.0),
+                'microstrain': parameters.get('microstrain', 0.0),
+                'strain_extra': parameters.get('strain_extra'),
+            },
+            self.wavelength,
+        )
         
     def _pseudo_voigt_profile(self, x: np.ndarray, center: float, fwhm: float, 
                             intensity: float, eta: float) -> np.ndarray:
@@ -1293,10 +1557,11 @@ class LeBailRefinement:
                     'r_factors': self.r_factors,
                     'scale_factor': phase['parameters']['scale_factor'],
                     'profile_params': {
-                        'u': phase['parameters']['u_param'],
-                        'v': phase['parameters']['v_param'], 
-                        'w': phase['parameters']['w_param'],
-                        'eta': phase['parameters']['eta_param']
+                        'u': self.global_parameters.get('u_param', 0.0),
+                        'v': self.global_parameters.get('v_param', 0.0),
+                        'w': self.global_parameters.get('w_param', 0.0),
+                        'crystallite_size': phase['parameters'].get('crystallite_size', 0.0),
+                        'microstrain': phase['parameters'].get('microstrain', 0.0),
                     },
                     'zero_shift': self.global_parameters.get('zero_shift', 0.0),
                     'displacement': self.global_parameters.get('displacement', 0.0),
@@ -1334,9 +1599,12 @@ class LeBailRefinement:
         Per-phase refined values plus RIR weight percents, for display and export.
 
         Weight percents follow Chung: w_i = (I_i/RIR_i) / sum_j (I_j/RIR_j), with
-        I_i the strongest-line intensity implied by the refined scale. They are
-        only reported for the fixed-intensity model, because Le Bail extraction
-        absorbs the scale factor and leaves nothing to quantify with.
+        I_i the strongest-line intensity implied by the refined scale. Where the
+        database is missing an I/Ic for any phase they fall back to each phase's
+        share of the fitted pattern, and `weight_percent_basis` says which of the
+        two a row came from. They are only reported for the fixed-intensity
+        model, because Le Bail extraction absorbs the scale factor and leaves
+        nothing to quantify with.
         """
         quantitative = self.intensity_model == 'fixed'
         contributions = self._calculate_phase_contributions() if self.phases else []
@@ -1371,11 +1639,12 @@ class LeBailRefinement:
                 'absorption': float(params.get('absorption', 0.0) or 0.0),
                 'harmonic_coeffs': list(params.get('harmonic_coeffs') or []),
                 'profile': {
-                    'u': float(params.get('u_param', 0.0)),
-                    'v': float(params.get('v_param', 0.0)),
-                    'w': float(params.get('w_param', 0.0)),
-                    'eta': float(params.get('eta_param', 0.5)),
+                    'u': float(self.global_parameters.get('u_param', 0.0)),
+                    'v': float(self.global_parameters.get('v_param', 0.0)),
+                    'w': float(self.global_parameters.get('w_param', 0.0)),
                 },
+                'crystallite_size': float(params.get('crystallite_size', 0.0)),
+                'microstrain': float(params.get('microstrain', 0.0)),
                 'contribution_percent': (
                     contributions[index]['contribution_percent'] if index < len(contributions) else None
                 ),
@@ -1384,15 +1653,38 @@ class LeBailRefinement:
                 ),
             })
 
+        # A Chung normalisation needs an I/Ic for every phase, because the sum
+        # runs over all of them. Quantifying only the phases that have one
+        # inflates them to fill 100% and hides the rest of the sample -- a
+        # single RIR-bearing phase would come out at 100% however little of the
+        # pattern it accounts for. When the set is incomplete, put every phase
+        # on its share of the fitted pattern instead: that assumes equal
+        # scattering power rather than silently dropping phases, and it keeps
+        # all the numbers on one basis.
+        complete_rir = bool(rows) and all(row['rir'] for row in rows)
         terms = [
             row['line_intensity'] / row['rir']
             for row in rows
-            if quantitative and row['rir'] and row['line_intensity'] > 0
+            if row['rir'] and row['line_intensity'] > 0
         ]
         total = float(sum(terms))
+
+        if not quantitative:
+            basis = None
+        elif complete_rir and total > 0:
+            basis = 'rir'
+        else:
+            basis = 'contribution'
+
         for row in rows:
-            if quantitative and row['rir'] and row['line_intensity'] > 0 and total > 0:
-                row['weight_percent'] = 100.0 * (row['line_intensity'] / row['rir']) / total
+            row['weight_percent_basis'] = basis
+            if basis == 'rir':
+                row['weight_percent'] = (
+                    100.0 * (row['line_intensity'] / row['rir']) / total
+                    if row['line_intensity'] > 0 else 0.0
+                )
+            elif basis == 'contribution':
+                row['weight_percent'] = row['contribution_percent']
             else:
                 row['weight_percent'] = None
         return rows
@@ -1419,6 +1711,11 @@ class LeBailRefinement:
         report.append(f"  Zero shift    = {self.global_parameters.get('zero_shift', 0.0):+.4f}°")
         report.append(f"  Displacement  = {self.global_parameters.get('displacement', 0.0):+.4f}°")
         report.append(
+            f"  Instrument profile: U={self.global_parameters.get('u_param', 0.0):.6f}, "
+            f"V={self.global_parameters.get('v_param', 0.0):.6f}, "
+            f"W={self.global_parameters.get('w_param', 0.0):.6f}"
+        )
+        report.append(
             "  Intensity model = "
             + ("reference intensities, scale refined" if self.intensity_model == 'fixed'
                else "Le Bail extraction")
@@ -1432,11 +1729,10 @@ class LeBailRefinement:
             
             report.append(f"Phase {i+1}: {phase_name}")
             report.append(f"  Scale factor: {params['scale_factor']:.4f}")
-            report.append(f"  Profile parameters:")
-            report.append(f"    U = {params['u_param']:.6f}")
-            report.append(f"    V = {params['v_param']:.6f}")
-            report.append(f"    W = {params['w_param']:.6f}")
-            report.append(f"    η = {params['eta_param']:.3f}")
+            report.append(
+                f"  Sample broadening: size={params.get('crystallite_size', 0.0):.4g} um, "
+                f"microstrain={params.get('microstrain', 0.0):.4g}"
+            )
 
             if params.get('absorption'):
                 report.append(f"  Absorption: {params['absorption']:+.4f}")

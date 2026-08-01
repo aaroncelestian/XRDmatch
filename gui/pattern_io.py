@@ -124,6 +124,30 @@ def parse_xml_file(file_path: str):
     )
 
 
+def normalize_for_comparison(intensity) -> np.ndarray:
+    """
+    Rescale a pattern to 0-100 so patterns of different exposure can be overlaid.
+
+    Both ends are set from the data: the top from the strongest peak, the bottom
+    from a low percentile rather than the outright minimum, so that one dead
+    channel or a negative excursion left by background subtraction cannot drag
+    the whole curve down. Removing the floor as well as the ceiling matters
+    because patterns collected on different instruments sit on very different
+    backgrounds, and scaling by the peak alone would leave them stacked at
+    different heights.
+    """
+    values = np.asarray(intensity, dtype=float)
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return np.zeros_like(values)
+
+    floor = float(np.percentile(finite, 1.0))
+    span = float(finite.max()) - floor
+    if span <= 0:
+        return np.zeros_like(values)
+    return (values - floor) / span * 100.0
+
+
 def load_pattern_file(file_path: str, wavelength: float = 1.5406) -> dict:
     """Load a pattern file into the session dict format."""
     if not os.path.isfile(file_path):

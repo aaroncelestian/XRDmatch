@@ -48,6 +48,10 @@ class ShortlistPanel(QWidget):
         # Analysis entries keyed by shortlist key, rebuilt whenever the pattern
         # changes so no phase carries a shift fitted against different data
         self._entry_cache: Dict[str, Optional[Dict]] = {}
+        # AMCSD id and database name per local row id. Identity is asked for
+        # once per visible row every time a result list is built, and the
+        # answer only moves when the database does.
+        self._identity_cache: Dict[str, tuple] = {}
         self._loading = False
         # A check mark must not rebuild the table: the checkbox that emitted the
         # signal would be destroyed while it is still delivering it
@@ -235,8 +239,8 @@ class ShortlistPanel(QWidget):
         checked = len(self.store.checked())
         if total == 0:
             self.header.setText(
-                "Shortlist is empty — right-click a mineral in the Phases list and "
-                "choose “Add to Shortlist”. The shortlist is saved between sessions "
+                "Shortlist is empty — every mineral you check in the Phases list "
+                "lands here automatically. The shortlist is saved between sessions "
                 "and follows you from one pattern to the next."
             )
         else:
@@ -271,6 +275,7 @@ class ShortlistPanel(QWidget):
         workspace's job, once it has cleared the stale candidate list.
         """
         self._entry_cache.clear()
+        self._identity_cache.clear()
         self.reload()
 
     def _resolve(self, key: str, entry: Dict) -> Optional[Dict]:
@@ -324,15 +329,15 @@ class ShortlistPanel(QWidget):
 
     # --- actions ---
 
-    def add_result(self, result: Dict) -> bool:
+    def identity_for(self, result: Dict) -> Optional[Dict]:
         """
-        Put a search hit, match, or phase dict on the shortlist.
+        The stable identity of a search hit, match, or phase dict.
 
         The real AMCSD id has to be looked up: search hits do not carry one, and
         the phase dicts built from them fill the field with the local row id.
         """
         if not isinstance(result, dict):
-            return False
+            return None
         phase = result.get("phase", result)
         name = (
             phase.get("mineral")
@@ -347,21 +352,79 @@ class ShortlistPanel(QWidget):
         )
 
         amcsd_id = None
-        stage = self.workspace.identify_stage
         if mineral_id is not None:
-            try:
-                row = stage.local_db.get_mineral_by_id(int(mineral_id))
-                if row:
-                    amcsd_id = row.get("amcsd_id")
-                    name = name or row.get("mineral_name") or ""
-            except Exception:
-                amcsd_id = None
+            cache_key = str(mineral_id)
+            if cache_key not in self._identity_cache:
+                found = (None, "")
+                try:
+                    row = self.workspace.identify_stage.local_db.get_mineral_by_id(
+                        int(mineral_id)
+                    )
+                    if row:
+                        found = (row.get("amcsd_id"), row.get("mineral_name") or "")
+                except Exception:
+                    pass
+                self._identity_cache[cache_key] = found
+            amcsd_id, db_name = self._identity_cache[cache_key]
+            name = name or db_name
 
         if not amcsd_id and not name:
+            return None
+        return {"amcsd_id": amcsd_id, "mineral_name": name, "mineral_id": mineral_id}
+
+    def add_result(self, result: Dict) -> bool:
+        """Put a search hit, match, or phase dict on the shortlist, checked."""
+        identity = self.identity_for(result)
+        if identity is None:
             return False
-        return self.store.add(
-            amcsd_id=amcsd_id, mineral_name=name, mineral_id=mineral_id, checked=True
-        )
+        added = self.store.add(**identity, checked=True)
+        self.store.set_checked(entry_key(identity), True)
+        return added
+
+    def add_results(self, results: List[Dict]) -> int:
+        """Shortlist a whole list at once; returns how many were new."""
+        added = 0
+        self._suppress_reload = True
+        try:
+            for result in results:
+                if self.add_result(result):
+                    added += 1
+        finally:
+            self._suppress_reload = False
+        self.reload()
+        return added
+
+    def checked_state(self, result: Dict) -> Optional[bool]:
+        """Whether this mineral is checked here, or None if it is not on the list."""
+        identity = self.identity_for(result)
+        if identity is None:
+            return None
+        entry = self.store.find(entry_key(identity))
+        return bool(entry.get("checked")) if entry is not None else None
+
+    def set_result_checked(self, result: Dict, checked: bool) -> None:
+        """
+        Carry a check mark from the phase list onto the shortlist.
+
+        Checking a mineral in the results list is the same statement as
+        checking it here, so a new one is added rather than needing to be
+        remembered separately. Unchecking only clears the mark: the mineral
+        stays on the list, which is the whole point of having one.
+        """
+        identity = self.identity_for(result)
+        if identity is None:
+            return
+        key = entry_key(identity)
+        self._suppress_reload = True
+        try:
+            if checked:
+                self.store.add(**identity, checked=True)
+                self.store.set_checked(key, True)
+            elif self.store.contains(key):
+                self.store.set_checked(key, False)
+        finally:
+            self._suppress_reload = False
+        self.reload()
 
     def _on_check(self, key: str, state):
         if self._loading:
@@ -474,5 +537,8 @@ class ShortlistPanel(QWidget):
     def _publish(self):
         """Push the checked minerals into the session and redraw."""
         self._update_header()
+        # The same mineral may be sitting in the phase list with its own
+        # check box; leaving the two disagreeing is worse than either state
+        self.workspace.apply_shortlist_checks()
         self.workspace.sync_selected_phases()
         self.selection_changed.emit()

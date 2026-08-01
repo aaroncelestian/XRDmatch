@@ -7,16 +7,16 @@ import textwrap
 import numpy as np
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
-    QGridLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMessageBox, QProgressBar, QPushButton, QSpinBox, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QGridLayout, QHBoxLayout,
+    QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton, QSpinBox,
+    QVBoxLayout, QWidget,
 )
 
 from utils import emphasis, search_debug
 from utils.emphasis import DEFAULT_WEIGHT as EMPHASIS_DEFAULT_WEIGHT
 from utils.fast_pattern_search import FastPatternSearchEngine
 from utils.pattern_search import PatternSearchEngine
-from utils.local_database import LocalCIFDatabase
+from utils.local_database import get_local_database
 from utils.rir_quant import quantify as rir_quantify, summary_lines as rir_summary_lines
 from utils.fingerprint_search import (
     coincidence_fraction,
@@ -25,7 +25,7 @@ from utils.fingerprint_search import (
     select_fingerprint_peaks,
 )
 from utils.conditions import (AMBIENT_MAX_PRESSURE_GPA, AMBIENT_MAX_TEMPERATURE_K,
-                             AMBIENT_MIN_TEMPERATURE_K)
+                             AMBIENT_MIN_TEMPERATURE_K, is_ambient)
 from utils.residual_search import (
     build_residual_pattern,
     build_residual_peaks,
@@ -45,6 +45,7 @@ from utils.two_theta_shift import (
     shift_pattern,
     unshift_pattern,
 )
+from gui.dialogs.mineral_picker_dialog import MineralPickerDialog
 from gui.dialogs.search_report_dialog import SearchReportDialog
 from gui.matching_tab import PhaseMatchingThread
 from gui.widgets.control_bar import OptionsDialog, compact
@@ -73,6 +74,12 @@ def _defined(term: str, text: str) -> list:
 # badly displaced can still be measured from a phase the user recognizes
 FIT_TO_ROW_MIN_SPAN = 1.0
 
+# How many records the mineral picker loads. Common minerals run to several
+# hundred entries — 594 spinels — and every one of them gets scored against the
+# measured peaks when the picker opens, so the list is capped rather than
+# unbounded. Anything past this is reachable by typing more of the name.
+MINERAL_PICKER_LIMIT = 300
+
 
 SEARCH_METHODS = [
     ("Fingerprint (mixtures)", "fingerprint"),
@@ -91,13 +98,13 @@ class IdentifyStage(QWidget):
         self.workspace = workspace
         self.fast_engine = FastPatternSearchEngine()
         self.search_engine = PatternSearchEngine()
-        self.local_db = LocalCIFDatabase()
+        self.local_db = get_local_database()
         self._match_thread = None
         self._search_results = []
         self._kept_phases = []  # accepted across residual rounds
-        self._theo_cache = {}
         self._options = None
         self._report_dialog = None
+        self._picker = None
 
         self.control_panel = self._build_controls()
         outer = QVBoxLayout(self)
@@ -161,7 +168,14 @@ class IdentifyStage(QWidget):
         self.mineral_search.setPlaceholderText("Add known mineral — e.g. quartz")
         self.mineral_search.returnPressed.connect(self.add_mineral_by_name)
         self.add_mineral_btn = QPushButton("Add")
-        self.add_mineral_btn.setToolTip("Search the local database and add a mineral as a candidate")
+        self.add_mineral_btn.setToolTip(
+            "Search the local database and add a mineral as a candidate.\n\n"
+            "Most minerals have many records — different compositions, and "
+            "different pressures and temperatures — whose lines sit in "
+            "different places. When there is more than one, a chooser opens "
+            "with them ranked by how well they fit your peaks, and draws the "
+            "highlighted record on the pattern."
+        )
         self.add_mineral_btn.clicked.connect(self.add_mineral_by_name)
         self.explain_btn = QPushButton("Why not?")
         self.explain_btn.setToolTip(
@@ -901,16 +915,14 @@ class IdentifyStage(QWidget):
         )
         if mineral_id is None:
             return None
-        wl = round(float(self.session.wavelength), 4)
-        key = (str(mineral_id), wl)
-        if key in self._theo_cache:
-            return self._theo_cache[key]
+        # get_diffraction_pattern memoizes, and does it process-wide, so a
+        # second cache here would only add a way to go stale after an import
         try:
-            pattern = self.local_db.get_diffraction_pattern(int(mineral_id), wl)
+            return self.local_db.get_diffraction_pattern(
+                int(mineral_id), round(float(self.session.wavelength), 4)
+            )
         except Exception:
-            pattern = None
-        self._theo_cache[key] = pattern
-        return pattern
+            return None
 
     def reference_peaks_for(self, result: dict):
         """Reference peaks moved to where this phase's shift puts them."""
@@ -927,7 +939,9 @@ class IdentifyStage(QWidget):
             QMessageBox.information(self, "Add Mineral", "Type at least 2 characters.")
             return
         try:
-            hits = self.local_db.search_by_mineral_name(query, limit=40)
+            # Non-ambient records are fetched too: the picker filters them out
+            # by default but lets the user bring them back without a re-query
+            hits = self.local_db.search_by_mineral_name(query, limit=MINERAL_PICKER_LIMIT)
         except Exception as e:
             QMessageBox.critical(self, "Database Error", str(e))
             return
@@ -947,16 +961,75 @@ class IdentifyStage(QWidget):
             return (2, name)
 
         hits.sort(key=relevance)
+        # One record needs no choosing. Everything else does: several records of
+        # the same mineral differ in composition and in the conditions they were
+        # measured at, and those cells put the lines in different places.
         exact = [h for h in hits if str(h.get("mineral_name", "")).lower() == needle]
-        if len(exact) == 1:
-            chosen = exact[0]
-        elif len(hits) == 1:
-            chosen = hits[0]
-        else:
-            chosen = self._pick_mineral_dialog(hits, query)
-            if chosen is None:
-                return
+        if len(hits) == 1 or len(exact) == 1:
+            self._add_mineral_record(exact[0] if exact else hits[0])
+            return
+        self._open_mineral_picker(hits, query)
 
+    def _open_mineral_picker(self, hits: list, query: str):
+        """Let the user compare the records against the pattern before adding one."""
+        if getattr(self, "_picker", None) is not None:
+            self._picker.close()
+
+        restore = self.workspace.current_preview()
+        dialog = MineralPickerDialog(
+            hits, query,
+            score_fn=self._score_hit if self.session.has_peaks() else None,
+            preview_fn=self.workspace.preview_phase,
+            tolerance=self.tolerance.value(),
+            ambient_only=self.ambient_only.isChecked(),
+            truncated=len(hits) >= MINERAL_PICKER_LIMIT,
+            parent=self.workspace.window(),
+        )
+
+        def finished(_code):
+            self._picker = None
+            chosen = dialog.chosen()
+            if chosen is None:
+                self.workspace.restore_preview(restore)
+            else:
+                self._add_mineral_record(chosen)
+
+        dialog.finished.connect(finished)
+        self._picker = dialog
+        dialog.show()
+        dialog.raise_()
+        ambient = sum(1 for h in hits if self._hit_is_ambient(h))
+        self.status.setText(
+            f"{len(hits)} records for “{query}” ({ambient} at ambient conditions) — "
+            "click one to see its lines on the pattern."
+        )
+
+    def _score_hit(self, hit: dict):
+        """How well one database record's strong lines fit the measured peaks."""
+        if not self.session.has_peaks():
+            return None
+        theo = self.theoretical_peaks_for(hit)
+        if not theo:
+            return None
+        return fingerprint_score(
+            self.session.peaks["two_theta"],
+            self.session.peaks["intensity"],
+            theo.get("two_theta", []),
+            theo.get("intensity", []),
+            tolerance=self.tolerance.value(),
+            n_peaks=self.fp_n_peaks.value(),
+            min_rel_intensity=self.fp_min_rel.value(),
+            exp_range=self._measured_range(),
+            shift=self.shift.value(),
+            shift_span=self.shift_span.value(),
+            shift_model=self.shift_model_key(),
+        )
+
+    @staticmethod
+    def _hit_is_ambient(hit: dict) -> bool:
+        return is_ambient(hit.get("pressure_gpa"), hit.get("temperature_k"))
+
+    def _add_mineral_record(self, chosen: dict):
         phase = self._db_row_to_phase(chosen)
         self.session.add_candidates([phase])
         row = {
@@ -974,25 +1047,12 @@ class IdentifyStage(QWidget):
             "match_score": 1.0,
             "manual_add": True,
         }
-        # Report how well the known mineral actually fits the peaks
-        if self.session.has_peaks():
-            theo = self.theoretical_peaks_for(row)
-            if theo:
-                info = fingerprint_score(
-                    self.session.peaks["two_theta"],
-                    self.session.peaks["intensity"],
-                    theo.get("two_theta", []),
-                    theo.get("intensity", []),
-                    tolerance=self.tolerance.value(),
-                    n_peaks=self.fp_n_peaks.value(),
-                    min_rel_intensity=self.fp_min_rel.value(),
-                    exp_range=self._measured_range(),
-                    shift=self.shift.value(),
-                    shift_span=self.shift_span.value(),
-                    shift_model=self.shift_model_key(),
-                )
-                row["fingerprint"] = info
-                row["fingerprint_score"] = info["score"]
+        # Report how well the known mineral actually fits the peaks. The picker
+        # has usually scored it already, in which case that result stands.
+        info = chosen.get("fingerprint") or self._score_hit(chosen)
+        if info:
+            row["fingerprint"] = info
+            row["fingerprint_score"] = info["score"]
 
         self._append_candidate_result(row)
         self.update_action_states()
@@ -1007,34 +1067,6 @@ class IdentifyStage(QWidget):
         else:
             self.status.setText(f"Added {name}. Select it and run matching when ready.")
         self.workspace.set_status(f"Added mineral: {name}")
-
-    def _pick_mineral_dialog(self, hits: list, query: str):
-        dlg = QDialog(self)
-        dlg.setWindowTitle(f"Choose mineral — “{query}”")
-        dlg.resize(480, 360)
-        lay = QVBoxLayout(dlg)
-        lay.addWidget(QLabel(f"{len(hits)} matches — select one to add:"))
-        lst = QListWidget()
-        for h in hits:
-            text = (
-                f"{h.get('mineral_name', '?')}  ·  "
-                f"{h.get('chemical_formula', '')}  ·  "
-                f"{h.get('space_group', '')}"
-            )
-            item = QListWidgetItem(text)
-            item.setData(Qt.UserRole, h)
-            lst.addItem(item)
-        lst.setCurrentRow(0)
-        lst.itemDoubleClicked.connect(lambda *_: dlg.accept())
-        lay.addWidget(lst)
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(dlg.accept)
-        buttons.rejected.connect(dlg.reject)
-        lay.addWidget(buttons)
-        if dlg.exec_() != QDialog.Accepted:
-            return None
-        item = lst.currentItem()
-        return item.data(Qt.UserRole) if item else None
 
     @staticmethod
     def _db_row_to_phase(mineral: dict) -> dict:
@@ -1060,12 +1092,23 @@ class IdentifyStage(QWidget):
     def _append_candidate_result(self, result: dict):
         """Merge a manual hit into the candidates table and check it."""
         existing = list(getattr(self.workspace, "_candidate_results", []) or [])
-        key = (result.get("mineral_name") or "").lower()
-        if not any((r.get("mineral_name") or "").lower() == key for r in existing):
+        # Two records of the same mineral are a pair worth comparing — different
+        # composition, different cell, different line positions — so only the
+        # same record counts as already present
+        record = result.get("mineral_id")
+        name = (result.get("mineral_name") or "").lower()
+
+        def duplicate(other: dict) -> bool:
+            if record is not None and other.get("mineral_id") is not None:
+                return other.get("mineral_id") == record
+            return (other.get("mineral_name") or "").lower() == name
+
+        existing_match = next((r for r in existing if duplicate(r)), None)
+        if existing_match is None:
             existing.insert(0, result)
         self._search_results = existing
         self.workspace.set_results_candidates(existing)
-        self.workspace.check_candidate_rows([key])
+        self.workspace.check_candidate_result(existing_match or result)
 
     # --- diagnosis ---
 
@@ -1563,6 +1606,12 @@ class IdentifyStage(QWidget):
             )
             return
 
+        # Everything carried into the residual round is part of this pattern's
+        # answer, including phases locked in during earlier rounds that the
+        # table no longer shows. Shortlisting the lot here is what makes moving
+        # on safe: the round is about to replace the list they were checked in.
+        self.workspace.shortlist_phases(selected)
+
         self._kept_phases = selected
         self.session.set_selected_phases(selected)
         overlap_keep = self.overlap_keep.value()
@@ -2004,6 +2053,10 @@ class IdentifyStage(QWidget):
                     f"(skipped {before - len(phases)} already-found)."
                 )
 
+        # Matching replaces the candidate list with its results, so anything
+        # checked in it has to be recorded before it disappears
+        self.workspace.shortlist_phases(phases)
+
         pw = self.peak_weight.value()
         cw = self.corr_weight.value()
         total = pw + cw
@@ -2029,6 +2082,7 @@ class IdentifyStage(QWidget):
         self.match_btn.setEnabled(True)
         min_score = self.min_score.value()
         filtered = [r for r in results if r.get("match_score", 0) >= min_score]
+        weak = len(results) - len(filtered)
         for r in filtered:
             self._attach_fingerprint(r)
         filtered.sort(
@@ -2036,27 +2090,37 @@ class IdentifyStage(QWidget):
             reverse=True,
         )
 
-        # Keep previously locked selections; never re-add the same mineral twice
+        # Every checked candidate earns its own row: the database holds many
+        # records per mineral, and picking three forsterites is a deliberate
+        # comparison, not a duplicate. Only the very same record is dropped.
         previous = list(self._kept_phases)
-        excl_ids, excl_names = exclusion_sets(previous)
+        seen_ids = set()
+        for p in previous:
+            seen_ids |= mineral_ids(p)
         merged = list(previous)
         new_count = 0
+        duplicates = 0
         for r in filtered:
-            if is_excluded_hit(r, excl_ids, excl_names):
+            ids = mineral_ids(r)
+            if ids and ids & seen_ids:
+                duplicates += 1
                 continue
             merged.append(r)
-            excl_ids |= mineral_ids(r)
-            name = mineral_key(r)
-            if name:
-                excl_names.add(name)
+            seen_ids |= ids
             new_count += 1
 
         self.session.set_matched_phases(merged)
         self.session.set_selected_phases(previous)
         self.workspace.set_results_matches(merged, preselect=previous)
         self.update_action_states()
+        skipped = []
+        if weak:
+            skipped.append(f"{weak} below the {min_score:.2f} match score")
+        if duplicates:
+            skipped.append(f"{duplicates} already in the list")
+        note = f" Skipped {', '.join(skipped)}." if skipped else ""
         self.status.setText(
-            f"Matched {new_count} new phase(s); {len(previous)} previously kept. "
+            f"Matched {new_count} new phase(s); {len(previous)} previously kept.{note} "
             "Check phases to keep, then Clear Unselected or Search Residual."
         )
         self.workspace.set_status(f"Matched {new_count} new phases")

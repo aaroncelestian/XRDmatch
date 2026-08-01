@@ -451,8 +451,8 @@ class PatternSearchTab(QWidget):
             exp_wavelength = pattern_to_use.get('wavelength', 1.5406) if pattern_to_use else 1.5406
             
             # Get theoretical pattern
-            from utils.local_database import LocalCIFDatabase
-            local_db = LocalCIFDatabase()
+            from utils.local_database import get_local_database
+            local_db = get_local_database()
             theoretical_pattern = local_db.get_diffraction_pattern(mineral_id, exp_wavelength)
             
             if theoretical_pattern and len(theoretical_pattern['two_theta']) > 0:
