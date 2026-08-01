@@ -120,8 +120,8 @@ class ShortlistPanel(QWidget):
         self.rir_btn = QPushButton("RIR Quant")
         self.rir_btn.setObjectName("primaryButton")
         self.rir_btn.setToolTip(
-            "Reference intensity ratio weight percents for the checked minerals, "
-            "plus anything still checked in the Phases list"
+            "Reference intensity ratio weight percents for exactly the minerals "
+            "checked here — uncheck one and run again to leave it out"
         )
         self.rir_btn.clicked.connect(self._run_rir)
         row.addWidget(self.rir_btn)
@@ -394,13 +394,23 @@ class ShortlistPanel(QWidget):
         self.reload()
         return added
 
-    def checked_state(self, result: Dict) -> Optional[bool]:
-        """Whether this mineral is checked here, or None if it is not on the list."""
+    def analysis_state(self, result: Dict) -> Optional[bool]:
+        """
+        Whether the shortlist says this mineral is part of the analysis.
+
+        True when it is checked here, and False both when it has been unchecked
+        and when it has been dropped from the list altogether — every mineral
+        checked in the phase list is added here automatically, so one that is
+        missing is one the user has deliberately taken out.
+
+        None means the shortlist has nothing to say: the result carries no
+        identity to key on, so it could never have been put on the list.
+        """
         identity = self.identity_for(result)
         if identity is None:
             return None
         entry = self.store.find(entry_key(identity))
-        return bool(entry.get("checked")) if entry is not None else None
+        return bool(entry.get("checked")) if entry is not None else False
 
     def set_result_checked(self, result: Dict, checked: bool) -> None:
         """

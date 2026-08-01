@@ -798,8 +798,9 @@ class IdentifyStage(QWidget):
         Checked candidates count as accepted, so residual and multi-phase work
         without having to run peak matching first. Phases kept from earlier
         residual rounds stay in the list even though the table now shows the
-        newest candidates. Minerals checked on the Shortlist tab are added on
-        top, since that list is deliberately independent of the current search.
+        newest candidates. The Shortlist tab then has the last word on the
+        whole set, since that list is deliberately independent of the current
+        search — see `_with_shortlist`.
         """
         if getattr(self.workspace, "_results_mode", None) == "matches":
             return self._with_shortlist(self.workspace.get_selected_matches())
@@ -826,12 +827,21 @@ class IdentifyStage(QWidget):
         return self._with_shortlist(accepted)
 
     def _with_shortlist(self, accepted: list) -> list:
-        """Append the checked shortlist minerals that are not already here."""
+        """
+        Reconcile the accepted phases with the shortlist, which decides.
+
+        The shortlist is where the user says which minerals make up the mixture
+        being quantified, so changing it has to change the answer: unchecking or
+        removing a mineral there drops it even though the row it was checked in
+        is still on screen, and checking one adds it even though no search has
+        turned it up. Phases the shortlist cannot identify are left alone,
+        because it can hold no opinion about them.
+        """
         panel = getattr(self.workspace, "shortlist_panel", None)
         if panel is None:
             return accepted
 
-        merged = list(accepted)
+        merged = [p for p in accepted if panel.analysis_state(p) is not False]
         seen_ids, seen_names = exclusion_sets(merged)
         for entry in panel.checked_entries():
             if is_excluded_hit(entry, seen_ids, seen_names):
@@ -2158,11 +2168,14 @@ class IdentifyStage(QWidget):
         window, where the cell and correction terms can move.
         """
         pattern = self.session.active_pattern()
-        phases = self.accepted_phases() or list(self.session.selected_phases)
+        # Read live rather than falling back to the last selection: unchecking
+        # everything has to mean nothing, not a repeat of the previous run
+        phases = self.accepted_phases()
         if not pattern or not phases:
             QMessageBox.warning(
                 self, "No Phases Selected",
-                "Check the phases you want quantified, then RIR Quant.",
+                "Check the phases you want quantified, here or on the Shortlist "
+                "tab, then RIR Quant.",
             )
             return
 
@@ -2179,12 +2192,21 @@ class IdentifyStage(QWidget):
             return
 
         if result is None:
+            # The earlier numbers were for a different set of phases, so leaving
+            # them in the Quant window would report them as this one's answer
+            self.session.set_rir_results(None)
             QMessageBox.warning(
                 self, "No Reference Patterns",
                 "None of the checked phases has reference lines inside the "
                 "measured 2θ range, so there is nothing to fit.",
             )
             return
+
+        # A height fitted against a different set of phases is wrong for this
+        # one, and a phase left out of this fit has no height at all
+        for entry in phases:
+            if isinstance(entry, dict):
+                entry.pop("contribution", None)
 
         # The fitted profile is the phase's share of the observed intensity, which
         # is what the plot needs to draw its reference lines at the right height

@@ -1368,8 +1368,10 @@ class AnalysisWorkspace(QWidget):
 
         A mineral checked on the shortlist is in the analysis whether or not
         the current list shows it, so when it does appear — in a new search, or
-        after loading another pattern — it has to come up checked. Rows for
-        minerals that are not on the shortlist are left as the user set them.
+        after loading another pattern — it has to come up checked. Unchecking
+        or removing it there travels the other way for the same reason: the row
+        it was checked in has to stop claiming it is part of the answer. Rows
+        the shortlist cannot identify are left as the user set them.
         """
         panel = getattr(self, "shortlist_panel", None)
         if panel is None or self._results_mode is None:
@@ -1382,7 +1384,7 @@ class AnalysisWorkspace(QWidget):
                 result = self._result_at_row(row)
                 if cb is None or result is None:
                     continue
-                state = panel.checked_state(result)
+                state = panel.analysis_state(result)
                 if state is not None and cb.isChecked() != state:
                     cb.setChecked(state)
         finally:
