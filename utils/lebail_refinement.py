@@ -13,7 +13,10 @@ from typing import Dict, List, Tuple, Optional
 import copy
 import warnings
 
-from utils.profile_functions import phase_widths
+from utils.profile_functions import (
+    MAX_ASYMMETRY, asymmetry_exponent, flank_widths, phase_widths,
+    skew_description,
+)
 
 warnings.filterwarnings('ignore')
 
@@ -82,9 +85,11 @@ class LeBailRefinement:
             'w_param': 0.004,
             'x_param': 0.0,         # instrument Lorentzian; normally zero
             'y_param': 0.0,
+            'axial_asymmetry': 0.0,  # axial divergence skew, as cot(2-theta)
             'refine_zero_shift': True,
             'refine_displacement': False,
             'refine_instrument_profile': False,
+            'refine_axial_asymmetry': False,
         }
         self.wavelength = 1.5406
 
@@ -199,6 +204,10 @@ class LeBailRefinement:
             'microstrain': 1000.0,     # delta-d/d x 1e6
             'refine_size': False,      # size matters mainly for nanomaterials
             'refine_strain': True,     # microstrain is the usual dominant term
+            # Skew belonging to this phase alone, as log(low flank / high flank).
+            # Layer silicates with stacking disorder need it; most phases do not.
+            'asymmetry': 0.0,
+            'refine_asymmetry': False,
             'zero_shift': 0.0,    # legacy per-phase offset; the global term is used now
             'unit_cell': self._extract_unit_cell(phase_data),
             # Isotropic lattice dilation: every d-spacing scales by this factor.
@@ -298,6 +307,8 @@ class LeBailRefinement:
                 pass  # a watcher must never be able to stop the refinement
         if not self.quiet:
             print(message)
+
+    _skew_direction = staticmethod(skew_description)
 
     def _phase_name(self, phase_idx: int) -> str:
         try:
@@ -747,6 +758,16 @@ class LeBailRefinement:
             names.append('displacement')
             vector.append(float(self.global_parameters.get('displacement', 0.0)))
             bounds.append((-0.5, 0.5))
+        # The scan below is a product grid, so it stays restricted to the two
+        # near-degenerate shift terms. Asymmetry changes the peak shape rather
+        # than its position and is not degenerate with either, so the local
+        # optimizer finds it without help and a third scan axis would multiply
+        # the cost of every pass by eleven for nothing.
+        n_scanned = len(names)
+        if self.global_parameters.get('refine_axial_asymmetry', False):
+            names.append('axial_asymmetry')
+            vector.append(float(self.global_parameters.get('axial_asymmetry', 0.0)))
+            bounds.append((-0.2, 0.2))
         if not names:
             return
 
@@ -770,7 +791,7 @@ class LeBailRefinement:
         self._freeze_extracted = True
         try:
             scan_pass = getattr(self, '_global_scan_pass', 0)
-            if scan_pass < len(self._GLOBAL_SCAN_SCHEDULE):
+            if n_scanned and scan_pass < len(self._GLOBAL_SCAN_SCHEDULE):
                 half_width = self._GLOBAL_SCAN_SCHEDULE[scan_pass]
                 # Eleven samples per axis is enough to find the valley; 21^n was
                 # spending most of the refinement budget on the scan alone
@@ -779,14 +800,15 @@ class LeBailRefinement:
                         np.linspace(center - half_width, center + half_width, 11),
                         low, high,
                     )
-                    for center, (low, high) in zip(vector, bounds)
+                    for center, (low, high) in zip(vector[:n_scanned], bounds[:n_scanned])
                 ]
                 best_value = chi2(vector)
                 best_point = list(vector)
                 for point in itertools.product(*grids):
-                    value = chi2(point)
+                    trial = list(point) + list(vector[n_scanned:])
+                    value = chi2(trial)
                     if value < best_value:
-                        best_value, best_point = value, list(point)
+                        best_value, best_point = value, trial
                 vector = best_point
                 self._global_scan_pass = scan_pass + 1
 
@@ -800,11 +822,15 @@ class LeBailRefinement:
             best = result.x if chi2(result.x) <= chi2(vector) else vector
             for name, value in zip(names, best):
                 self.global_parameters[name] = float(value)
-            self._log(
+            message = (
                 "  Global: zero shift="
                 f"{self.global_parameters['zero_shift']:+.4f}°, "
                 f"displacement={self.global_parameters['displacement']:+.4f}°"
             )
+            if 'axial_asymmetry' in names:
+                axial = self.global_parameters['axial_asymmetry']
+                message += f", axial asymmetry={axial:+.4f}"
+            self._log(message)
         except Exception as e:
             for name, value in saved.items():
                 self.global_parameters[name] = value
@@ -869,6 +895,10 @@ class LeBailRefinement:
                     f"(a={cell.get('a', 0.0):.4f}, b={cell.get('b', 0.0):.4f}, "
                     f"c={cell.get('c', 0.0):.4f} Å)"
                 )
+
+            if 'asymmetry' in optimized_params:
+                self._log(f"  Phase asymmetry: {optimized_params['asymmetry']:+.4f} "
+                          f"({self._skew_direction(optimized_params['asymmetry'])})")
 
             if 'absorption' in optimized_params:
                 self._log(f"  Absorption: {optimized_params['absorption']:.4f}")
@@ -979,6 +1009,10 @@ class LeBailRefinement:
                     f"  Sample broadening: size={params.get('crystallite_size', 1.0):.4g} um, "
                     f"microstrain={params.get('microstrain', 1000.0):.4g}"
                 )
+            if params.get('refine_asymmetry', False):
+                param_vector.append(float(params.get('asymmetry', 0.0)))
+                param_bounds.append((-MAX_ASYMMETRY, MAX_ASYMMETRY))
+                param_names.append('asymmetry')
 
 
         # Zero shift and specimen displacement are refined globally, not here
@@ -1141,6 +1175,7 @@ class LeBailRefinement:
             
         shifted_positions = self._shift_positions(positions, parameters)
         peak_widths, eta = self._calculate_peak_widths(shifted_positions, parameters)
+        skew = self._peak_asymmetry(shifted_positions, parameters)
         scale_factor = parameters.get('scale_factor', 1.0)
         is_pawley = bool(parameters.get('refine_intensities', False))
         use_scaled = self._uses_fixed_intensities(parameters)
@@ -1153,22 +1188,24 @@ class LeBailRefinement:
                 * self._intensity_corrections(shifted_positions, parameters, intensities)
             )
             return self._accumulate_pseudo_voigt(
-                shifted_positions, peak_widths, effective, eta
+                shifted_positions, peak_widths, effective, eta, skew
             )
 
         if is_pawley:
             effective = self._pawley_intensities(
-                phase_idx, shifted_positions, peak_widths, eta
+                phase_idx, shifted_positions, peak_widths, eta, skew
             )
         else:
             effective = self._partitioned_intensities(
-                phase, shifted_positions, peak_widths, eta
+                phase, shifted_positions, peak_widths, eta, skew
             )
 
-        return self._accumulate_pseudo_voigt(shifted_positions, peak_widths, effective, eta)
+        return self._accumulate_pseudo_voigt(
+            shifted_positions, peak_widths, effective, eta, skew
+        )
 
     def _pawley_intensities(self, phase_idx: int, positions: np.ndarray,
-                            widths: np.ndarray, eta) -> np.ndarray:
+                            widths: np.ndarray, eta, asymmetry=0.0) -> np.ndarray:
         """
         This phase's Pawley intensities, re-solved unless they are frozen.
 
@@ -1188,7 +1225,9 @@ class LeBailRefinement:
             # intensities stand in for it and stop the solve from re-entering.
             return cached if usable else self._reference_intensities(phase, positions)
 
-        solved = self._solve_pawley_intensities(phase_idx, positions, widths, eta)
+        solved = self._solve_pawley_intensities(
+            phase_idx, positions, widths, eta, asymmetry
+        )
         phase['_pawley_intensities'] = solved
         return solved
 
@@ -1203,7 +1242,8 @@ class LeBailRefinement:
         )
 
     def _solve_pawley_intensities(self, phase_idx: int, positions: np.ndarray,
-                                  widths: np.ndarray, eta) -> np.ndarray:
+                                  widths: np.ndarray, eta,
+                                  asymmetry=0.0) -> np.ndarray:
         """
         Reflection intensities by non-negative least squares.
 
@@ -1241,7 +1281,7 @@ class LeBailRefinement:
 
         target = observed - others
 
-        indices, profiles, _ = self._peak_windows(positions, widths, eta)
+        indices, profiles, _ = self._peak_windows(positions, widths, eta, asymmetry)
         n_peaks = len(positions)
         n_points = len(observed)
 
@@ -1264,7 +1304,8 @@ class LeBailRefinement:
         return np.maximum(result.x, 0.0)
 
     def _partitioned_intensities(self, phase: Dict, positions: np.ndarray,
-                                 widths: np.ndarray, eta) -> np.ndarray:
+                                 widths: np.ndarray, eta,
+                                 asymmetry=0.0) -> np.ndarray:
         """
         This phase's Le Bail intensities, re-partitioned unless they are frozen.
 
@@ -1279,7 +1320,7 @@ class LeBailRefinement:
         cached = phase.get('_extracted_intensities')
         if self._freeze_extracted and cached is not None and len(cached) == len(positions):
             return cached
-        extracted = self._extract_lebail_intensities(positions, widths, eta)
+        extracted = self._extract_lebail_intensities(positions, widths, eta, asymmetry)
         phase['_extracted_intensities'] = extracted
         return extracted
 
@@ -1306,7 +1347,8 @@ class LeBailRefinement:
         return array.reshape(count, 1)
 
     def _peak_windows(self, positions: np.ndarray, widths: np.ndarray,
-                      eta) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+                      eta, asymmetry=0.0
+                      ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Unit-height pseudo-Voigt profiles for every reflection, in one array.
 
@@ -1318,9 +1360,10 @@ class LeBailRefinement:
         hundreds of times. The profile is rebuilt on every objective evaluation
         during refinement, so this is the inner loop of the whole engine.
 
-        `eta` may be a scalar or one value per reflection: once the mixing is
-        derived from the Gaussian and Lorentzian widths it varies with angle,
-        so every reflection carries its own.
+        `eta` and `asymmetry` may each be a scalar or one value per reflection:
+        once the mixing is derived from the Gaussian and Lorentzian widths it
+        varies with angle, and the skew from axial divergence varies with angle
+        too, so every reflection carries its own.
 
         Returns the grid indices each window covers, the profiles, and the
         number of grid points under each unit-height peak.
@@ -1332,7 +1375,19 @@ class LeBailRefinement:
 
         x = self.experimental_data['two_theta']
         widths = np.maximum(np.asarray(widths, dtype=float), 1e-6)
-        cutoff = 5.0 * widths
+        mixing = self._as_column(eta, positions.size)
+        skew = self._as_column(asymmetry, positions.size)
+        low_width, high_width = flank_widths(widths[:, None], skew)
+        # How far a peak has to be followed depends on how Lorentzian it is. A
+        # Gaussian is dead by three widths, but a Lorentzian still holds a few
+        # percent of its area past five, and cutting it there leaves that
+        # intensity out of the calculated pattern as an unfitted tail on every
+        # strong peak. Scaling the window with eta buys the reach where it is
+        # needed and hands it back on the near-Gaussian peaks.
+        reach = 3.0 + 12.0 * mixing
+        # The window also has to clear the broader flank, or a skewed tail is
+        # cut off exactly where it was added to model something
+        cutoff = (reach * np.maximum(low_width, high_width)).ravel()
 
         half = int(np.ceil(float(np.max(cutoff)) / self._dx)) + 1
         # Broad peaks on a fine grid would otherwise make the array enormous
@@ -1347,9 +1402,11 @@ class LeBailRefinement:
         np.clip(indices, 0, n - 1, out=indices)
 
         offset = x[indices] - positions[:, None]
-        sigma = widths[:, None] / (2.0 * np.sqrt(2.0 * np.log(2.0)))
-        gamma = widths[:, None] / 2.0
-        mixing = self._as_column(eta, positions.size)
+        # A split profile: each flank keeps its own width, and the two agree at
+        # the centre because both are unit height there
+        width = np.where(offset < 0.0, low_width, high_width)
+        sigma = width / (2.0 * np.sqrt(2.0 * np.log(2.0)))
+        gamma = width / 2.0
         profiles = (
             (1.0 - mixing) * np.exp(-0.5 * (offset / sigma) ** 2)
             + mixing / (1.0 + (offset / gamma) ** 2)
@@ -1359,12 +1416,13 @@ class LeBailRefinement:
         return indices, profiles, profiles.sum(axis=1)
 
     def _accumulate_pseudo_voigt(self, positions: np.ndarray, widths: np.ndarray,
-                                  intensities: np.ndarray, eta) -> np.ndarray:
+                                  intensities: np.ndarray, eta,
+                                  asymmetry=0.0) -> np.ndarray:
         """Windowed accumulation of pseudo-Voigt peaks into a dense pattern"""
         if self._n == 0 or len(positions) == 0:
             return np.zeros(self._n)
 
-        indices, profiles, _ = self._peak_windows(positions, widths, eta)
+        indices, profiles, _ = self._peak_windows(positions, widths, eta, asymmetry)
         heights = np.maximum(np.asarray(intensities, dtype=float), 0.0)
         contributions = profiles * heights[:, None]
         return np.bincount(
@@ -1372,7 +1430,7 @@ class LeBailRefinement:
         )
     
     def _extract_lebail_intensities(self, positions: np.ndarray, widths: np.ndarray,
-                                     eta) -> np.ndarray:
+                                     eta, asymmetry=0.0) -> np.ndarray:
         """
         Le Bail intensity extraction using windowed partitioning.
         Avoids allocating full-length profile arrays per peak.
@@ -1393,7 +1451,7 @@ class LeBailRefinement:
         if n_peaks == 0 or n_pts == 0:
             return np.zeros(n_peaks)
 
-        indices, profiles, areas = self._peak_windows(positions, widths, eta)
+        indices, profiles, areas = self._peak_windows(positions, widths, eta, asymmetry)
         areas = np.maximum(areas, 1e-12)
         unit_area = profiles / areas[:, None]
         observed_window = observed[indices]
@@ -1441,6 +1499,20 @@ class LeBailRefinement:
                 'strain_extra': parameters.get('strain_extra'),
             },
             self.wavelength,
+        )
+
+    def _peak_asymmetry(self, two_theta: np.ndarray, parameters: Dict) -> np.ndarray:
+        """
+        Per-reflection peak skew, from the instrument and from this phase.
+
+        The axial term belongs to the diffractometer and is shared; the sample
+        term belongs to the phase, so a disordered layer silicate can be skewed
+        without dragging the phases beside it out of shape.
+        """
+        return asymmetry_exponent(
+            two_theta,
+            axial=self.global_parameters.get('axial_asymmetry', 0.0),
+            sample=parameters.get('asymmetry', 0.0),
         )
         
     def _pseudo_voigt_profile(self, x: np.ndarray, center: float, fwhm: float, 
@@ -1645,6 +1717,7 @@ class LeBailRefinement:
                 },
                 'crystallite_size': float(params.get('crystallite_size', 0.0)),
                 'microstrain': float(params.get('microstrain', 0.0)),
+                'asymmetry': float(params.get('asymmetry', 0.0) or 0.0),
                 'contribution_percent': (
                     contributions[index]['contribution_percent'] if index < len(contributions) else None
                 ),

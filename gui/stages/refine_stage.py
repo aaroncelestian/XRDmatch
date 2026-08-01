@@ -14,6 +14,7 @@ from PyQt5.QtWidgets import (
 from utils.multi_phase_analyzer import MultiPhaseAnalyzer
 from utils.lebail_refinement import LeBailRefinement
 from gui import display_settings, refinement_table
+from gui.focus import hold_focus, restores_focus
 from gui.widgets.section import CollapsibleSection
 from gui.dialogs.refinement_progress_dialog import (
     RefinementProgressDialog, RefinementWorker,
@@ -140,6 +141,18 @@ class RefineStage(QWidget):
         )
         glob_form.addRow(self.refine_instrument)
 
+        self.refine_axial = QCheckBox("Refine axial asymmetry")
+        self.refine_axial.setChecked(False)
+        self.refine_axial.setToolTip(
+            "Skew from beam divergence out of the diffraction plane, shared by "
+            "every phase. Its effect goes as cot 2θ, so it drags a low-angle "
+            "tail out of the peaks below about 20° and fades to nothing by 90°. "
+            "Turn this on when every phase in the pattern leans the same way at "
+            "low angle; if only one phase is skewed, use the per-phase term "
+            "instead."
+        )
+        glob_form.addRow(self.refine_axial)
+
         toolbox.addItem(glob, "Global parameters")
 
         # --- Phase-specific parameters ---
@@ -166,6 +179,20 @@ class RefineStage(QWidget):
             "together needs peaks over a wide 2θ range."
         )
         phase_form.addRow(self.refine_size)
+
+        self.refine_asymmetry = QCheckBox("Refine peak asymmetry")
+        self.refine_asymmetry.setChecked(False)
+        self.refine_asymmetry.setToolTip(
+            "Lets one phase's peaks be skewed independently of the others, for "
+            "sample effects rather than instrument ones. Stacking disorder in a "
+            "layered structure is the usual cause, so this is what the "
+            "phyllosilicates need — chlorite, the micas, the clays — while the "
+            "framework and chain silicates beside them stay symmetric.\n\n"
+            "The two flanks are widened and narrowed about the same mean width, "
+            "so this changes the peak shape without competing with crystallite "
+            "size or microstrain for the width."
+        )
+        phase_form.addRow(self.refine_asymmetry)
 
         self.refine_cell = QCheckBox("Refine unit cell")
         self.refine_cell.setChecked(True)
@@ -355,6 +382,7 @@ class RefineStage(QWidget):
         ("scale_factor", "scale"),
         ("crystallite_size", "crystallite_size"),
         ("microstrain", "microstrain"),
+        ("asymmetry", "asymmetry"),
         ("lattice_scale", "lattice_scale"),
         ("absorption", "absorption"),
         ("harmonic_coeffs", "harmonic_coeffs"),
@@ -380,7 +408,8 @@ class RefineStage(QWidget):
 
         previous = inner.get("global_parameters") or {}
         carried_globals = {
-            key: previous.get(key) for key in ("zero_shift", "displacement")
+            key: previous.get(key)
+            for key in ("zero_shift", "displacement", "axial_asymmetry")
         }
         # The instrument widths are seeded from the Initial FWHM box, so only
         # carry them when the previous run actually refined them away from it.
@@ -433,6 +462,7 @@ class RefineStage(QWidget):
             initial_w = fwhm ** 2
             refine_size = self.refine_size.isChecked()
             refine_strain = self.refine_strain.isChecked()
+            refine_asymmetry = self.refine_asymmetry.isChecked()
             carry_over, carry_globals = self._carried_values()
             refinement_params = {
                 "carry_over": carry_over,
@@ -442,10 +472,12 @@ class RefineStage(QWidget):
                 "initial_w": initial_w,
                 "max_scale": self.max_scale.value(),
                 "refine_cell": self.refine_cell.isChecked(),
-                "refine_profile": refine_size or refine_strain,
+                "refine_profile": refine_size or refine_strain or refine_asymmetry,
                 "refine_size": refine_size,
                 "refine_strain": refine_strain,
+                "refine_asymmetry": refine_asymmetry,
                 "refine_instrument_profile": self.refine_instrument.isChecked(),
+                "refine_axial_asymmetry": self.refine_axial.isChecked(),
                 "refine_intensities": self.refine_intensities.isChecked(),
                 "intensity_model": self.intensity_model.currentData() or "fixed",
                 "refine_zero_shift": self.refine_zero_shift.isChecked(),
@@ -507,6 +539,7 @@ class RefineStage(QWidget):
         finally:
             worker.cancel()
             worker.wait(5000)
+            hold_focus(self)
         return dialog.results, dialog.error
 
     @staticmethod
@@ -533,6 +566,7 @@ class RefineStage(QWidget):
             message += ". Switch to the reference-intensity model for weight percents."
         return message
 
+    @restores_focus
     def export_plot(self, fmt: str):
         path, _ = QFileDialog.getSaveFileName(
             self, f"Export Plot as {fmt.upper()}", f"xrd_plot.{fmt}",
@@ -547,6 +581,7 @@ class RefineStage(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Export Error", str(e))
 
+    @restores_focus
     def export_csv_data(self):
         """Write the results table, under the statistics that qualify it."""
         results = self.session.lebail_results
@@ -577,6 +612,7 @@ class RefineStage(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Export Error", str(e))
 
+    @restores_focus
     def export_pattern_csv(self):
         """Write the pattern itself: observed, calculated and difference."""
         pattern = self.session.active_pattern()

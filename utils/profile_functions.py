@@ -13,6 +13,10 @@ yields both a total width and a mixing parameter. Fitting the mixing parameter
 directly, as an independent variable, lets it trade against the widths; deriving
 it removes that correlation.
 
+On top of that width the profile may be skewed, since a real powder peak is not
+symmetric: axial divergence drags a low-angle tail out of every reflection, and
+a disordered layer structure skews its own. See `asymmetry_exponent`.
+
 Units are degrees 2-theta for widths, angstroms for wavelength, micrometres for
 crystallite size, and dimensionless 1e-6 for microstrain.
 """
@@ -131,22 +135,102 @@ def tch_mix(gamma_gauss: np.ndarray, gamma_lorentz: np.ndarray
     return gamma, eta
 
 
-def pseudo_voigt(offset: np.ndarray, fwhm: np.ndarray,
-                 eta: np.ndarray) -> np.ndarray:
+def pseudo_voigt(offset: np.ndarray, fwhm: np.ndarray, eta: np.ndarray,
+                 asymmetry: np.ndarray = 0.0) -> np.ndarray:
     """
     Unit-height pseudo-Voigt: a linear blend of Gaussian and Lorentzian.
 
     `offset` is the distance from the peak centre in degrees. `fwhm` and `eta`
     broadcast against it, so each reflection may carry its own width and mixing.
+    `asymmetry` is the log width ratio described in `flank_widths`; at 0 this is
+    the ordinary symmetric profile.
     """
     offset = np.asarray(offset, dtype=float)
     fwhm = np.maximum(np.asarray(fwhm, dtype=float), 1e-9)
     eta = np.asarray(eta, dtype=float)
 
-    sigma = fwhm * FWHM_TO_SIGMA
+    low, high = flank_widths(fwhm, asymmetry)
+    width = np.where(offset < 0.0, low, high)
+
+    sigma = width * FWHM_TO_SIGMA
     gaussian = np.exp(-0.5 * (offset / sigma) ** 2)
-    lorentzian = 1.0 / (1.0 + (offset / (fwhm / 2.0)) ** 2)
+    lorentzian = 1.0 / (1.0 + (offset / (width / 2.0)) ** 2)
     return (1.0 - eta) * gaussian + eta * lorentzian
+
+
+# Beyond this the flanks differ by more than a factor of e**2, which is further
+# than any real peak is skewed and far enough to let the fit hide a missing
+# phase inside one peak's tail.
+MAX_ASYMMETRY = 2.0
+
+
+def flank_widths(fwhm: np.ndarray, asymmetry: np.ndarray
+                 ) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Split one FWHM into low-angle and high-angle flank widths.
+
+    `asymmetry` is log(w_low / w_high): positive skews the peak towards low
+    2-theta, which is the direction axial divergence tails, and negative skews
+    it the other way. Zero returns the symmetric width unchanged.
+
+    The two flanks are chosen so their mean is always the FWHM that was passed
+    in. Without that constraint an asymmetry term also broadens the peak, and it
+    then competes with crystallite size and microstrain for the same evidence --
+    the fit can trade one against the other with no change in the residual.
+    """
+    fwhm = np.maximum(np.asarray(fwhm, dtype=float), 1e-9)
+    ratio = np.exp(np.clip(np.asarray(asymmetry, dtype=float),
+                           -MAX_ASYMMETRY, MAX_ASYMMETRY))
+    return 2.0 * fwhm * ratio / (1.0 + ratio), 2.0 * fwhm / (1.0 + ratio)
+
+
+# Below this the two flanks differ by under 2%, which no measurement resolves.
+# A refined value this small is the optimizer idling, not a skewed peak, and
+# reporting a direction for it reads as a finding where there is none.
+NEGLIGIBLE_ASYMMETRY = 0.02
+
+
+def skew_description(value) -> str:
+    """Which way a peak leans, in words, since the sign alone says little."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return "unknown"
+    if abs(value) < NEGLIGIBLE_ASYMMETRY:
+        return "symmetric"
+    return "tail to low 2θ" if value > 0 else "tail to high 2θ"
+
+
+def asymmetry_exponent(two_theta: np.ndarray, axial: float = 0.0,
+                       sample: float = 0.0) -> np.ndarray:
+    """
+    Per-reflection log width ratio from an instrument and a sample term.
+
+    Two different things skew a powder peak and they are separated here because
+    they behave differently:
+
+      axial   divergence out of the diffraction plane, an instrument property
+              shared by every phase. Its effect scales as cot(2-theta), so it
+              dominates at low angle, vanishes at 90 degrees and reverses
+              direction beyond -- the sign change is real, not a fitting
+              artefact.
+      sample  skew belonging to one phase and roughly constant with angle, as
+              produced by stacking disorder in a layered structure. Chlorite and
+              the other phyllosilicates need this; the phases beside them in the
+              same pattern generally do not.
+
+    Keeping them apart stops a single disordered phase from imposing its skew on
+    the whole pattern through a shared instrument term.
+    """
+    two_theta = np.asarray(two_theta, dtype=float)
+    axial = float(axial)
+    if axial == 0.0:
+        return np.full(two_theta.shape, float(sample))
+    # cot runs away as the angle approaches zero, where a low-angle reflection
+    # would otherwise be handed an unbounded skew
+    cot = np.clip(1.0 / np.tan(np.radians(np.clip(two_theta, 1e-3, 179.999))),
+                  -20.0, 20.0)
+    return axial * cot + float(sample)
 
 
 def phase_widths(two_theta: np.ndarray, instrument: dict, sample: dict,

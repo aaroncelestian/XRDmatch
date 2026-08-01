@@ -862,6 +862,7 @@ class MultiPhaseAnalyzer:
                     'microstrain': carry(
                         'microstrain', params.get('microstrain', 1000.0)
                     ),
+                    'asymmetry': carry('asymmetry', 0.0),
                     'lattice_scale': carry('lattice_scale', 1.0),
                     'absorption': carry('absorption', 0.0),
                     'harmonic_coeffs': carry('harmonic_coeffs', []),
@@ -870,6 +871,7 @@ class MultiPhaseAnalyzer:
                     'refine_profile': params.get('refine_profile', True),
                     'refine_size': params.get('refine_size', False),
                     'refine_strain': params.get('refine_strain', True),
+                    'refine_asymmetry': params.get('refine_asymmetry', False),
                     'refine_scale': True,
                     'refine_intensities': params.get('refine_intensities', False),
                     'refine_absorption': params.get('refine_absorption', False),
@@ -889,11 +891,13 @@ class MultiPhaseAnalyzer:
                 'refine_zero_shift': settings.get('refine_zero_shift', True),
                 'refine_displacement': settings.get('refine_displacement', False),
                 'refine_instrument_profile': settings.get('refine_instrument_profile', False),
+                'refine_axial_asymmetry': settings.get('refine_axial_asymmetry', False),
             }
             # Starting values carried over from a previous run. This has to come
             # after add_phase, which seeds the instrument widths from the
             # per-phase initial_u/v/w.
-            for key in ('zero_shift', 'displacement', 'u_param', 'v_param', 'w_param'):
+            for key in ('zero_shift', 'displacement', 'u_param', 'v_param', 'w_param',
+                        'axial_asymmetry'):
                 value = (settings.get('carry_globals') or {}).get(key)
                 if value is not None:
                     globals_[key] = float(value)

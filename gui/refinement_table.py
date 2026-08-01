@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Tuple
 
+from utils.profile_functions import skew_description
+
 # (label, tooltip) for the per-phase summary table
 SUMMARY_COLUMNS: Tuple[Tuple[str, str], ...] = (
     ("Phase", "Mineral name and formula"),
@@ -128,6 +130,10 @@ def summary_tooltips(results: Optional[Dict]) -> List[List[str]]:
     return tooltips
 
 
+def _skew_direction(value) -> str:
+    return _MISSING if value is None else skew_description(value)
+
+
 def _start_note(value, unit: str = "Å") -> str:
     return "" if value is None else f"start {float(value):.4f} {unit}"
 
@@ -199,11 +205,13 @@ def global_rows(results: Optional[Dict]) -> List[Tuple[str, str]]:
         ("Instrument U", _number(globals_.get("u_param"), ".6f")),
         ("Instrument V", _number(globals_.get("v_param"), ".6f")),
         ("Instrument W", _number(globals_.get("w_param"), ".6f")),
+        ("Axial asymmetry", _number(globals_.get("axial_asymmetry"), "+.5f")),
     ]
     for label, key in (
         ("Zero shift refined", "refine_zero_shift"),
         ("Displacement refined", "refine_displacement"),
         ("Instrument profile refined", "refine_instrument_profile"),
+        ("Axial asymmetry refined", "refine_axial_asymmetry"),
     ):
         rows.append((label, "yes" if globals_.get(key) else "no"))
     return rows
@@ -224,6 +232,8 @@ _DETAIL_FIELDS = (
     ("RIR (I/Ic)", lambda p: _number(p.get("rir"), ".3f")),
     ("Microstrain (×10⁻⁶)", lambda p: _number(p.get("microstrain"), ".1f")),
     ("Crystallite size (µm)", lambda p: _number(p.get("crystallite_size"), ".4g")),
+    ("Phase asymmetry", lambda p: _number(p.get("asymmetry"), "+.4f")),
+    ("Peak skew", lambda p: _skew_direction(p.get("asymmetry"))),
     ("Lattice scale", lambda p: _number(p.get("lattice_scale"), ".6f")),
     ("Δlattice (%)", lambda p: _number(
         None if p.get("lattice_scale") is None

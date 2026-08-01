@@ -11,6 +11,7 @@ from PyQt5.QtWidgets import (
 )
 
 from gui import refinement_table
+from gui.focus import restores_focus
 from gui.widgets.copyable_table import CopyableTable
 
 
@@ -127,6 +128,7 @@ class RefinementDetailsDialog(QDialog):
             lines.append("")
         QApplication.clipboard().setText("\n".join(lines))
 
+    @restores_focus
     def export_csv(self):
         path, _ = QFileDialog.getSaveFileName(
             self, "Export Refinement Parameters", "refinement_parameters.csv",

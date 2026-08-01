@@ -14,6 +14,7 @@ from matplotlib_config import apply_plot_style, draw_error_bars, get_plot_palett
 from gui import display_settings, refinement_table
 from gui.theme import get_current_mode
 from gui.dialogs.refinement_details_dialog import RefinementDetailsDialog
+from gui.focus import hold_focus
 from gui.widgets.copyable_table import CopyableTable
 from gui.widgets.plot_host import create_plot_host
 from gui.stages.refine_stage import RefineStage
@@ -105,6 +106,9 @@ class QuantDialog(QDialog):
     def show_details(self):
         if self._details_dialog is None:
             self._details_dialog = RefinementDetailsDialog(self.session, self)
+            # Closing the parameter window should come back here, not to the
+            # main window behind it
+            self._details_dialog.finished.connect(lambda _result: hold_focus(self))
         self._details_dialog.show()
         self._details_dialog.raise_()
         self._details_dialog.activateWindow()

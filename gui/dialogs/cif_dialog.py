@@ -10,6 +10,7 @@ from PyQt5.QtWidgets import (
     QLabel, QMessageBox, QPlainTextEdit, QPushButton, QVBoxLayout,
 )
 
+from gui.focus import restores_focus
 from utils.cif_repository import get_cif_repository
 
 
@@ -98,6 +99,7 @@ class CifViewerDialog(QDialog):
         if text:
             QApplication.clipboard().setText(text)
 
+    @restores_focus
     def _save(self):
         text = self._current_text()
         if not text:
