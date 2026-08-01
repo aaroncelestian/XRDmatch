@@ -74,9 +74,10 @@ class QuantDialog(QDialog):
         # it has to wrap rather than clip the very part that qualifies them
         self.quant_results_label.setWordWrap(True)
         header_row.addWidget(self.quant_results_label, 1)
-        self.details_btn = QPushButton("All parameters…")
+        self.details_btn = QPushButton("Parameters…")
         self.details_btn.setToolTip(
-            "Every refined parameter for every phase, in a window of its own"
+            "Edit which terms refine for each phase, hold a value at a number "
+            "you choose, or read every refined parameter in one place."
         )
         self.details_btn.clicked.connect(self.show_details)
         header_row.addWidget(self.details_btn)
@@ -160,7 +161,11 @@ class QuantDialog(QDialog):
                 "Refinement — run Le Bail, or RIR Quant in the Phases tab"
             )
             self.quant_results_table.set_content([], [])
-        self.details_btn.setEnabled(bool(results and results.get("success")))
+        has_phases = bool(
+            self.session.selected_phases or self.session.matched_phases
+            or (results and results.get("success"))
+        )
+        self.details_btn.setEnabled(has_phases)
 
     def _show_lebail_details(self, results: dict):
         parts = refinement_table.summary_headline(results)

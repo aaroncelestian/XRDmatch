@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
+
 from utils.profile_functions import skew_description
 
 # (label, tooltip) for the per-phase summary table
@@ -35,12 +37,63 @@ RIR_COLUMNS: Tuple[Tuple[str, str], ...] = (
     ("Phase", ""),
     ("wt%", "Chung RIR weight percent"),
     ("Scale", "Refined scale factor"),
-    ("Fitted I", "Strongest-line intensity from the fit"),
+    ("Fitted I", "Integrated intensity of the strongest line, which is what I/Ic is defined on"),
     ("RIR", "I/I_corundum from AMCSD"),
     ("Pattern share %", "Share of the fitted pattern intensity, before the RIR conversion"),
 )
 
 _MISSING = "—"
+
+# Durbin-Watson runs 0 to 4 and sits at 2 when successive residuals are
+# independent. Departures either way mean the residuals still have structure the
+# model has not taken up, so the bands below are symmetric about 2.
+_DURBIN_BANDS = (
+    (1.0, "strongly correlated — systematic misfit"),
+    (1.6, "correlated — some systematic misfit"),
+    (2.4, "close to random — near the noise floor"),
+    (3.0, "correlated — some systematic misfit"),
+)
+_DURBIN_EXTREME = "strongly anti-correlated — check the error estimates"
+
+
+# Above this the peak width is mostly coming from the refined sample terms
+# rather than from the instrument, which for an ordinary ground powder means
+# the crystallite size is standing in for a resolution curve nobody calibrated.
+_WIDTH_SHARE_LIMIT = 0.5
+
+
+def _percent(fraction):
+    try:
+        return 100.0 * float(fraction)
+    except (TypeError, ValueError):
+        return None
+
+
+def _size_warning(phase: Dict) -> str:
+    share = phase.get("sample_width_share")
+    try:
+        share = float(share)
+    except (TypeError, ValueError):
+        return _MISSING
+    if share < _WIDTH_SHARE_LIMIT:
+        return "none"
+    return (f"{share * 100:.0f}% of the width is sample broadening — calibrate "
+            "U, V, W against a standard before reading the size as a particle size")
+
+
+def _residual_character(value) -> str:
+    """Say in words what the Durbin-Watson number means."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return _MISSING
+    if not np.isfinite(value):
+        return _MISSING
+    for limit, description in _DURBIN_BANDS:
+        if value < limit:
+            return description
+    return _DURBIN_EXTREME
+
 
 _WEIGHT_NOTES = {
     "rir": "Chung RIR weight percent",
@@ -148,7 +201,7 @@ def rir_rows(result: Optional[Dict]) -> List[List[str]]:
             str(phase.get("name") or f"Phase {index + 1}"),
             _number(phase.get("weight_percent"), ".1f"),
             _number(phase.get("scale"), ".4g"),
-            _number(phase.get("line_intensity"), ".4g"),
+            _number(phase.get("line_area"), ".4g"),
             _number(phase.get("rir") or None, ".3f"),
             _number(phase.get("pattern_intensity", 0.0) / total * 100.0, ".1f"),
         ])
@@ -164,10 +217,14 @@ def summary_headline(results: Optional[Dict]) -> List[str]:
     globals_ = inner.get("global_parameters") or {}
 
     parts = []
-    for key, label in (("Rwp", "Rwp"), ("Rp", "Rp"), ("GoF", "GoF")):
+    for key, label in (("Rwp", "Rwp"), ("Rwp_peak", "Rwp(peaks)"), ("Rp", "Rp"),
+                       ("R_Bragg", "R_Bragg"), ("GoF", "GoF")):
         value = factors.get(key)
-        if value is not None:
+        if value is not None and np.isfinite(float(value)):
             parts.append(f"{label}={float(value):.2f}" + ("%" if key != "GoF" else ""))
+    durbin = factors.get("durbin_watson")
+    if durbin is not None and np.isfinite(float(durbin)):
+        parts.append(f"DW={float(durbin):.2f}")
     parts.append(f"zero={float(globals_.get('zero_shift', 0.0)):+.4f}°")
     parts.append(f"disp={float(globals_.get('displacement', 0.0)):+.4f}°")
     if inner.get("iterations"):
@@ -181,6 +238,48 @@ def summary_headline(results: Optional[Dict]) -> List[str]:
     return parts
 
 
+def phase_parameters(results: Optional[Dict],
+                     overrides: Optional[Dict] = None) -> Dict[str, Dict]:
+    """
+    Current per-phase values and refine flags, for the editable grid.
+
+    The last run's values are the starting point, so the grid opens where the
+    refinement finished rather than at a default nobody chose. Anything the user
+    has already set by hand wins over that, otherwise their edits would be
+    silently undone every time a run completed.
+    """
+    inner = (results or {}).get("refinement_results") or {}
+    out: Dict[str, Dict] = {}
+    for row in inner.get("phase_summary") or []:
+        name = row.get("name")
+        if not name:
+            continue
+        entry = {
+            "scale_factor": row.get("scale"),
+            "microstrain": row.get("microstrain"),
+            "crystallite_size": row.get("crystallite_size"),
+            "asymmetry": row.get("asymmetry"),
+            "lattice_scale": row.get("lattice_scale"),
+            "absorption": row.get("absorption"),
+            # Defaults match the refine-stage checkboxes; an older result that
+            # never recorded its flags still opens looking like a fresh run
+            "refine_scale": True,
+            "refine_strain": True,
+            "refine_size": False,
+            "refine_asymmetry": False,
+            "refine_cell": True,
+            "refine_absorption": False,
+            "refine_harmonics": False,
+        }
+        entry.update(row.get("refine_flags") or {})
+        out[name] = entry
+    for name, override in (overrides or {}).items():
+        out.setdefault(name, {}).update(
+            {k: v for k, v in override.items() if k != "_locked"}
+        )
+    return out
+
+
 # --- everything the refinement holds, for the details window and the CSV ----
 
 def global_rows(results: Optional[Dict]) -> List[Tuple[str, str]]:
@@ -192,9 +291,16 @@ def global_rows(results: Optional[Dict]) -> List[Tuple[str, str]]:
     model = inner.get("intensity_model")
     rows = [
         ("Rwp (%)", _number(factors.get("Rwp"), ".3f")),
+        ("Rwp near peaks (%)", _number(factors.get("Rwp_peak"), ".3f")),
+        ("Points near peaks (%)", _number(factors.get("peak_coverage"), ".1f")),
         ("Rp (%)", _number(factors.get("Rp"), ".3f")),
         ("Rexp (%)", _number(factors.get("Rexp"), ".3f")),
+        ("R_Bragg (%)", _number(factors.get("R_Bragg"), ".3f")),
+        ("Durbin-Watson", _number(factors.get("durbin_watson"), ".3f")),
+        ("Residuals look", _residual_character(factors.get("durbin_watson"))),
         ("Goodness of fit", _number(factors.get("GoF"), ".3f")),
+        ("Fitted region", "Near modelled peaks only"
+         if inner.get("fit_peak_regions_only") else "Whole pattern"),
         ("Cycles", str(inner.get("iterations") or _MISSING)),
         ("Intensity model", {
             "fixed": "Reference intensities (quantitative)",
@@ -227,9 +333,13 @@ _DETAIL_FIELDS = (
     }.get(p.get("weight_percent_basis"), _MISSING)),
     ("Contribution (%)", lambda p: _number(p.get("contribution_percent"), ".2f")),
     ("Scale factor", lambda p: _number(p.get("scale"), ".6g")),
-    ("Strongest-line intensity", lambda p: _number(p.get("line_intensity"), ".6g")),
+    ("Strongest-line height", lambda p: _number(p.get("line_intensity"), ".6g")),
+    ("Strongest-line area", lambda p: _number(p.get("line_area"), ".6g")),
     ("Integrated intensity", lambda p: _number(p.get("integrated_intensity"), ".6g")),
     ("RIR (I/Ic)", lambda p: _number(p.get("rir"), ".3f")),
+    ("Width from sample terms (%)",
+     lambda p: _number(_percent(p.get("sample_width_share")), ".0f")),
+    ("Crystallite size warning", lambda p: _size_warning(p)),
     ("Microstrain (×10⁻⁶)", lambda p: _number(p.get("microstrain"), ".1f")),
     ("Crystallite size (µm)", lambda p: _number(p.get("crystallite_size"), ".4g")),
     ("Phase asymmetry", lambda p: _number(p.get("asymmetry"), "+.4f")),

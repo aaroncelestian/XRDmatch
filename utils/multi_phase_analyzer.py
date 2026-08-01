@@ -831,6 +831,12 @@ class MultiPhaseAnalyzer:
             # let it settle, fix it, and move on to the next.
             carried = params.get('carry_over') or {}
 
+            # Per-phase overrides, keyed by mineral name. Everything below is a
+            # default that an entry here replaces, so one phase can refine a
+            # term its neighbour holds fixed -- chlorite needs its asymmetry
+            # free while the quartz beside it does not.
+            overrides = params.get('phase_overrides') or {}
+
             # Add identified phases to refinement
             for phase_result in identified_phases:
                 phase_data = {
@@ -879,13 +885,23 @@ class MultiPhaseAnalyzer:
                     'harmonic_order': params.get('harmonic_order', 0),
                     'max_scale_bound': params.get('max_scale', 10.0)
                 }
-                
+
+                override = overrides.get(name) or {}
+                initial_params.update(override)
+                # A pinned parameter must not also be refined, whatever flag
+                # arrived with it; the lock is what the user actually asked for.
+                for locked in initial_params.get('_locked') or ():
+                    initial_params[f'refine_{locked}'] = False
+
                 self.lebail_engine.add_phase(phase_data, initial_params)
 
             settings = refinement_params or {}
             # Callers that want quantification ask for 'fixed' explicitly; the
             # older tabs keep the classic extraction behaviour
             self.lebail_engine.intensity_model = settings.get('intensity_model', 'extract')
+            self.lebail_engine.fit_peak_regions_only = bool(
+                settings.get('fit_peak_regions_only', False)
+            )
 
             globals_ = {
                 'refine_zero_shift': settings.get('refine_zero_shift', True),

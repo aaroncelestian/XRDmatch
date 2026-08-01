@@ -153,6 +153,21 @@ class RefineStage(QWidget):
         )
         glob_form.addRow(self.refine_axial)
 
+        self.fit_peaks_only = QCheckBox("Fit only near modelled peaks")
+        self.fit_peaks_only.setChecked(False)
+        self.fit_peaks_only.setToolTip(
+            "A background-subtracted pattern is mostly empty, and those empty "
+            "points carry the largest weight because the error model is "
+            "smallest where the intensity is smallest. The refinement can end "
+            "up steered by counting noise between the peaks. Tick this to fit "
+            "only within a few widths of each reflection. The region is fixed "
+            "from the starting positions so the peaks cannot slide out of it. "
+            "This changes the fit, not just the reported numbers — Rwp(peaks) "
+            "in the results lets you compare a run with it on against one "
+            "with it off."
+        )
+        glob_form.addRow(self.fit_peaks_only)
+
         toolbox.addItem(glob, "Global parameters")
 
         # --- Phase-specific parameters ---
@@ -480,6 +495,10 @@ class RefineStage(QWidget):
                 "refine_axial_asymmetry": self.refine_axial.isChecked(),
                 "refine_intensities": self.refine_intensities.isChecked(),
                 "intensity_model": self.intensity_model.currentData() or "fixed",
+                "fit_peak_regions_only": self.fit_peaks_only.isChecked(),
+                # Anything set by hand in the parameter grid overrides the
+                # run-wide defaults above, for that phase only
+                "phase_overrides": getattr(self.session, "phase_overrides", {}) or {},
                 "refine_zero_shift": self.refine_zero_shift.isChecked(),
                 "refine_displacement": self.refine_displacement.isChecked(),
                 "refine_absorption": self.refine_absorption.isChecked(),

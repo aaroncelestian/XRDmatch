@@ -98,8 +98,10 @@ def test_complete_rir_set_gives_chung_weight_percents():
     summary = _refine(BASE_PARAMS)["refinement_results"]["phase_summary"]
     assert all(row["weight_percent_basis"] == "rir" for row in summary)
     assert sum(row["weight_percent"] for row in summary) == pytest.approx(100.0)
-    # With equal RIRs the split follows the fitted line intensities
-    ratio = summary[0]["line_intensity"] / summary[1]["line_intensity"]
+    # With equal RIRs the split follows the integrated intensity of each
+    # strongest line, not its height: the two phases refine to different widths,
+    # and a narrower peak is not more material. See test_weight_percent.py.
+    ratio = summary[0]["line_area"] / summary[1]["line_area"]
     assert summary[0]["weight_percent"] / summary[1]["weight_percent"] == pytest.approx(ratio)
 
 

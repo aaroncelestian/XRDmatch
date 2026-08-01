@@ -37,6 +37,9 @@ class AnalysisSession(QObject):
         self.file_path: Optional[str] = None
         # 2theta spans the user wants search/match to prioritise
         self.emphasis_regions: List[Dict[str, float]] = []
+        # Per-phase starting values and refine flags set by hand, keyed by
+        # mineral name. Empty means every phase follows the run-wide defaults.
+        self.phase_overrides: Dict[str, Dict[str, Any]] = {}
 
     # --- stage completion helpers ---
 
@@ -67,6 +70,7 @@ class AnalysisSession(QObject):
         self.lebail_results = None
         self.rir_results = None
         self.emphasis_regions = []
+        self.phase_overrides = {}
         self.file_path = pattern.get("file_path")
         if "wavelength" in pattern:
             self.wavelength = float(pattern["wavelength"])
@@ -117,6 +121,10 @@ class AnalysisSession(QObject):
 
     def set_lebail_results(self, results: Optional[Dict[str, Any]]) -> None:
         self.lebail_results = results
+        self.refinement_changed.emit()
+
+    def set_phase_overrides(self, overrides: Dict[str, Dict[str, Any]]) -> None:
+        self.phase_overrides = overrides or {}
         self.refinement_changed.emit()
         self.stage_status_changed.emit()
 

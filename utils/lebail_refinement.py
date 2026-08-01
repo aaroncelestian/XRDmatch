@@ -93,6 +93,12 @@ class LeBailRefinement:
         }
         self.wavelength = 1.5406
 
+        # Restrict the residual to the neighbourhood of the modelled reflections,
+        # so the optimizer is not pulled by counting noise in the empty stretches
+        # between them. Off by default: it changes the fit, not just the report.
+        self.fit_peak_regions_only = False
+        self._fit_mask = None
+
         # 'extract': classic Le Bail, intensities partitioned out of the observed
         #            pattern. Best profile/cell fit, but scale and the intensity
         #            corrections are absorbed and cannot be determined.
@@ -242,6 +248,8 @@ class LeBailRefinement:
         # Pawley intensities are solved, not searched, so they need no starting
         # vector here; the cache is filled on the first alternation step.
         default_params.pop('peak_intensity_multipliers', None)
+
+        default_params['_locked'] = frozenset(default_params.get('_locked') or ())
 
         order = int(default_params.get('harmonic_order', 0) or 0)
         n_harmonics = max(0, order // 2)
@@ -510,6 +518,20 @@ class LeBailRefinement:
         if staged_refinement and self.mode == 'polish':
             self._log("Using staged refinement: unit cell → profile parameters")
         
+        # The fitted region is fixed here, once, from the starting positions. If
+        # it were recomputed from the current model the optimizer could improve
+        # the residual by sliding peaks until the awkward points fell outside it.
+        self._fit_mask = None
+        if self.fit_peak_regions_only:
+            mask = self._peak_region_mask(reach=4.0)
+            fraction = float(np.mean(mask))
+            if mask.any():
+                self._fit_mask = mask
+                self._log(
+                    f"Fitting the {fraction * 100:.1f}% of points near modelled "
+                    "peaks; the empty stretches are excluded"
+                )
+
         # Initialize refinement
         self.refinement_history = []
         previous_rwp = float('inf')
@@ -622,7 +644,9 @@ class LeBailRefinement:
             phase_contributions = self._calculate_phase_contributions()
             
             self._log(f"R-factors: Rp={r_factors['Rp']:.3f}, Rwp={r_factors['Rwp']:.3f}, "
-                      f"GoF={r_factors['GoF']:.3f}")
+                      f"Rwp(peaks)={r_factors['Rwp_peak']:.3f}, "
+                      f"GoF={r_factors['GoF']:.3f}, "
+                      f"DW={r_factors['durbin_watson']:.2f}")
             
             for phase_idx, phase in enumerate(self.phases):
                 phase_name = phase['data']['phase'].get('mineral', f'Phase_{phase_idx}')
@@ -689,6 +713,7 @@ class LeBailRefinement:
             'experimental_intensity': self.experimental_data['intensity'].copy(),
             'global_parameters': dict(self.global_parameters),
             'intensity_model': self.intensity_model,
+            'fit_peak_regions_only': self._fit_mask is not None,
             'phase_summary': self.phase_summary(),
         }
         
@@ -708,22 +733,45 @@ class LeBailRefinement:
         """
         if not self._uses_fixed_intensities() or not self.phases:
             return
+        # A pinned scale is a fixed quantity of a phase, often the whole point of
+        # the run -- an internal standard weighed into the mount. Solving for it
+        # here would discard that before the refinement had begun, so those
+        # phases are held at their value and the rest are solved around them.
+        pinned = [
+            'scale_factor' in self._locked_parameters(p['parameters'])
+            for p in self.phases
+        ]
         columns = []
         for index, phase in enumerate(self.phases):
             params = dict(phase['parameters'])
-            params['scale_factor'] = 1.0
+            if not pinned[index]:
+                params['scale_factor'] = 1.0
             columns.append(self._calculate_phase_pattern(index, params))
         design = np.column_stack(columns)
         if not np.any(design > 0):
             return
+
+        target = self.experimental_data['intensity']
+        if any(pinned):
+            target = target - np.sum(
+                [column for column, fixed in zip(columns, pinned) if fixed],
+                axis=0, initial=0.0,
+            )
+            free = [i for i, fixed in enumerate(pinned) if not fixed]
+            if not free:
+                return
+            design = design[:, free]
         try:
-            scales, _ = nnls(design, self.experimental_data['intensity'])
+            scales, _ = nnls(design, np.maximum(target, 0.0))
         except Exception as e:
             self._log(f"Scale initialization failed: {e}")
             return
-        for phase, scale in zip(self.phases, scales):
+
+        targets = [i for i, fixed in enumerate(pinned) if not fixed] if any(pinned) \
+            else list(range(len(self.phases)))
+        for index, scale in zip(targets, scales):
             if scale > 0:
-                phase['parameters']['scale_factor'] = float(scale)
+                self.phases[index]['parameters']['scale_factor'] = float(scale)
         self._log(
             "  Initial scales (least squares): "
             + ", ".join(f"{p['parameters']['scale_factor']:.4f}" for p in self.phases)
@@ -780,7 +828,9 @@ class LeBailRefinement:
         def residuals(x):
             for name, value in zip(names, x):
                 self.global_parameters[name] = float(value)
-            return (observed - self._calculate_total_pattern()) / errors
+            return self._fitted_residual(
+                (observed - self._calculate_total_pattern()) / errors
+            )
 
         def chi2(x):
             return float(np.sum(residuals(x) ** 2))
@@ -943,7 +993,7 @@ class LeBailRefinement:
             if 'unit_cell' in temp:
                 merged['unit_cell'] = temp['unit_cell']
             total = self._calculate_phase_pattern(phase_idx, merged) + other_pattern
-            return (observed - total) / errors
+            return self._fitted_residual((observed - total) / errors)
 
         if len(group) == 1 and names[0] == 'lattice_scale':
             # A 1-D bracketed search is cheaper and more robust than TRF for the
@@ -1036,7 +1086,30 @@ class LeBailRefinement:
         # Pawley intensities are absent by design: they are linear in the pattern
         # and are solved by NNLS in the alternation step instead.
 
+        # A pinned parameter is dropped here rather than at each flag above, so
+        # that the staged refinement -- which switches whole groups of flags on
+        # and off as it moves between stages -- cannot hand one back.
+        locked = self._locked_parameters(params)
+        if locked:
+            keep = [i for i, name in enumerate(param_names)
+                    if not self._is_locked(name, locked)]
+            param_vector = [param_vector[i] for i in keep]
+            param_bounds = [param_bounds[i] for i in keep]
+            param_names = [param_names[i] for i in keep]
+
         return np.array(param_vector), param_bounds, param_names
+
+    @staticmethod
+    def _locked_parameters(params: Dict) -> frozenset:
+        """Names the user has pinned, which nothing may refine or overwrite."""
+        return frozenset(params.get('_locked') or ())
+
+    @staticmethod
+    def _is_locked(name: str, locked: frozenset) -> bool:
+        if name in locked:
+            return True
+        # The harmonic terms are pinned as a group, being one correction
+        return name.startswith('harmonic_') and 'harmonic_coeffs' in locked
         
     def _vector_to_parameters(self, vector: np.ndarray, names: List[str], 
                             original_params: Dict) -> Dict:
@@ -1430,7 +1503,7 @@ class LeBailRefinement:
         )
     
     def _extract_lebail_intensities(self, positions: np.ndarray, widths: np.ndarray,
-                                     eta, asymmetry=0.0) -> np.ndarray:
+                                     eta, asymmetry=0.0, residual=None) -> np.ndarray:
         """
         Le Bail intensity extraction using windowed partitioning.
         Avoids allocating full-length profile arrays per peak.
@@ -1442,9 +1515,13 @@ class LeBailRefinement:
 
         Each phase is partitioned against its own reflections only, so where two
         phases overlap both claim the same observed intensity. That is why this
-        mode cannot be used for quantification.
+        mode cannot be used for quantification. Pass `residual` -- the other
+        phases' calculated pattern -- to take their share out first, which is
+        what an honest per-phase comparison needs.
         """
         observed = self.experimental_data['intensity']
+        if residual is not None:
+            observed = np.maximum(observed - np.asarray(residual, dtype=float), 0.0)
         n_peaks = len(positions)
         n_pts = self._n
 
@@ -1589,27 +1666,208 @@ class LeBailRefinement:
         obs = self.experimental_data['intensity']
         calc = calculated_pattern
         errors = self.experimental_data['errors']
-        
+
         rp = np.sum(np.abs(obs - calc)) / np.sum(obs) if np.sum(obs) > 0 else float('inf')
-        
-        rwp_num = np.sum(((obs - calc) / errors) ** 2)
+
+        weighted = (obs - calc) / errors
+        rwp_num = np.sum(weighted ** 2)
         rwp_den = np.sum((obs / errors) ** 2)
         rwp = np.sqrt(rwp_num / rwp_den) if rwp_den > 0 else float('inf')
-        
+
         n_obs = len(obs)
         n_param = sum(len(self._create_parameter_vector(p['parameters'])[0]) for p in self.phases)
         r_exp = np.sqrt((n_obs - n_param) / rwp_den) if rwp_den > 0 and n_obs > n_param else float('inf')
-        
+
         gof = rwp / r_exp if r_exp > 0 and not np.isinf(r_exp) else float('inf')
         chi_squared = rwp_num / (n_obs - n_param) if n_obs > n_param else float('inf')
-        
-        return {
+
+        factors = {
             'Rp': rp * 100,
             'Rwp': rwp * 100,
             'Rexp': r_exp * 100,
             'GoF': gof,
-            'chi_squared': chi_squared
+            'chi_squared': chi_squared,
+            'Rwp_peak': self._peak_region_rwp(calc) * 100,
+            'peak_coverage': float(np.mean(self._peak_region_mask())) * 100,
+            'durbin_watson': self._durbin_watson(weighted),
+            'R_Bragg': self._bragg_r_factor(),
         }
+        return factors
+
+    # How far either side of a reflection still counts as part of the peak. Two
+    # widths holds essentially all of a Gaussian and the body of a Lorentzian,
+    # without reaching so far that the gaps between peaks creep back in.
+    _PEAK_REGION_WIDTHS = 2.0
+
+    def _peak_region_mask(self, reach: Optional[float] = None) -> np.ndarray:
+        """
+        The points where the model actually predicts something.
+
+        A pattern is mostly gaps. Because the data is background subtracted the
+        gaps sit at zero, where the Poisson error model gives its smallest error
+        and therefore its largest weight, so the emptiest parts of the pattern
+        carry the most weight in Rwp while contributing almost nothing to its
+        denominator. What comes out is dominated by counting noise between the
+        peaks rather than by how well the peaks are fitted.
+        """
+        x = self.experimental_data['two_theta']
+        mask = np.zeros(len(x), dtype=bool)
+        reach = self._PEAK_REGION_WIDTHS if reach is None else float(reach)
+
+        for phase in self.phases:
+            params = phase['parameters']
+            positions, _ = self._filter_peaks(phase['theoretical_peaks'])
+            if len(positions) == 0:
+                continue
+            positions = self._shift_positions(positions, params)
+            widths, _ = self._calculate_peak_widths(positions, params)
+            span = reach * np.maximum(widths, 1e-6)
+            starts = np.searchsorted(x, positions - span, side='left')
+            stops = np.searchsorted(x, positions + span, side='right')
+            for start, stop in zip(starts, stops):
+                mask[start:stop] = True
+        return mask
+
+    def _strongest_line_area(self, phase_idx: int) -> Tuple[float, float]:
+        """
+        Profile area under a unit-height peak at this phase's strongest line,
+        and how much of that line's width the sample terms are supplying.
+
+        I/Ic is defined on integrated intensities, but a refined scale factor
+        only gives a peak height. The two are proportional only at fixed width,
+        and crystallite size and microstrain are refined per phase, so a phase
+        whose peaks refine narrower gets a taller strongest line at unchanged
+        area and is read as more abundant than it is. Multiplying by the area
+        under the profile converts the height the scale factor carries into the
+        integrated intensity the method is defined on.
+
+        The width share is a diagnostic rather than a correction: when the
+        sample terms are supplying most of the width, they are standing in for
+        an instrument profile that was never calibrated, and the crystallite
+        size that comes out is not a particle size.
+        """
+        phase = self.phases[phase_idx]
+        params = phase['parameters']
+        positions, reference = self._filter_peaks(phase['theoretical_peaks'])
+        if len(positions) == 0:
+            return 1.0, 0.0
+
+        strongest = int(np.argmax(reference))
+        shifted = self._shift_positions(positions, params)
+        widths, eta = self._calculate_peak_widths(shifted, params)
+        skew = self._peak_asymmetry(shifted, params)
+
+        _, _, areas = self._peak_windows(shifted, widths, eta, skew)
+        area = float(areas[strongest]) if len(areas) > strongest else 1.0
+
+        # The same width with the sample contribution switched off tells us how
+        # much of it the sample terms are carrying.
+        bare = dict(params)
+        bare['crystallite_size'] = 0.0
+        bare['microstrain'] = 0.0
+        instrument, _ = self._calculate_peak_widths(shifted, bare)
+        total = float(widths[strongest])
+        share = 0.0
+        if total > 0:
+            share = max(0.0, 1.0 - float(instrument[strongest]) / total)
+        return area, share
+
+    def _fitted_residual(self, residual: np.ndarray) -> np.ndarray:
+        """The part of the residual the optimizer is being asked to minimise."""
+        if self._fit_mask is None:
+            return residual
+        return residual[self._fit_mask]
+
+    def _peak_region_rwp(self, calc: np.ndarray) -> float:
+        """Rwp over the peaks alone, with the empty stretches left out."""
+        mask = self._peak_region_mask()
+        if not mask.any():
+            return float('inf')
+        obs = self.experimental_data['intensity'][mask]
+        errors = self.experimental_data['errors'][mask]
+        denominator = np.sum((obs / errors) ** 2)
+        if denominator <= 0:
+            return float('inf')
+        numerator = np.sum(((obs - calc[mask]) / errors) ** 2)
+        return float(np.sqrt(numerator / denominator))
+
+    @staticmethod
+    def _durbin_watson(weighted_residual: np.ndarray) -> float:
+        """
+        Serial correlation in the residuals, as a number near 2.
+
+        Rwp says how large the misfit is; this says whether it has structure.
+        Around 2 the residuals are uncorrelated point to point, which is what
+        noise looks like and means the model has taken everything it can. Well
+        below 2 they wander in runs -- the signature of an unmodelled peak
+        shape, a wrong width or a missing phase -- and a smaller Rwp reached by
+        adding parameters has not fixed it.
+        """
+        residual = np.asarray(weighted_residual, dtype=float)
+        if residual.size < 2:
+            return float('nan')
+        denominator = float(np.sum(residual ** 2))
+        if denominator <= 0:
+            return float('nan')
+        return float(np.sum(np.diff(residual) ** 2) / denominator)
+
+    def _bragg_r_factor(self) -> Optional[float]:
+        """
+        Agreement between the observed and modelled integrated intensities.
+
+        Reported only when the calculated intensities come from the structure.
+        Le Bail sets them equal to the values it partitioned out of the observed
+        pattern, so it scores exactly zero however wrong the model is, and
+        Pawley fits them as free parameters against the same data. In either
+        case the number would say nothing about the model. With reference
+        intensities the comparison is real, and this is where preferred
+        orientation or a misidentified polymorph shows itself.
+        """
+        if self.intensity_model != 'fixed' or not self.phases:
+            return None
+        if any(p['parameters'].get('refine_intensities') for p in self.phases):
+            return None
+
+        observed_total = 0.0
+        difference_total = 0.0
+        frozen, self._freeze_extracted = self._freeze_extracted, True
+        try:
+            # Each phase's pattern once, then subtract to get everyone else's,
+            # rather than rebuilding the others from scratch for every phase.
+            patterns = [self._calculate_phase_pattern(i, p['parameters'])
+                        for i, p in enumerate(self.phases)]
+            everything = np.sum(patterns, axis=0)
+
+            for index, phase in enumerate(self.phases):
+                params = phase['parameters']
+                positions, reference = self._filter_peaks(phase['theoretical_peaks'])
+                if len(positions) == 0:
+                    continue
+                positions = self._shift_positions(positions, params)
+                widths, eta = self._calculate_peak_widths(positions, params)
+                skew = self._peak_asymmetry(positions, params)
+
+                modelled = (
+                    reference * params.get('scale_factor', 1.0)
+                    * self._intensity_corrections(positions, params, reference)
+                )
+
+                # What the data leaves for this phase once the others have taken
+                # their share; without this every phase would claim the whole of
+                # any overlapped intensity and score better than it deserves.
+                others = everything - patterns[index]
+                observed = self._extract_lebail_intensities(
+                    positions, widths, eta, skew, residual=others
+                )
+
+                observed_total += float(np.sum(np.abs(observed)))
+                difference_total += float(np.sum(np.abs(observed - modelled)))
+        finally:
+            self._freeze_extracted = frozen
+
+        if observed_total <= 0:
+            return None
+        return 100.0 * difference_total / observed_total
         
     def get_refined_phases_for_search(self) -> List[Dict]:
         """
@@ -1689,6 +1947,7 @@ class LeBailRefinement:
                 phase['theoretical_peaks'].get('intensity', []), dtype=float
             )
             reference_max = float(np.max(theo_intensity)) if len(theo_intensity) else 0.0
+            line_area, width_share = self._strongest_line_area(index)
 
             rir = info.get('rir')
             try:
@@ -1704,6 +1963,8 @@ class LeBailRefinement:
                 'formula': info.get('formula', info.get('chemical_formula', '')),
                 'scale': scale,
                 'line_intensity': scale * reference_max,
+                'line_area': scale * reference_max * line_area,
+                'sample_width_share': width_share,
                 'rir': rir,
                 'lattice_scale': float(params.get('lattice_scale', 1.0)),
                 'unit_cell': dict(params.get('unit_cell') or {}),
@@ -1718,6 +1979,15 @@ class LeBailRefinement:
                 'crystallite_size': float(params.get('crystallite_size', 0.0)),
                 'microstrain': float(params.get('microstrain', 0.0)),
                 'asymmetry': float(params.get('asymmetry', 0.0) or 0.0),
+                # What was free for this phase, so the next run can be set up
+                # from where the last one actually stood rather than a default
+                'refine_flags': {
+                    key: bool(params.get(key, False))
+                    for key in ('refine_scale', 'refine_strain', 'refine_size',
+                                'refine_asymmetry', 'refine_cell',
+                                'refine_absorption', 'refine_harmonics')
+                },
+                'locked': sorted(self._locked_parameters(params)),
                 'contribution_percent': (
                     contributions[index]['contribution_percent'] if index < len(contributions) else None
                 ),
@@ -1736,9 +2006,9 @@ class LeBailRefinement:
         # all the numbers on one basis.
         complete_rir = bool(rows) and all(row['rir'] for row in rows)
         terms = [
-            row['line_intensity'] / row['rir']
+            row['line_area'] / row['rir']
             for row in rows
-            if row['rir'] and row['line_intensity'] > 0
+            if row['rir'] and row['line_area'] > 0
         ]
         total = float(sum(terms))
 
@@ -1753,8 +2023,8 @@ class LeBailRefinement:
             row['weight_percent_basis'] = basis
             if basis == 'rir':
                 row['weight_percent'] = (
-                    100.0 * (row['line_intensity'] / row['rir']) / total
-                    if row['line_intensity'] > 0 else 0.0
+                    100.0 * (row['line_area'] / row['rir']) / total
+                    if row['line_area'] > 0 else 0.0
                 )
             elif basis == 'contribution':
                 row['weight_percent'] = row['contribution_percent']

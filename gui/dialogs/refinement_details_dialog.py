@@ -1,4 +1,4 @@
-"""Every refined parameter, for every phase, in one window."""
+"""Everything the refinement holds, and the controls to change it."""
 
 from __future__ import annotations
 
@@ -7,21 +7,24 @@ import csv
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
     QDialog, QFileDialog, QHBoxLayout, QLabel, QMessageBox, QPushButton,
-    QSplitter, QVBoxLayout, QWidget,
+    QTabWidget, QVBoxLayout, QWidget,
 )
 
 from gui import refinement_table
 from gui.focus import restores_focus
 from gui.widgets.copyable_table import CopyableTable
+from gui.widgets.parameter_matrix import ParameterMatrix
 
 
 class RefinementDetailsDialog(QDialog):
     """
-    The full parameter set behind the summary table.
+    The parameters behind the summary table, laid out to be worked in.
 
-    The summary shows what is read at a glance; this shows everything the
-    refinement holds, including the quantities that are only meaningful once
-    something has gone wrong with the fit.
+    This began as a read-only window because the refinement panel had nowhere
+    to show a value, which left the two halves of the same job in different
+    places: you read a number here and went elsewhere to act on it. The grid on
+    the first tab is the same information made editable, so reading a parameter
+    and deciding what to do about it are one gesture.
     """
 
     def __init__(self, session, parent=None):
@@ -29,7 +32,7 @@ class RefinementDetailsDialog(QDialog):
         self.session = session
         self.setWindowTitle("Refinement Parameters")
         self.setWindowModality(Qt.NonModal)
-        self.resize(820, 620)
+        self.resize(940, 660)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
@@ -40,22 +43,17 @@ class RefinementDetailsDialog(QDialog):
         self.headline.setWordWrap(True)
         root.addWidget(self.headline)
 
-        splitter = QSplitter(Qt.Vertical)
-        splitter.setChildrenCollapsible(False)
-
-        splitter.addWidget(self._section(
-            "Global — one value for the whole pattern", "global_table"
-        ))
-        splitter.addWidget(self._section(
-            "Per phase", "phase_table"
-        ))
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([220, 400])
-        root.addWidget(splitter, 1)
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._build_matrix_tab(), "Parameters")
+        self.tabs.addTab(self._build_table_tab("global_table"), "Statistics")
+        self.tabs.addTab(self._build_table_tab("phase_table"), "All values")
+        root.addWidget(self.tabs, 1)
 
         buttons = QHBoxLayout()
-        buttons.addStretch()
+        self.hint = QLabel()
+        self.hint.setObjectName("mutedLabel")
+        self.hint.setWordWrap(True)
+        buttons.addWidget(self.hint, 1)
         copy_btn = QPushButton("Copy all")
         copy_btn.setToolTip("Copy both tables to the clipboard")
         copy_btn.clicked.connect(self.copy_all)
@@ -71,19 +69,46 @@ class RefinementDetailsDialog(QDialog):
         session.refinement_changed.connect(self.refresh)
         self.refresh()
 
-    def _section(self, title: str, attribute: str) -> QWidget:
+    # --- construction ------------------------------------------------------
+
+    def _build_matrix_tab(self) -> QWidget:
         wrapper = QWidget()
         layout = QVBoxLayout(wrapper)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
-        label = QLabel(title)
-        label.setStyleSheet("font-weight: 600;")
-        layout.addWidget(label)
+        layout.setContentsMargins(0, 6, 0, 0)
+        layout.setSpacing(4)
+
+        caption = QLabel(
+            "Tick to refine a term for that phase; untick to hold it at the "
+            "value shown, which you can edit. Changes apply to the next run."
+        )
+        caption.setObjectName("mutedLabel")
+        caption.setWordWrap(True)
+        layout.addWidget(caption)
+
+        self.matrix = ParameterMatrix()
+        self.matrix.changed.connect(self._store_overrides)
+        layout.addWidget(self.matrix, 1)
+
+        row = QHBoxLayout()
+        row.addStretch()
+        reset = QPushButton("Reset to defaults")
+        reset.setToolTip("Discard every hand-set value and flag on this tab.")
+        reset.clicked.connect(self._reset_overrides)
+        row.addWidget(reset)
+        layout.addLayout(row)
+        return wrapper
+
+    def _build_table_tab(self, attribute: str) -> QWidget:
+        wrapper = QWidget()
+        layout = QVBoxLayout(wrapper)
+        layout.setContentsMargins(0, 6, 0, 0)
         table = CopyableTable()
         table.horizontalHeader().setStretchLastSection(True)
         setattr(self, attribute, table)
         layout.addWidget(table)
         return wrapper
+
+    # --- state -------------------------------------------------------------
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -91,22 +116,85 @@ class RefinementDetailsDialog(QDialog):
 
     def refresh(self):
         results = self.session.lebail_results
-        if not (results and results.get("success")):
-            self.headline.setText("No refinement yet — run Le Bail to see its parameters.")
+        overrides = getattr(self.session, "phase_overrides", {}) or {}
+
+        if results and results.get("success"):
+            parts = refinement_table.summary_headline(results)
+            self.headline.setText("  ·  ".join(parts) if parts else "Refinement")
+            self.global_table.set_content(
+                ["Parameter", "Value"], refinement_table.global_rows(results)
+            )
+            names = refinement_table.phase_names(results)
+            self.phase_table.set_content(
+                ["Parameter"] + names, refinement_table.detail_rows(results)
+            )
+            values = refinement_table.phase_parameters(results, overrides)
+            quantitative = (
+                (results.get("refinement_results") or {}).get("intensity_model") == "fixed"
+            )
+        else:
+            self.headline.setText(
+                "No refinement yet — set starting values here, then run Le Bail."
+            )
             self.global_table.set_content([], [])
             self.phase_table.set_content([], [])
-            return
+            names, values = self._phases_before_first_run(overrides)
+            quantitative = True
 
-        parts = refinement_table.summary_headline(results)
-        self.headline.setText("  ·  ".join(parts) if parts else "Refinement")
+        self.matrix.set_phases(names, values, quantitative=quantitative)
+        self._update_hint(overrides)
 
-        self.global_table.set_content(
-            ["Parameter", "Value"], refinement_table.global_rows(results)
+    # Matches the refine-stage checkboxes so the grid opens showing what a run
+    # with no overrides would actually do, rather than a blank that looks like
+    # every term is held.
+    _DEFAULT_FLAGS = {
+        "refine_scale": True,
+        "refine_strain": True,
+        "refine_size": False,
+        "refine_asymmetry": False,
+        "refine_cell": True,
+        "refine_absorption": False,
+        "refine_harmonics": False,
+        "scale_factor": 1.0,
+        "microstrain": 1000.0,
+        "crystallite_size": 1.0,
+        "asymmetry": 0.0,
+        "lattice_scale": 1.0,
+        "absorption": 0.0,
+    }
+
+    def _phases_before_first_run(self, overrides):
+        """Seed the grid from the matched phases so the first run can be set up."""
+        names = []
+        for phase in self.session.selected_phases or self.session.matched_phases or []:
+            info = phase.get("phase") or phase
+            name = info.get("mineral") or info.get("mineral_name")
+            if name and name not in names:
+                names.append(name)
+        values = {}
+        for name in names:
+            entry = dict(self._DEFAULT_FLAGS)
+            entry.update(overrides.get(name) or {})
+            values[name] = entry
+        return names, values
+
+    def _store_overrides(self):
+        overrides = self.matrix.overrides()
+        self.session.phase_overrides = overrides
+        self._update_hint(overrides)
+
+    def _reset_overrides(self):
+        self.session.phase_overrides = {}
+        self.refresh()
+
+    def _update_hint(self, overrides):
+        pinned = sum(len(entry.get("_locked") or ()) for entry in overrides.values())
+        self.hint.setText(
+            f"{pinned} parameter{'' if pinned == 1 else 's'} held at a set value"
+            if pinned else ""
         )
-        names = refinement_table.phase_names(results)
-        self.phase_table.set_content(
-            ["Parameter"] + names, refinement_table.detail_rows(results)
-        )
+
+    # --- copying and export ------------------------------------------------
 
     def _blocks(self):
         return (
