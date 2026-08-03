@@ -10,6 +10,9 @@ from typing import Dict, List, Tuple, Optional
 from scipy.fft import fft, ifft
 from scipy.signal import correlate
 from utils.ima_mineral_database import get_ima_database
+from utils.conditions import is_ambient
+from utils import search_debug
+from utils.two_theta_shift import DISPLACEMENT, remove_shift
 import time
 
 class FastPatternSearchEngine:
@@ -29,6 +32,7 @@ class FastPatternSearchEngine:
         self.pattern_matrix = None
         self.mineral_metadata = None
         self.common_grid = None
+        self._row_sums = None  # cached per-phase intensity totals for screening
         
         # Performance tracking
         self.last_search_time = 0
@@ -105,7 +109,7 @@ class FastPatternSearchEngine:
         cursor.execute('''
             SELECT m.id, m.mineral_name, m.chemical_formula, m.space_group,
                    m.cell_a, m.cell_b, m.cell_c, m.cell_alpha, m.cell_beta, m.cell_gamma,
-                   m.rir,
+                   m.rir, m.pressure_gpa, m.temperature_k,
                    dp.two_theta, dp.intensities, dp.d_spacings
             FROM minerals m
             JOIN diffraction_patterns dp ON m.id = dp.mineral_id
@@ -130,8 +134,8 @@ class FastPatternSearchEngine:
         # Process each mineral
         for i, row in enumerate(rows):
             (mineral_id, mineral_name, formula, space_group, cell_a, cell_b, cell_c,
-             cell_alpha, cell_beta, cell_gamma, rir, two_theta_json, intensities_json,
-             d_spacings_json) = row
+             cell_alpha, cell_beta, cell_gamma, rir, pressure_gpa, temperature_k,
+             two_theta_json, intensities_json, d_spacings_json) = row
             
             try:
                 # Parse pattern data - handle both JSON and comma-separated formats
@@ -169,6 +173,8 @@ class FastPatternSearchEngine:
                     'cell_beta': cell_beta,
                     'cell_gamma': cell_gamma,
                     'rir': rir,
+                    'pressure_gpa': pressure_gpa,
+                    'temperature_k': temperature_k,
                     'pattern_norm': pattern_norm
                 })
                 
@@ -191,6 +197,8 @@ class FastPatternSearchEngine:
                     'cell_beta': cell_beta,
                     'cell_gamma': cell_gamma,
                     'rir': rir,
+                    'pressure_gpa': pressure_gpa,
+                    'temperature_k': temperature_k,
                     'pattern_norm': 0
                 })
         
@@ -203,6 +211,7 @@ class FastPatternSearchEngine:
         
         # Build search index flag
         self.search_index = True
+        self._row_sums = None
         
         self.index_build_time = time.time() - start_time
         print(f"✅ Search index built in {self.index_build_time:.2f}s")
@@ -217,10 +226,53 @@ class FastPatternSearchEngine:
         
         return True
     
+    def _backfill_conditions(self):
+        """Attach P/T to index metadata that predates conditions support.
+        
+        The index is cached to disk, so an index built before this feature has no
+        conditions in its metadata. Reading them from the database is far cheaper
+        than forcing users to rebuild.
+        """
+        if not self.mineral_metadata:
+            return
+        if 'pressure_gpa' in self.mineral_metadata[0]:
+            return
+        
+        conn = sqlite3.connect(self.local_db.db_path)
+        try:
+            conditions = {
+                row[0]: (row[1], row[2])
+                for row in conn.execute(
+                    'SELECT id, pressure_gpa, temperature_k FROM minerals'
+                )
+            }
+        except sqlite3.OperationalError:
+            # Columns absent: database has not been migrated yet
+            conditions = {}
+        finally:
+            conn.close()
+        
+        for meta in self.mineral_metadata:
+            pressure, temperature = conditions.get(meta.get('id'), (None, None))
+            meta['pressure_gpa'] = pressure
+            meta['temperature_k'] = temperature
+    
+    def _ambient_mask(self) -> np.ndarray:
+        """Boolean mask over the pattern matrix selecting ambient-condition entries."""
+        self._backfill_conditions()
+        return np.array(
+            [
+                is_ambient(meta.get('pressure_gpa'), meta.get('temperature_k'))
+                for meta in self.mineral_metadata
+            ],
+            dtype=bool,
+        )
+    
     def ultra_fast_correlation_search(self, experimental_pattern: Dict,
                                     min_correlation: float = 0.3,
                                     max_results: int = 50,
-                                    wavelength_convert: bool = True) -> List[Dict]:
+                                    wavelength_convert: bool = True,
+                                    ambient_only: bool = True) -> List[Dict]:
         """
         Ultra-fast correlation search using pre-computed pattern matrix
         
@@ -231,6 +283,8 @@ class FastPatternSearchEngine:
             min_correlation: Minimum correlation threshold
             max_results: Maximum results to return
             wavelength_convert: Convert wavelengths if needed
+            ambient_only: Exclude structures measured at high P/T, whose
+                compressed or expanded cells shift lines away from ambient 2θ
             
         Returns:
             List of correlation results sorted by score
@@ -272,7 +326,14 @@ class FastPatternSearchEngine:
         correlations = np.dot(self.pattern_matrix, exp_pattern)
         
         # Find results above threshold
-        valid_indices = np.where(correlations >= min_correlation)[0]
+        eligible = correlations >= min_correlation
+        if ambient_only:
+            ambient = self._ambient_mask()
+            excluded = int(np.sum(eligible & ~ambient))
+            eligible &= ambient
+            if excluded:
+                print(f"   Excluded {excluded} high P/T entries")
+        valid_indices = np.where(eligible)[0]
         
         if len(valid_indices) == 0:
             print(f"⚠️  No correlations above {min_correlation}")
@@ -303,6 +364,8 @@ class FastPatternSearchEngine:
                 'cell_beta': metadata.get('cell_beta'),
                 'cell_gamma': metadata.get('cell_gamma'),
                 'rir': metadata.get('rir'),
+                'pressure_gpa': metadata.get('pressure_gpa'),
+                'temperature_k': metadata.get('temperature_k'),
                 'correlation': float(correlation),
                 'r_squared': float(correlation ** 2),
                 'search_method': 'ultra_fast_correlation'
@@ -326,6 +389,145 @@ class FastPatternSearchEngine:
         print(f"   Top correlation: {results[0]['correlation']:.3f}" if results else "")
         
         return results
+
+    def screen_by_peak_coverage(self, peak_two_theta, weights=None,
+                                tolerance: float = 0.2, top_n: int = 400,
+                                min_coverage: float = 0.05,
+                                wavelength: Optional[float] = None,
+                                ambient_only: bool = True,
+                                shift: float = 0.0,
+                                shift_span: float = 0.0,
+                                shift_model: str = DISPLACEMENT) -> List[Dict]:
+        """
+        Screen the whole index on peak positions instead of pattern similarity.
+
+        Scores each indexed phase by the fraction of its own intensity that
+        falls on an observed peak, so a minor phase in a mixture is not buried
+        by the dominant phase the way whole-pattern correlation buries it.
+        `weights` (residual search) lets already-explained peaks count for less.
+        `ambient_only` drops structures measured at high P/T, whose shifted
+        cells would otherwise match at shifted 2θ.
+
+        `shift` pulls the observed peaks back onto the reference scale so a
+        displaced sample still screens in; `shift_span` widens the match
+        windows to cover a shift that has not been pinned down yet. Screening
+        only decides who gets scored, so a loose window here costs pool size
+        rather than accuracy.
+        """
+        from utils.fingerprint_search import line_coverage
+
+        if self.search_index is None or self.pattern_matrix is None:
+            return []
+
+        tt = np.asarray(peak_two_theta, dtype=float)
+        if len(tt) == 0:
+            return []
+
+        if shift:
+            tt = remove_shift(tt, shift, shift_model)
+        tolerance = tolerance + abs(shift_span)
+
+        # The index grid is Cu Kα1; convert experimental positions if needed
+        if wavelength and abs(wavelength - 1.5406) > 1e-4:
+            d = wavelength / (2 * np.sin(np.radians(tt / 2.0)))
+            sin_theta = 1.5406 / (2 * d)
+            valid = (sin_theta > 0) & (sin_theta < 1)
+            tt = 2 * np.degrees(np.arcsin(sin_theta[valid]))
+            if weights is not None:
+                weights = np.asarray(weights, dtype=float)[valid]
+
+        if self._row_sums is None or len(self._row_sums) != self.pattern_matrix.shape[0]:
+            self._row_sums = self.pattern_matrix.sum(axis=1)
+
+        start_time = time.time()
+        coverage = line_coverage(
+            self.pattern_matrix, self.common_grid, tt,
+            weights=weights, tolerance=tolerance, row_sums=self._row_sums,
+        )
+
+        above_floor = coverage >= min_coverage
+        eligible = above_floor.copy()
+        ambient = None
+        if ambient_only:
+            ambient = self._ambient_mask()
+            eligible &= ambient
+        candidates = np.where(eligible)[0]
+        if len(candidates) == 0:
+            print(f"⚠️  No phases with line coverage above {min_coverage}")
+            search_debug.stage(
+                f"Line-coverage screen: nothing above min coverage {min_coverage:.2f} "
+                f"(best {float(np.max(coverage)):.3f})"
+            )
+            return []
+        ranked = candidates[np.argsort(coverage[candidates])[::-1]]
+        order = ranked[:top_n]
+
+        if search_debug.enabled():
+            self._trace_screen(coverage, above_floor, ambient, ranked, order,
+                               min_coverage, top_n)
+
+        results = []
+        for idx in order:
+            metadata = self.mineral_metadata[idx]
+            results.append({
+                'mineral_id': metadata['id'],
+                'mineral_name': metadata['name'],
+                'chemical_formula': metadata['formula'],
+                'space_group': metadata['space_group'],
+                'cell_a': metadata.get('cell_a'),
+                'cell_b': metadata.get('cell_b'),
+                'cell_c': metadata.get('cell_c'),
+                'cell_alpha': metadata.get('cell_alpha'),
+                'cell_beta': metadata.get('cell_beta'),
+                'cell_gamma': metadata.get('cell_gamma'),
+                'rir': metadata.get('rir'),
+                'pressure_gpa': metadata.get('pressure_gpa'),
+                'temperature_k': metadata.get('temperature_k'),
+                'line_coverage': float(coverage[idx]),
+                'search_method': 'peak_coverage_screen',
+            })
+
+        elapsed = (time.time() - start_time) * 1000
+        print(f"🔎 Line-coverage screen: {len(results)} candidates in {elapsed:.0f}ms "
+              f"(best {coverage[order[0]]:.2f}, {len(tt)} peaks)")
+        return results
+
+    def _trace_screen(self, coverage, above_floor, ambient, ranked, order,
+                      min_coverage, top_n):
+        """Report why each indexed phase did or did not enter the pool."""
+        kept = min(len(ranked), top_n)
+        cutoff = float(coverage[ranked[kept - 1]])
+        search_debug.stage(
+            f"Line-coverage screen: {int(np.sum(above_floor))} of {len(coverage)} "
+            f"phases above min coverage {min_coverage:.2f}, pool keeps the top "
+            f"{kept} (coverage ≥ {cutoff:.3f})"
+        )
+
+        # Fate of every indexed phase, so the totals cover the whole database
+        below_floor = ~above_floor
+        non_ambient = above_floor & ~ambient if ambient is not None else None
+        search_debug.bulk("screen_coverage", int(np.sum(below_floor)))
+        if non_ambient is not None:
+            search_debug.bulk("ambient", int(np.sum(non_ambient)))
+        search_debug.bulk("pool_size", len(ranked) - kept)
+
+        in_pool = set(int(i) for i in order)
+        for i, metadata in enumerate(self.mineral_metadata):
+            name = metadata.get('name')
+            if not search_debug.watching(name) or int(i) in in_pool:
+                continue  # scoring reports the fate of everything in the pool
+            if below_floor[i]:
+                fate = "screen_coverage"
+            elif non_ambient is not None and non_ambient[i]:
+                fate = "ambient"
+            else:
+                fate = "pool_size"
+            search_debug.follow(
+                fate, name, mineral_id=metadata.get('id'),
+                coverage=float(coverage[i]),
+                pressure_gpa=metadata.get('pressure_gpa'),
+                temperature_k=metadata.get('temperature_k'),
+            )
     
     def _fast_pattern_generation(self, peak_positions: np.ndarray, 
                                peak_intensities: np.ndarray,
@@ -507,6 +709,7 @@ class FastPatternSearchEngine:
             data = np.load(file_path, allow_pickle=True)
             
             self.pattern_matrix = data['pattern_matrix']
+            self._row_sums = None
             self.common_grid = data['common_grid']
             self.mineral_metadata = data['mineral_metadata'].tolist()
             self.index_build_time = float(data['index_build_time'])
@@ -573,6 +776,7 @@ class FastPatternSearchEngine:
             
             # Restore search index data
             self.pattern_matrix = cache_data['pattern_matrix']
+            self._row_sums = None
             self.common_grid = cache_data['common_grid']
             self.mineral_metadata = cache_data['mineral_metadata']
             self.index_build_time = cache_data.get('index_build_time', 0)

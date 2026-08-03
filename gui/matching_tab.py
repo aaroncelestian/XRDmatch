@@ -16,6 +16,7 @@ from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as Navigatio
 from matplotlib.figure import Figure
 from utils.cif_parser import CIFParser
 from utils.multi_phase_analyzer import MultiPhaseAnalyzer
+from utils.two_theta_shift import DISPLACEMENT, shift_pattern
 from scipy.special import wofz
 from scipy.stats import pearsonr
 from scipy.interpolate import interp1d
@@ -32,13 +33,18 @@ class PhaseMatchingThread(QThread):
     matching_complete = pyqtSignal(list)
     progress_updated = pyqtSignal(int)
     
-    def __init__(self, experimental_peaks, reference_phases, tolerance, peak_weight=0.6, corr_weight=0.4):
+    def __init__(self, experimental_peaks, reference_phases, tolerance, peak_weight=0.6,
+                 corr_weight=0.4, shift=0.0, shift_model=DISPLACEMENT):
         super().__init__()
         self.experimental_peaks = experimental_peaks
         self.reference_phases = reference_phases
         self.tolerance = tolerance
         self.peak_weight = peak_weight
         self.corr_weight = corr_weight
+        # Sample-displacement correction; a phase carrying its own fitted value
+        # overrides this one
+        self.shift = shift
+        self.shift_model = shift_model
         
     def run(self):
         """Run phase matching in separate thread"""
@@ -75,8 +81,15 @@ class PhaseMatchingThread(QThread):
         print(f"Exp 2θ range: {np.min(exp_two_theta):.2f}° - {np.max(exp_two_theta):.2f}°")
         print(f"Tolerance: {self.tolerance}°")
         
-        # Generate theoretical pattern for this phase
+        # Generate theoretical pattern for this phase, placed where the sample
+        # displacement puts its lines rather than at nominal 2θ
         theoretical_peaks = self.generate_theoretical_pattern(phase)
+        shift = phase.get('two_theta_shift')
+        theoretical_peaks = shift_pattern(
+            theoretical_peaks,
+            self.shift if shift is None else float(shift),
+            self.shift_model,
+        )
         
         if not theoretical_peaks:
             print(f"  ⚠️  No theoretical peaks generated!")
@@ -239,8 +252,8 @@ class PhaseMatchingThread(QThread):
             
             # Check if this phase is from local database and has pre-calculated patterns
             if phase.get('local_db') and phase.get('id'):
-                from utils.local_database import LocalCIFDatabase
-                local_db = LocalCIFDatabase()
+                from utils.local_database import get_local_database
+                local_db = get_local_database()
                 
                 # Try to get pre-calculated pattern first
                 pre_calculated = local_db.get_diffraction_pattern(

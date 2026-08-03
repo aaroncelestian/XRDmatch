@@ -7,6 +7,7 @@ import os
 import sqlite3
 import json
 import numpy as np
+from collections import OrderedDict
 from typing import Dict, List, Optional, Tuple
 from pymatgen.io.cif import CifParser
 from pymatgen.core import Structure
@@ -14,8 +15,59 @@ import hashlib
 from pathlib import Path
 import re
 import signal
+import threading
 import time
 from utils.cif_parser import CIFParser
+from utils.conditions import ambient_sql_filter
+
+
+# Reference patterns are read thousands at a time during a search and again by
+# matching, quantification, and the plot. Fetching one means a database round
+# trip, parsing three lists of floats out of text, and re-placing every
+# reflection for the working wavelength — all of it identical every time, so it
+# is memoized process-wide rather than per instance: several parts of the app
+# build their own LocalCIFDatabase.
+_PATTERN_CACHE: "OrderedDict[tuple, Optional[Dict]]" = OrderedDict()
+PATTERN_CACHE_MAX = 12000
+
+
+def clear_pattern_cache() -> None:
+    """Forget every cached reference pattern; call after importing or rebuilding."""
+    _PATTERN_CACHE.clear()
+
+
+# Connections cannot be shared between threads and matching runs on a worker,
+# so each thread keeps its own read connection rather than opening one per call
+_READ_CONNECTIONS = threading.local()
+
+_DB_INSTANCES: Dict[str, "LocalCIFDatabase"] = {}
+
+
+def get_local_database(db_path: str = None) -> "LocalCIFDatabase":
+    """
+    The shared LocalCIFDatabase for a path.
+
+    Constructing one runs the schema setup and prints a banner, so building a
+    fresh instance per phase — as the matching and search views used to — is
+    pure overhead for an object that holds nothing but a path.
+    """
+    key = str(db_path) if db_path is not None else ""
+    if key not in _DB_INSTANCES:
+        _DB_INSTANCES[key] = LocalCIFDatabase(db_path)
+    return _DB_INSTANCES[key]
+
+
+def _parse_series(text) -> np.ndarray:
+    """One stored pattern column as floats, JSON list or comma-separated."""
+    if text is None:
+        return np.array([], dtype=float)
+    try:
+        return np.asarray(json.loads(text), dtype=float)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return np.array(
+            [float(x) for x in str(text).split(',') if x.strip()], dtype=float
+        )
+
 
 class LocalCIFDatabase:
     """Local database for CIF files with SQLite backend"""
@@ -99,6 +151,11 @@ class LocalCIFDatabase:
         mineral_cols = {row[1] for row in cursor.fetchall()}
         if 'rir' not in mineral_cols:
             cursor.execute('ALTER TABLE minerals ADD COLUMN rir REAL')
+        # Migrate: measurement conditions, NULL meaning "not annotated" (see utils/conditions.py)
+        if 'pressure_gpa' not in mineral_cols:
+            cursor.execute('ALTER TABLE minerals ADD COLUMN pressure_gpa REAL')
+        if 'temperature_k' not in mineral_cols:
+            cursor.execute('ALTER TABLE minerals ADD COLUMN temperature_k REAL')
         
         # Create search indices
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_mineral_name ON minerals (mineral_name)')
@@ -108,6 +165,7 @@ class LocalCIFDatabase:
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_elements ON mineral_elements (element)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_diffraction_mineral ON diffraction_patterns (mineral_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_diffraction_wavelength ON diffraction_patterns (wavelength)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_conditions ON minerals (pressure_gpa, temperature_k)')
         
         conn.commit()
         conn.close()
@@ -541,17 +599,87 @@ class LocalCIFDatabase:
         
         return added_count
     
-    def search_by_mineral_name(self, mineral_name: str, limit: int = 100) -> List[Dict]:
+    def conditions_coverage(self) -> Dict[str, int]:
+        """Count how many rows carry parsed P/T annotations."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        clause, params = ambient_sql_filter()
+        stats = {
+            'total': cursor.execute('SELECT COUNT(*) FROM minerals').fetchone()[0],
+            'with_pressure': cursor.execute(
+                'SELECT COUNT(*) FROM minerals WHERE pressure_gpa IS NOT NULL'
+            ).fetchone()[0],
+            'with_temperature': cursor.execute(
+                'SELECT COUNT(*) FROM minerals WHERE temperature_k IS NOT NULL'
+            ).fetchone()[0],
+            'ambient': cursor.execute(
+                f'SELECT COUNT(*) FROM minerals WHERE {clause}', params
+            ).fetchone()[0],
+        }
+        stats['non_ambient'] = stats['total'] - stats['ambient']
+        conn.close()
+        return stats
+
+    def populate_conditions(self, progress_callback=None) -> Dict[str, int]:
+        """Fill pressure_gpa/temperature_k from the CIF archive's title annotations.
+
+        Cheap enough to re-run at will (a few seconds for the whole archive), so
+        it simply rewrites every row rather than tracking what has been done.
+        """
+        from utils.cif_repository import get_cif_repository
+
+        repo = get_cif_repository()
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        rows = cursor.execute(
+            'SELECT id, amcsd_id FROM minerals ORDER BY id'
+        ).fetchall()
+
+        updates = []
+        missing = 0
+        for index, (mineral_id, amcsd_id) in enumerate(rows):
+            meta = repo.get_metadata(amcsd_id) if amcsd_id else None
+            if meta is None:
+                missing += 1
+                continue
+            updates.append(
+                (meta.get('pressure_gpa'), meta.get('temperature_k'), mineral_id)
+            )
+            if progress_callback and index % 500 == 0:
+                progress_callback(index, len(rows))
+
+        cursor.executemany(
+            'UPDATE minerals SET pressure_gpa = ?, temperature_k = ? WHERE id = ?',
+            updates,
+        )
+        conn.commit()
+        conn.close()
+
+        stats = self.conditions_coverage()
+        stats['updated'] = len(updates)
+        stats['no_cif'] = missing
+        return stats
+
+    def search_by_mineral_name(self, mineral_name: str, limit: int = 100,
+                               ambient_only: bool = False) -> List[Dict]:
         """Search minerals by name"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        cursor.execute('''
+        where = ['mineral_name LIKE ?']
+        params: List = [f'%{mineral_name}%']
+        if ambient_only:
+            clause, clause_params = ambient_sql_filter()
+            where.append(clause)
+            params.extend(clause_params)
+        params.append(limit)
+        
+        cursor.execute(f'''
             SELECT * FROM minerals 
-            WHERE mineral_name LIKE ? 
+            WHERE {' AND '.join(where)}
             ORDER BY mineral_name 
             LIMIT ?
-        ''', (f'%{mineral_name}%', limit))
+        ''', params)
         
         results = []
         for row in cursor.fetchall():
@@ -560,10 +688,17 @@ class LocalCIFDatabase:
         conn.close()
         return results
     
-    def search_by_elements(self, elements: List[str], exact_match: bool = False, limit: int = 100) -> List[Dict]:
+    def search_by_elements(self, elements: List[str], exact_match: bool = False, limit: int = 100,
+                           ambient_only: bool = False) -> List[Dict]:
         """Search minerals by chemical elements"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
+        
+        if ambient_only:
+            ambient_clause, ambient_params = ambient_sql_filter('m')
+            ambient_clause = f' AND {ambient_clause}'
+        else:
+            ambient_clause, ambient_params = '', []
         
         if exact_match:
             # Find minerals that contain exactly these elements
@@ -579,20 +714,20 @@ class LocalCIFDatabase:
                         SELECT mineral_id FROM mineral_elements 
                         WHERE element NOT IN ({placeholders})
                     )
-                )
+                ){ambient_clause}
                 ORDER BY m.mineral_name
                 LIMIT ?
-            ''', elements + [len(elements)] + elements + [limit])
+            ''', elements + [len(elements)] + elements + ambient_params + [limit])
         else:
             # Find minerals that contain any of these elements
             placeholders = ','.join(['?' for _ in elements])
             cursor.execute(f'''
                 SELECT DISTINCT m.* FROM minerals m
                 JOIN mineral_elements me ON m.id = me.mineral_id
-                WHERE me.element IN ({placeholders})
+                WHERE me.element IN ({placeholders}){ambient_clause}
                 ORDER BY m.mineral_name
                 LIMIT ?
-            ''', elements + [limit])
+            ''', elements + ambient_params + [limit])
         
         results = []
         for row in cursor.fetchall():
@@ -601,17 +736,26 @@ class LocalCIFDatabase:
         conn.close()
         return results
     
-    def search_by_formula(self, formula: str, limit: int = 100) -> List[Dict]:
+    def search_by_formula(self, formula: str, limit: int = 100,
+                          ambient_only: bool = False) -> List[Dict]:
         """Search minerals by chemical formula"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        cursor.execute('''
+        where = ['chemical_formula LIKE ?']
+        params: List = [f'%{formula}%']
+        if ambient_only:
+            clause, clause_params = ambient_sql_filter()
+            where.append(clause)
+            params.extend(clause_params)
+        params.append(limit)
+        
+        cursor.execute(f'''
             SELECT * FROM minerals 
-            WHERE chemical_formula LIKE ? 
+            WHERE {' AND '.join(where)}
             ORDER BY mineral_name 
             LIMIT ?
-        ''', (f'%{formula}%', limit))
+        ''', params)
         
         results = []
         for row in cursor.fetchall():
@@ -636,6 +780,30 @@ class LocalCIFDatabase:
         conn.close()
         return None
     
+    def get_mineral_by_amcsd_id(self, amcsd_id) -> Optional[Dict]:
+        """
+        Get mineral by AMCSD id, the identifier that survives a rebuild.
+
+        The stored codes are zero-padded to seven characters, so a bare number
+        has to be padded before it will match.
+        """
+        from utils.cif_repository import normalize_amcsd_id
+
+        padded = normalize_amcsd_id(amcsd_id)
+        if not padded:
+            return None
+
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            'SELECT * FROM minerals WHERE amcsd_id = ? OR amcsd_id = ? LIMIT 1',
+            (padded, padded.lstrip('0') or '0'),
+        )
+        row = cursor.fetchone()
+        result = self._row_to_dict(cursor, row) if row else None
+        conn.close()
+        return result
+
     def bulk_import_amcsd_dif(self, dif_file_path: str, progress_callback=None) -> int:
         """
         Import entire AMCSD bulk DIF file with all minerals
@@ -841,6 +1009,7 @@ class LocalCIFDatabase:
             
             conn.commit()
             conn.close()
+            clear_pattern_cache()
             return 1  # Successfully imported
             
         except Exception as e:
@@ -848,16 +1017,48 @@ class LocalCIFDatabase:
                 conn.close()
             return -1  # Error
 
+    def _iter_dif_blocks(self, path: str) -> list:
+        """
+        Mineral blocks from a bulk DIF file, a zip archive, or a directory.
+
+        AMCSD ships both a single separator-delimited bulk file and archives of
+        one file per mineral, so accept whichever the user has on disk.
+        """
+        if os.path.isdir(path):
+            blocks = []
+            for name in sorted(os.listdir(path)):
+                if not name.lower().endswith(('.dif', '.txt')):
+                    continue
+                with open(os.path.join(path, name), 'r', encoding='utf-8', errors='ignore') as f:
+                    blocks.append(f.read())
+            return blocks
+
+        if path.lower().endswith('.zip'):
+            import zipfile
+            blocks = []
+            with zipfile.ZipFile(path) as archive:
+                for name in archive.namelist():
+                    if name.endswith('/'):
+                        continue
+                    if not name.lower().endswith(('.dif', '.txt')):
+                        continue
+                    blocks.append(archive.read(name).decode('utf-8', 'ignore'))
+            return blocks
+
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+        return self._split_amcsd_dif_blocks(content)
+
     def update_rir_from_dif(self, dif_file_path: str, progress_callback=None) -> Dict[str, int]:
         """
-        Update RIR (and density) on existing minerals from an AMCSD bulk DIF file
+        Update RIR (and density) on existing minerals from AMCSD DIF data
         without re-importing diffraction patterns.
+
+        Accepts a bulk DIF file, a zip archive, or a directory of DIF files.
         """
         stats = {'updated': 0, 'missing': 0, 'no_rir': 0, 'errors': 0}
         try:
-            with open(dif_file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                content = f.read()
-            blocks = self._split_amcsd_dif_blocks(content)
+            blocks = self._iter_dif_blocks(dif_file_path)
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
 
@@ -1038,6 +1239,7 @@ class LocalCIFDatabase:
             
             conn.commit()
             conn.close()
+            clear_pattern_cache()
             
             print(f"✅ Successfully imported DIF pattern for {dif_data['mineral_name']} ({len(dif_data['two_theta'])} peaks)")
             return 1
@@ -1545,6 +1747,7 @@ class LocalCIFDatabase:
             
             conn.commit()
             conn.close()
+            clear_pattern_cache()
             
             print(f"✅ Calculated and stored diffraction pattern for {mineral_name} ({len(pattern['two_theta'])} peaks)")
             return True
@@ -1559,131 +1762,157 @@ class LocalCIFDatabase:
                               max_two_theta: float = 90.0, min_d_spacing: float = 0.5) -> Optional[Dict]:
         """
         Retrieve pre-calculated diffraction pattern from database and convert to target wavelength
-        
+
+        The stored patterns are at whatever Cu Kα the source used — AMCSD DIF
+        files give 1.541838 — so a scan collected at Cu Kα1 needs every
+        reflection re-placed through Bragg's law. That is real work: the
+        correction runs from about 0.01° at low angle to nearly 0.09° at back
+        reflection, a sizeable fraction of a typical match tolerance. It is
+        also the same work for every caller asking about the same mineral, so
+        the answer is memoized process-wide.
+
         Args:
             mineral_id: Database ID of the mineral
             wavelength: Target X-ray wavelength in Angstroms
             max_two_theta: Maximum 2θ angle (not used for retrieval, kept for compatibility)
             min_d_spacing: Minimum d-spacing (not used for retrieval, kept for compatibility)
-            
+
         Returns:
             Dictionary with 'two_theta', 'intensity', 'd_spacing' arrays and unit cell parameters or None
         """
         try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            # First get mineral metadata including unit cell parameters
-            cursor.execute('''
-                SELECT mineral_name, chemical_formula, space_group,
-                       cell_a, cell_b, cell_c, cell_alpha, cell_beta, cell_gamma, rir
-                FROM minerals
-                WHERE id = ?
-            ''', (mineral_id,))
-            
-            mineral_data = cursor.fetchone()
-            if not mineral_data:
+            key = (self.db_path, int(mineral_id), round(float(wavelength), 6))
+        except (TypeError, ValueError):
+            return None
+
+        if key in _PATTERN_CACHE:
+            _PATTERN_CACHE.move_to_end(key)
+            cached = _PATTERN_CACHE[key]
+            # A shallow copy: callers routinely add keys to what they get back,
+            # and the arrays themselves are only ever replaced, never written into
+            return dict(cached) if cached is not None else None
+
+        pattern = self._read_diffraction_pattern(int(mineral_id), float(wavelength))
+        _PATTERN_CACHE[key] = pattern
+        while len(_PATTERN_CACHE) > PATTERN_CACHE_MAX:
+            _PATTERN_CACHE.popitem(last=False)
+        return dict(pattern) if pattern is not None else None
+
+    def _read_connection(self) -> sqlite3.Connection:
+        """
+        This thread's long-lived read connection.
+
+        Opening a connection and running the first query on it costs several
+        times the query itself, which is most of the time in a bulk read of
+        reference patterns. Only ever used for SELECTs, so it holds no lock
+        between calls and does not block the writing paths.
+        """
+        pool = getattr(_READ_CONNECTIONS, 'pool', None)
+        if pool is None:
+            pool = _READ_CONNECTIONS.pool = {}
+        if self.db_path not in pool:
+            pool[self.db_path] = sqlite3.connect(self.db_path)
+        return pool[self.db_path]
+
+    def _drop_read_connection(self) -> None:
+        """Discard this thread's read connection so the next read reopens."""
+        pool = getattr(_READ_CONNECTIONS, 'pool', None) or {}
+        conn = pool.pop(self.db_path, None)
+        if conn is not None:
+            try:
                 conn.close()
-                return None
-            
-            (mineral_name, formula, space_group, cell_a, cell_b, cell_c,
-             cell_alpha, cell_beta, cell_gamma, rir) = mineral_data
-            
-            # Look for Cu Kα pattern (our reference wavelength)
-            # Try both common Cu Kα wavelengths and prefer AMCSD_DIF over other calculation methods
-            # First try exact match for 1.541838 (AMCSD standard), then 1.5406 (Cu Kα1)
+            except Exception:
+                pass
+
+    def _read_diffraction_pattern(self, mineral_id: int, wavelength: float) -> Optional[Dict]:
+        """One pattern straight from the database, uncached."""
+        try:
+            cursor = self._read_connection().cursor()
+
+            # Prefer AMCSD_DIF over other calculation methods, and take the
+            # mineral metadata in the same round trip
             cursor.execute('''
-                SELECT two_theta, intensities, d_spacings, wavelength FROM diffraction_patterns
-                WHERE mineral_id = ? AND (wavelength BETWEEN 1.5400 AND 1.5420)
+                SELECT m.mineral_name, m.chemical_formula, m.space_group,
+                       m.cell_a, m.cell_b, m.cell_c,
+                       m.cell_alpha, m.cell_beta, m.cell_gamma, m.rir,
+                       dp.two_theta, dp.intensities, dp.d_spacings, dp.wavelength
+                FROM minerals m
+                JOIN diffraction_patterns dp ON dp.mineral_id = m.id
+                WHERE m.id = ? AND (dp.wavelength BETWEEN 1.5400 AND 1.5420)
                 ORDER BY 
-                    CASE calculation_method 
+                    CASE dp.calculation_method 
                         WHEN 'AMCSD_DIF' THEN 1
                         WHEN 'pymatgen' THEN 2
                         ELSE 3
                     END,
-                    wavelength DESC,
-                    COALESCE(max_two_theta, 90.0) DESC, 
-                    COALESCE(min_d_spacing, 0.5) ASC
+                    dp.wavelength DESC,
+                    COALESCE(dp.max_two_theta, 90.0) DESC, 
+                    COALESCE(dp.min_d_spacing, 0.5) ASC
                 LIMIT 1
             ''', (mineral_id,))
-            
+
             result = cursor.fetchone()
-            conn.close()
-            
-            if result:
-                two_theta_json, intensities_json, d_spacings_json, reference_wavelength = result
-                
-                # Load the reference data - handle both JSON and comma-separated formats
-                try:
-                    ref_two_theta = np.array(json.loads(two_theta_json))
-                    intensities = np.array(json.loads(intensities_json))
-                    d_spacings = np.array(json.loads(d_spacings_json))
-                except (json.JSONDecodeError, ValueError):
-                    # Fallback to comma-separated format
-                    ref_two_theta = np.array([float(x) for x in two_theta_json.split(',')])
-                    intensities = np.array([float(x) for x in intensities_json.split(',')])
-                    d_spacings = np.array([float(x) for x in d_spacings_json.split(',')])
-                
-                # Convert to target wavelength using Bragg's law if needed
-                if abs(wavelength - reference_wavelength) > 1e-6:  # Different wavelength
-                    # Calculate new 2θ values: λ = 2d sin(θ) → θ = arcsin(λ / 2d)
-                    new_two_theta = []
-                    valid_intensities = []
-                    valid_d_spacings = []
-                    
-                    for d, intensity in zip(d_spacings, intensities):
-                        if d > 0:
-                            sin_theta = wavelength / (2 * d)
-                            if sin_theta <= 1.0:  # Valid reflection
-                                theta_rad = np.arcsin(sin_theta)
-                                two_theta_deg = 2 * np.degrees(theta_rad)
-                                
-                                # Apply reasonable 2θ limits based on wavelength
-                                min_2theta = 1.0 if wavelength < 1.0 else 5.0
-                                max_2theta_limit = 90.0 if wavelength > 1.0 else 60.0
-                                
-                                if min_2theta <= two_theta_deg <= max_2theta_limit:
-                                    new_two_theta.append(two_theta_deg)
-                                    valid_intensities.append(intensity)
-                                    valid_d_spacings.append(d)
-                    
-                    print(f"Converted pattern from λ={reference_wavelength:.4f}Å to λ={wavelength:.4f}Å: {len(valid_d_spacings)} peaks")
-                    
-                    return {
-                        'two_theta': np.array(new_two_theta),
-                        'intensity': np.array(valid_intensities),
-                        'd_spacing': np.array(valid_d_spacings),
-                        'mineral_name': mineral_name,
-                        'chemical_formula': formula,
-                        'space_group': space_group,
-                        'cell_a': cell_a,
-                        'cell_b': cell_b,
-                        'cell_c': cell_c,
-                        'cell_alpha': cell_alpha,
-                        'cell_beta': cell_beta,
-                        'cell_gamma': cell_gamma,
-                        'rir': rir
-                    }
-                else:
-                    # Same wavelength, return as-is
-                    return {
-                        'two_theta': ref_two_theta,
-                        'intensity': intensities,
-                        'd_spacing': d_spacings,
-                        'mineral_name': mineral_name,
-                        'chemical_formula': formula,
-                        'space_group': space_group,
-                        'cell_a': cell_a,
-                        'cell_b': cell_b,
-                        'cell_c': cell_c,
-                        'cell_alpha': cell_alpha,
-                        'cell_beta': cell_beta,
-                        'cell_gamma': cell_gamma,
-                        'rir': rir
-                    }
-            
+
+            if not result:
+                return None
+
+            (mineral_name, formula, space_group, cell_a, cell_b, cell_c,
+             cell_alpha, cell_beta, cell_gamma, rir,
+             two_theta_text, intensities_text, d_spacings_text,
+             reference_wavelength) = result
+
+            ref_two_theta = _parse_series(two_theta_text)
+            intensities = _parse_series(intensities_text)
+            d_spacings = _parse_series(d_spacings_text)
+
+            info = {
+                'mineral_name': mineral_name,
+                'chemical_formula': formula,
+                'space_group': space_group,
+                'cell_a': cell_a,
+                'cell_b': cell_b,
+                'cell_c': cell_c,
+                'cell_alpha': cell_alpha,
+                'cell_beta': cell_beta,
+                'cell_gamma': cell_gamma,
+                'rir': rir,
+                'reference_wavelength': reference_wavelength,
+            }
+
+            if abs(wavelength - reference_wavelength) <= 1e-6:
+                info.update({
+                    'two_theta': ref_two_theta,
+                    'intensity': intensities,
+                    'd_spacing': d_spacings,
+                })
+                return info
+
+            # λ = 2d sin θ, so a new wavelength moves every line; reflections
+            # it cannot reach at all are dropped from all three arrays together
+            n = min(len(d_spacings), len(intensities))
+            d = d_spacings[:n]
+            with np.errstate(divide='ignore', invalid='ignore'):
+                sin_theta = np.where(d > 0, wavelength / (2.0 * d), np.nan)
+            sin_theta = np.where(sin_theta <= 1.0, sin_theta, np.nan)
+            converted = 2.0 * np.degrees(np.arcsin(sin_theta))
+
+            lo = 1.0 if wavelength < 1.0 else 5.0
+            hi = 90.0 if wavelength > 1.0 else 60.0
+            keep = np.isfinite(converted) & (converted >= lo) & (converted <= hi)
+
+            info.update({
+                'two_theta': converted[keep],
+                'intensity': intensities[:n][keep],
+                'd_spacing': d[keep],
+            })
+            return info
+
+        except sqlite3.Error as e:
+            # The kept-open connection may be the thing that broke; the next
+            # read opens a fresh one rather than failing for the rest of the run
+            self._drop_read_connection()
+            print(f"Error retrieving diffraction pattern: {e}")
             return None
-            
         except Exception as e:
             print(f"Error retrieving diffraction pattern: {e}")
             return None
@@ -2077,6 +2306,7 @@ class LocalCIFDatabase:
             removed_count = cursor.rowcount
             conn.commit()
             conn.close()
+            clear_pattern_cache()
             
             print(f"✅ Successfully removed {removed_count} non-Cu Kα patterns")
             print(f"💡 Database now optimized for Cu Kα reference wavelength only")

@@ -10,6 +10,7 @@ from PyQt5.QtCore import pyqtSignal
 import json
 import os
 
+from . import display_settings
 from .theme import get_current_mode, LIGHT, DARK
 
 
@@ -22,7 +23,10 @@ class SettingsTab(QWidget):
     def __init__(self):
         super().__init__()
         self.settings = self.load_default_settings()
+        # Display prefs live in QSettings so open plots can follow them
+        self.settings['display'].update(display_settings.current())
         self._syncing_theme = False
+        self._syncing_display = False
         self.init_ui()
 
     def init_ui(self):
@@ -285,37 +289,59 @@ class SettingsTab(QWidget):
         plot_layout = QFormLayout(plot_group)
 
         self.plot_dpi = QSpinBox()
-        self.plot_dpi.setRange(50, 300)
+        self.plot_dpi.setRange(72, 600)
         self.plot_dpi.setValue(self.settings['display']['plot_dpi'])
-        plot_layout.addRow("Plot DPI:", self.plot_dpi)
+        self.plot_dpi.valueChanged.connect(self._push_display_settings)
+        plot_layout.addRow("Export DPI:", self.plot_dpi)
 
         self.line_width = QDoubleSpinBox()
         self.line_width.setRange(0.5, 5.0)
         self.line_width.setDecimals(1)
         self.line_width.setValue(self.settings['display']['line_width'])
+        self.line_width.valueChanged.connect(self._push_display_settings)
         plot_layout.addRow("Line Width:", self.line_width)
 
         self.marker_size = QSpinBox()
         self.marker_size.setRange(2, 20)
         self.marker_size.setValue(self.settings['display']['marker_size'])
+        self.marker_size.valueChanged.connect(self._push_display_settings)
         plot_layout.addRow("Marker Size:", self.marker_size)
 
         self.show_grid = QCheckBox("Show grid")
         self.show_grid.setChecked(self.settings['display']['show_grid'])
+        self.show_grid.toggled.connect(self._push_display_settings)
         plot_layout.addRow(self.show_grid)
 
         self.show_legend = QCheckBox("Show legend")
         self.show_legend.setChecked(self.settings['display']['show_legend'])
+        self.show_legend.toggled.connect(self._push_display_settings)
         plot_layout.addRow(self.show_legend)
 
         self.show_error_bars = QCheckBox("Show error bars (XYE files)")
         self.show_error_bars.setChecked(self.settings['display']['show_error_bars'])
+        self.show_error_bars.toggled.connect(self._push_display_settings)
         plot_layout.addRow(self.show_error_bars)
 
         layout.addWidget(plot_group)
         layout.addStretch()
 
         self.tab_widget.addTab(tab, "Display")
+
+    def _display_from_ui(self) -> dict:
+        return {
+            'plot_dpi': self.plot_dpi.value(),
+            'line_width': self.line_width.value(),
+            'marker_size': self.marker_size.value(),
+            'show_grid': self.show_grid.isChecked(),
+            'show_legend': self.show_legend.isChecked(),
+            'show_error_bars': self.show_error_bars.isChecked(),
+        }
+
+    def _push_display_settings(self):
+        """Apply plot preferences as they are edited — no Save step needed."""
+        if self._syncing_display:
+            return
+        display_settings.update(self._display_from_ui())
 
     def _on_theme_combo_changed(self, text: str):
         if self._syncing_theme:
@@ -359,15 +385,7 @@ class SettingsTab(QWidget):
                 'peak_prominence': 1.0,
                 'peak_distance': 5
             },
-            'display': {
-                'plot_dpi': 100,
-                'line_width': 1.0,
-                'marker_size': 6,
-                'color_scheme': 'Light',
-                'show_grid': True,
-                'show_legend': True,
-                'show_error_bars': True
-            }
+            'display': dict(display_settings.DEFAULTS, color_scheme='Light')
         }
         
     def browse_data_dir(self):
@@ -414,15 +432,10 @@ class SettingsTab(QWidget):
                 'peak_prominence': self.peak_prominence.value(),
                 'peak_distance': self.peak_distance.value()
             },
-            'display': {
-                'plot_dpi': self.plot_dpi.value(),
-                'line_width': self.line_width.value(),
-                'marker_size': self.marker_size.value(),
-                'color_scheme': self.color_scheme.currentText(),
-                'show_grid': self.show_grid.isChecked(),
-                'show_legend': self.show_legend.isChecked(),
-                'show_error_bars': self.show_error_bars.isChecked()
-            }
+            'display': dict(
+                self._display_from_ui(),
+                color_scheme=self.color_scheme.currentText(),
+            )
         }
         
     def save_settings(self):
@@ -493,18 +506,27 @@ class SettingsTab(QWidget):
         self.peak_prominence.setValue(matching.get('peak_prominence', 1.0))
         self.peak_distance.setValue(matching.get('peak_distance', 5))
         
-        # Display settings
+        # Display settings — set the widgets quietly, then push once
         display = settings.get('display', {})
-        self.plot_dpi.setValue(display.get('plot_dpi', 100))
-        self.line_width.setValue(display.get('line_width', 1.0))
-        self.marker_size.setValue(display.get('marker_size', 6))
+        defaults = display_settings.DEFAULTS
+        self._syncing_display = True
+        try:
+            self.plot_dpi.setValue(display.get('plot_dpi', defaults['plot_dpi']))
+            self.line_width.setValue(display.get('line_width', defaults['line_width']))
+            self.marker_size.setValue(display.get('marker_size', defaults['marker_size']))
+            self.show_grid.setChecked(display.get('show_grid', defaults['show_grid']))
+            self.show_legend.setChecked(display.get('show_legend', defaults['show_legend']))
+            self.show_error_bars.setChecked(
+                display.get('show_error_bars', defaults['show_error_bars'])
+            )
+        finally:
+            self._syncing_display = False
+        self._push_display_settings()
+
         scheme = display.get('color_scheme', 'Light')
         if scheme not in ('Light', 'Dark'):
             scheme = 'Dark' if str(scheme).lower() == 'dark' else 'Light'
         self.sync_theme_combo(DARK if scheme == 'Dark' else LIGHT)
-        self.show_grid.setChecked(display.get('show_grid', True))
-        self.show_legend.setChecked(display.get('show_legend', True))
-        self.show_error_bars.setChecked(display.get('show_error_bars', True))
 
     def reset_to_defaults(self):
         """Reset all settings to defaults"""

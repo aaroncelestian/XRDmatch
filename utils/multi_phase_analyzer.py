@@ -30,13 +30,19 @@ class MultiPhaseAnalyzer:
                                           residual_threshold: float = 0.05,
                                           fast_search_engine=None,
                                           residual_research: bool = True,
-                                          polish: bool = True) -> Dict:
+                                          polish: bool = True,
+                                          min_proposal_score: float = 0.1,
+                                          min_proposal_correlation: float = 0.05) -> Dict:
         """
         Multi-phase ID using trial joint Le Bail for accept/reject.
 
         Residual correlation is used only to propose the next candidate.
         A candidate is accepted only if trial joint refinement improves Rwp
         enough and the phase scale is significant. Optional final polish refine.
+
+        The proposal score scales with a phase's share of the residue, so minor
+        phases score low; drop `min_proposal_score` to zero when the caller has
+        already vetted the candidates and wants every one trialled.
         """
         exp_two_theta = np.asarray(experimental_data['two_theta'], dtype=float)
         exp_intensity = np.asarray(experimental_data['intensity'], dtype=float)
@@ -83,9 +89,10 @@ class MultiPhaseAnalyzer:
 
             proposal, score, _ = self._find_best_phase_for_residue(
                 exp_two_theta, current_residue, remaining, wavelength,
-                excluded_names=excluded_names
+                excluded_names=excluded_names,
+                min_correlation=min_proposal_correlation,
             )
-            if proposal is None or score < 0.1:
+            if proposal is None or score < min_proposal_score:
                 print(f"No suitable proposal (score={score:.3f}); stopping")
                 break
 
@@ -229,7 +236,8 @@ class MultiPhaseAnalyzer:
             engine.set_experimental_data(
                 np.asarray(experimental_data['two_theta'], dtype=float),
                 np.asarray(experimental_data['intensity'], dtype=float),
-                two_theta_range=experimental_data.get('two_theta_range')
+                two_theta_range=experimental_data.get('two_theta_range'),
+                wavelength=experimental_data.get('wavelength'),
             )
             for phase in phase_list:
                 phase_payload = {
@@ -242,10 +250,10 @@ class MultiPhaseAnalyzer:
                     'refine_cell': mode == 'polish',
                     'refine_profile': mode == 'polish',
                     'refine_scale': True,
+                    'refine_strain': mode == 'polish',
                     'u_param': 0.01,
                     'v_param': -0.001,
                     'w_param': 0.015,
-                    'eta_param': 0.5,
                 }
                 engine.add_phase(phase_payload, init)
 
@@ -498,7 +506,8 @@ class MultiPhaseAnalyzer:
                                    current_residue: np.ndarray,
                                    candidate_phases: List[Dict],
                                    wavelength: float,
-                                   excluded_names: Optional[set] = None) -> Tuple[Optional[Dict], float, float]:
+                                   excluded_names: Optional[set] = None,
+                                   min_correlation: float = 0.05) -> Tuple[Optional[Dict], float, float]:
         """
         Find the phase that best explains the current residue.
         Score is residual-weighted: correlation × fraction of residue intensity explained.
@@ -528,7 +537,7 @@ class MultiPhaseAnalyzer:
             correlation, optimal_scaling = self._calculate_residue_correlation(
                 exp_two_theta, current_residue, theoretical_pattern
             )
-            if correlation < 0.05:
+            if correlation < min_correlation:
                 continue
 
             # How much residual intensity would this phase remove (non-negative clamp)
@@ -771,7 +780,10 @@ class MultiPhaseAnalyzer:
                                   max_iterations: int = 15,
                                   convergence_threshold: float = 1e-4,
                                   two_theta_range: Optional[Tuple[float, float]] = None,
-                                  refinement_params: Optional[Dict] = None) -> Dict:
+                                  refinement_params: Optional[Dict] = None,
+                                  progress_callback=None,
+                                  log_callback=None,
+                                  cancel_check=None) -> Dict:
         """
         Perform Le Bail refinement on identified phases
         
@@ -791,7 +803,11 @@ class MultiPhaseAnalyzer:
         try:
             # Initialize Le Bail engine
             self.lebail_engine = LeBailRefinement()
-            
+            self.lebail_engine.progress_callback = progress_callback
+            self.lebail_engine.log_callback = log_callback
+            self.lebail_engine.cancel_check = cancel_check
+
+
             # Set experimental data
             errors = experimental_data.get('errors')
             if errors is None:
@@ -803,51 +819,106 @@ class MultiPhaseAnalyzer:
             self.lebail_engine.set_experimental_data(
                 experimental_data['two_theta'],
                 experimental_data['intensity'],
-                errors
+                errors,
+                wavelength=experimental_data.get('wavelength'),
             )
             
+            params = refinement_params or {}
+            # Values a previous refinement arrived at, keyed by phase name. A
+            # parameter whose refine flag has since been turned off is then held
+            # at the value it reached rather than snapping back to a default,
+            # which is what makes it possible to refine in stages: free a term,
+            # let it settle, fix it, and move on to the next.
+            carried = params.get('carry_over') or {}
+
+            # Per-phase overrides, keyed by mineral name. Everything below is a
+            # default that an entry here replaces, so one phase can refine a
+            # term its neighbour holds fixed -- chlorite needs its asymmetry
+            # free while the quartz beside it does not.
+            overrides = params.get('phase_overrides') or {}
+
             # Add identified phases to refinement
             for phase_result in identified_phases:
                 phase_data = {
                     'phase': phase_result['phase'],
                     'theoretical_peaks': phase_result['theoretical_peaks']
                 }
-                
-                # Set initial parameters based on sequential analysis results
-                # Use user-provided parameters if available, otherwise use defaults
-                if refinement_params:
-                    u_param = refinement_params.get('initial_u', 0.005)
-                    v_param = refinement_params.get('initial_v', 0.0)
-                    w_param = refinement_params.get('initial_w', 0.005)
-                    eta_param = refinement_params.get('initial_eta', 0.5)
-                    refine_cell = refinement_params.get('refine_cell', True)
-                    refine_profile = refinement_params.get('refine_profile', True)
-                    refine_intensities = refinement_params.get('refine_intensities', False)
-                else:
-                    u_param = 0.005
-                    v_param = 0.0
-                    w_param = 0.005
-                    eta_param = 0.5
-                    refine_cell = True
-                    refine_profile = True
-                    refine_intensities = False
-                
+
+                info = phase_result.get('phase') or {}
+                name = info.get('mineral') or info.get('mineral_name') or ''
+                previous = carried.get(name) or {}
+
+                def carry(key, fallback):
+                    value = previous.get(key)
+                    return fallback if value is None else value
+
+                # Instrument widths seed the global profile; the last phase to
+                # pass them wins, which is harmless because every caller hands
+                # the same values to every phase.
                 initial_params = {
-                    'scale_factor': phase_result.get('optimized_scaling', 1.0),
-                    'u_param': u_param,
-                    'v_param': v_param,
-                    'w_param': w_param,
-                    'eta_param': eta_param,
+                    'scale_factor': carry(
+                        'scale_factor', phase_result.get('optimized_scaling', 1.0)
+                    ),
+                    'u_param': params.get('initial_u', 0.005),
+                    'v_param': params.get('initial_v', 0.0),
+                    'w_param': params.get('initial_w', 0.005),
+                    'crystallite_size': carry(
+                        'crystallite_size', params.get('crystallite_size', 1.0)
+                    ),
+                    'microstrain': carry(
+                        'microstrain', params.get('microstrain', 1000.0)
+                    ),
+                    'asymmetry': carry('asymmetry', 0.0),
+                    'lattice_scale': carry('lattice_scale', 1.0),
+                    'absorption': carry('absorption', 0.0),
+                    'harmonic_coeffs': carry('harmonic_coeffs', []),
                     'zero_shift': 0.0,
-                    'refine_cell': refine_cell,
-                    'refine_profile': refine_profile,
+                    'refine_cell': params.get('refine_cell', True),
+                    'refine_profile': params.get('refine_profile', True),
+                    'refine_size': params.get('refine_size', False),
+                    'refine_strain': params.get('refine_strain', True),
+                    'refine_asymmetry': params.get('refine_asymmetry', False),
                     'refine_scale': True,
-                    'refine_intensities': refine_intensities,
-                    'max_scale_bound': refinement_params.get('max_scale', 10.0) if refinement_params else 10.0
+                    'refine_intensities': params.get('refine_intensities', False),
+                    'refine_absorption': params.get('refine_absorption', False),
+                    'refine_harmonics': params.get('refine_harmonics', False),
+                    'harmonic_order': params.get('harmonic_order', 0),
+                    'max_scale_bound': params.get('max_scale', 10.0)
                 }
-                
+
+                override = overrides.get(name) or {}
+                initial_params.update(override)
+                # A pinned parameter must not also be refined, whatever flag
+                # arrived with it; the lock is what the user actually asked for.
+                for locked in initial_params.get('_locked') or ():
+                    initial_params[f'refine_{locked}'] = False
+
                 self.lebail_engine.add_phase(phase_data, initial_params)
-                
+
+            settings = refinement_params or {}
+            # Callers that want quantification ask for 'fixed' explicitly; the
+            # older tabs keep the classic extraction behaviour
+            self.lebail_engine.intensity_model = settings.get('intensity_model', 'extract')
+            self.lebail_engine.fit_peak_regions_only = bool(
+                settings.get('fit_peak_regions_only', False)
+            )
+
+            globals_ = {
+                'refine_zero_shift': settings.get('refine_zero_shift', True),
+                'refine_displacement': settings.get('refine_displacement', False),
+                'refine_instrument_profile': settings.get('refine_instrument_profile', False),
+                'refine_axial_asymmetry': settings.get('refine_axial_asymmetry', False),
+            }
+            # Starting values carried over from a previous run. This has to come
+            # after add_phase, which seeds the instrument widths from the
+            # per-phase initial_u/v/w.
+            for key in ('zero_shift', 'displacement', 'u_param', 'v_param', 'w_param',
+                        'axial_asymmetry'):
+                value = (settings.get('carry_globals') or {}).get(key)
+                if value is not None:
+                    globals_[key] = float(value)
+            self.lebail_engine.set_global_parameters(**globals_)
+
             # Perform refinement (reduced iterations for performance)
             refinement_results = self.lebail_engine.refine_phases(
                 max_iterations=max_iterations,
@@ -877,6 +948,7 @@ class MultiPhaseAnalyzer:
             
             return {
                 'success': True,
+                'cancelled': bool(refinement_results.get('cancelled')),
                 'refinement_results': refinement_results,
                 'refinement_report': refinement_report,
                 'refined_phases': refined_phases,

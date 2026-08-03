@@ -12,7 +12,52 @@ from scipy.stats import pearsonr
 from scipy.interpolate import interp1d
 from utils.local_database import LocalCIFDatabase
 from utils.ima_mineral_database import get_ima_database
+from utils.conditions import ambient_sql_filter
 import time
+
+
+# Reference patterns are stored at whatever Cu Kα the source used: AMCSD DIF
+# files give 1.541838, other calculators give 1.5406. Asking for one exact
+# value silently selects nothing, so accept the whole Cu Kα window and convert
+# from the wavelength each row was actually calculated at.
+CU_KALPHA_MIN = 1.5400
+CU_KALPHA_MAX = 1.5420
+
+def parse_series(text) -> np.ndarray:
+    """
+    One stored pattern column as floats.
+
+    Older rows hold a JSON list and the AMCSD import writes a comma-separated
+    string, sometimes with a trailing separator, so both have to be accepted.
+    """
+    if text is None:
+        return np.array([], dtype=float)
+    if isinstance(text, (list, tuple, np.ndarray)):
+        return np.asarray(text, dtype=float)
+    try:
+        return np.asarray(json.loads(text), dtype=float)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return np.array(
+            [float(x) for x in str(text).split(',') if x.strip()], dtype=float
+        )
+
+
+REFERENCE_PATTERN_SQL = '''
+    SELECT m.id, m.mineral_name, m.chemical_formula, m.space_group,
+           m.cell_a, m.cell_b, m.cell_c, m.cell_alpha, m.cell_beta, m.cell_gamma,
+           dp.two_theta, dp.intensities, dp.d_spacings, dp.wavelength
+    FROM minerals m
+    JOIN diffraction_patterns dp ON m.id = dp.mineral_id
+    WHERE dp.wavelength BETWEEN ? AND ?
+    {ambient_clause}
+    ORDER BY m.id,
+             CASE dp.calculation_method
+                 WHEN 'AMCSD_DIF' THEN 1
+                 WHEN 'pymatgen' THEN 2
+                 ELSE 3
+             END
+'''
+
 
 class PatternSearchEngine:
     """
@@ -24,12 +69,60 @@ class PatternSearchEngine:
         """Initialize the pattern search engine"""
         self.local_db = LocalCIFDatabase(db_path)
         self.ima_db = get_ima_database()
+
+    def _iter_reference_patterns(self, cursor, ambient_only: bool):
+        """
+        One Cu Kα reference pattern per mineral, best calculation method first.
+
+        Yields the raw rows of REFERENCE_PATTERN_SQL, skipping a mineral once
+        it has been seen so a database holding several Cu Kα patterns for the
+        same phase cannot enter it into the results twice.
+        """
+        ambient_clause, ambient_params = '', []
+        if ambient_only:
+            clause, ambient_params = ambient_sql_filter('m')
+            ambient_clause = f'AND {clause}'
+
+        cursor.execute(
+            REFERENCE_PATTERN_SQL.format(ambient_clause=ambient_clause),
+            [CU_KALPHA_MIN, CU_KALPHA_MAX] + list(ambient_params),
+        )
+
+        seen = set()
+        for row in cursor.fetchall():
+            if row[0] in seen:
+                continue
+            seen.add(row[0])
+            yield row
+
+    def _at_wavelength(self, two_theta: np.ndarray, intensity: np.ndarray,
+                       d_spacings: np.ndarray, ref_wavelength: float,
+                       exp_wavelength: float):
+        """
+        Reference lines placed where the measured wavelength puts them.
+
+        Reflections Bragg's law cannot reach at the new wavelength are dropped
+        from the positions and the intensities together, so the two arrays stay
+        the same length and keep pointing at the same lines.
+        """
+        try:
+            ref_wavelength = float(ref_wavelength)
+        except (TypeError, ValueError):
+            ref_wavelength = CU_KALPHA_MIN
+        if abs(float(exp_wavelength) - ref_wavelength) <= 0.0001:
+            return two_theta, intensity
+
+        n = min(len(d_spacings), len(intensity))
+        converted = self._convert_wavelength(d_spacings[:n], exp_wavelength)
+        keep = np.isfinite(converted)
+        return converted[keep], np.asarray(intensity[:n])[keep]
         
     def search_by_peaks(self, experimental_peaks: Dict, 
                        tolerance: float = 0.2, 
                        min_matches: int = 3,
                        intensity_weight: float = 0.3,
-                       max_results: int = 50) -> List[Dict]:
+                       max_results: int = 50,
+                       ambient_only: bool = True) -> List[Dict]:
         """
         Search for phases based on peak positions and intensities
         
@@ -39,6 +132,8 @@ class PatternSearchEngine:
             min_matches: Minimum number of peak matches required
             intensity_weight: Weight for intensity similarity (0-1, 0=position only)
             max_results: Maximum number of results to return
+            ambient_only: Exclude structures measured at high P/T, whose shifted
+                cells put lines at shifted 2θ
             
         Returns:
             List of matching phases with scores
@@ -62,31 +157,23 @@ class PatternSearchEngine:
         conn = sqlite3.connect(self.local_db.db_path)
         cursor = conn.cursor()
         
-        cursor.execute('''
-            SELECT DISTINCT m.id, m.mineral_name, m.chemical_formula, m.space_group,
-                   m.cell_a, m.cell_b, m.cell_c, m.cell_alpha, m.cell_beta, m.cell_gamma,
-                   dp.two_theta, dp.intensities, dp.d_spacings
-            FROM minerals m
-            JOIN diffraction_patterns dp ON m.id = dp.mineral_id
-            WHERE dp.wavelength = 1.5406  -- Cu Kα reference patterns
-        ''')
-        
         results = []
-        total_minerals = cursor.rowcount if cursor.rowcount else 0
         processed = 0
         
-        for row in cursor.fetchall():
-            mineral_id, mineral_name, formula, space_group, cell_a, cell_b, cell_c, cell_alpha, cell_beta, cell_gamma, two_theta_json, intensities_json, d_spacings_json = row
+        for row in self._iter_reference_patterns(cursor, ambient_only):
+            (mineral_id, mineral_name, formula, space_group,
+             cell_a, cell_b, cell_c, cell_alpha, cell_beta, cell_gamma,
+             two_theta_json, intensities_json, d_spacings_json, ref_wavelength) = row
             
             try:
-                # Parse JSON data
-                theo_two_theta = np.array(json.loads(two_theta_json))
-                theo_intensity = np.array(json.loads(intensities_json))
-                theo_d_spacings = np.array(json.loads(d_spacings_json))
+                theo_two_theta = parse_series(two_theta_json)
+                theo_intensity = parse_series(intensities_json)
+                theo_d_spacings = parse_series(d_spacings_json)
                 
-                # Convert to experimental wavelength if needed
-                if abs(exp_wavelength - 1.5406) > 0.0001:
-                    theo_two_theta = self._convert_wavelength(theo_d_spacings, exp_wavelength)
+                theo_two_theta, theo_intensity = self._at_wavelength(
+                    theo_two_theta, theo_intensity, theo_d_spacings,
+                    ref_wavelength, exp_wavelength,
+                )
                 
                 # Calculate match score
                 match_result = self._calculate_peak_match_score(
@@ -147,7 +234,8 @@ class PatternSearchEngine:
     def search_by_correlation(self, experimental_pattern: Dict,
                             min_correlation: float = 0.5,
                             max_results: int = 50,
-                            two_theta_range: Tuple[float, float] = None) -> List[Dict]:
+                            two_theta_range: Tuple[float, float] = None,
+                            ambient_only: bool = True) -> List[Dict]:
         """
         Search for phases using correlation analysis of full diffraction patterns
         
@@ -156,6 +244,7 @@ class PatternSearchEngine:
             min_correlation: Minimum correlation coefficient (0-1)
             max_results: Maximum number of results to return
             two_theta_range: Optional (min, max) 2θ range for comparison
+            ambient_only: Exclude structures measured at high P/T
             
         Returns:
             List of matching phases with correlation scores
@@ -188,30 +277,23 @@ class PatternSearchEngine:
         conn = sqlite3.connect(self.local_db.db_path)
         cursor = conn.cursor()
         
-        cursor.execute('''
-            SELECT DISTINCT m.id, m.mineral_name, m.chemical_formula, m.space_group,
-                   m.cell_a, m.cell_b, m.cell_c, m.cell_alpha, m.cell_beta, m.cell_gamma,
-                   dp.two_theta, dp.intensities, dp.d_spacings
-            FROM minerals m
-            JOIN diffraction_patterns dp ON m.id = dp.mineral_id
-            WHERE dp.wavelength = 1.5406  -- Cu Kα reference patterns
-        ''')
-        
         results = []
         processed = 0
         
-        for row in cursor.fetchall():
-            mineral_id, mineral_name, formula, space_group, cell_a, cell_b, cell_c, cell_alpha, cell_beta, cell_gamma, two_theta_json, intensities_json, d_spacings_json = row
+        for row in self._iter_reference_patterns(cursor, ambient_only):
+            (mineral_id, mineral_name, formula, space_group,
+             cell_a, cell_b, cell_c, cell_alpha, cell_beta, cell_gamma,
+             two_theta_json, intensities_json, d_spacings_json, ref_wavelength) = row
             
             try:
-                # Parse theoretical pattern
-                theo_two_theta = np.array(json.loads(two_theta_json))
-                theo_intensity = np.array(json.loads(intensities_json))
-                theo_d_spacings = np.array(json.loads(d_spacings_json))
+                theo_two_theta = parse_series(two_theta_json)
+                theo_intensity = parse_series(intensities_json)
+                theo_d_spacings = parse_series(d_spacings_json)
                 
-                # Convert to experimental wavelength if needed
-                if abs(exp_wavelength - 1.5406) > 0.0001:
-                    theo_two_theta = self._convert_wavelength(theo_d_spacings, exp_wavelength)
+                theo_two_theta, theo_intensity = self._at_wavelength(
+                    theo_two_theta, theo_intensity, theo_d_spacings,
+                    ref_wavelength, exp_wavelength,
+                )
                 
                 # Calculate correlation
                 correlation_result = self._calculate_pattern_correlation(
@@ -273,17 +355,24 @@ class PatternSearchEngine:
                        min_correlation: float = 0.3,
                        peak_weight: float = 0.6,
                        correlation_weight: float = 0.4,
-                       max_results: int = 30) -> List[Dict]:
+                       max_results: int = 30,
+                       full_pattern: Optional[Dict] = None,
+                       ambient_only: bool = True) -> List[Dict]:
         """
         Combined search using both peak-based and correlation-based methods
         
         Args:
-            experimental_data: Dict with both peak data and full pattern
+            experimental_data: Peak list, with 'two_theta' and 'intensity'
             peak_tolerance: 2θ tolerance for peak matching
             min_correlation: Minimum correlation for inclusion
             peak_weight: Weight for peak-based score (0-1)
             correlation_weight: Weight for correlation score (0-1)
             max_results: Maximum results to return
+            full_pattern: The measured profile for the correlation half.
+                Correlating against a bare peak list compares a few dozen
+                isolated points and means nothing, so pass the profile whenever
+                there is one; without it the peak list is used as before.
+            ambient_only: Exclude structures measured at high P/T
             
         Returns:
             Combined and weighted results
@@ -295,13 +384,15 @@ class PatternSearchEngine:
             experimental_data, 
             tolerance=peak_tolerance,
             min_matches=2,  # Lower threshold for combined search
-            max_results=100  # Get more candidates
+            max_results=100,  # Get more candidates
+            ambient_only=ambient_only,
         )
         
         correlation_results = self.search_by_correlation(
-            experimental_data,
+            full_pattern if full_pattern is not None else experimental_data,
             min_correlation=min_correlation,
-            max_results=100  # Get more candidates
+            max_results=100,  # Get more candidates
+            ambient_only=ambient_only,
         )
         
         # Combine results by mineral ID
@@ -356,16 +447,24 @@ class PatternSearchEngine:
 
         methods: subset of 'peaks', 'correlation', 'combined', 'ultrafast'
         For ultrafast, pass fast_search_engine= in kwargs.
+
+        The peak methods want the peak list in `experimental_data`; the
+        correlation methods want the measured profile, passed as
+        full_pattern= in kwargs. They fall back to each other when only one
+        is available.
         """
         methods = methods or ['peaks', 'correlation', 'ultrafast']
         fused: Dict[int, Dict] = {}
+        full_pattern = kwargs.get('full_pattern') or experimental_data
+        ambient_only = kwargs.get('ambient_only', True)
 
         if 'peaks' in methods and experimental_data.get('two_theta') is not None:
             for r in self.search_by_peaks(
                 experimental_data,
                 tolerance=kwargs.get('peak_tolerance', 0.2),
                 min_matches=kwargs.get('min_matches', 2),
-                max_results=max_results * 2
+                max_results=max_results * 2,
+                ambient_only=ambient_only,
             ):
                 mid = r['mineral_id']
                 entry = fused.setdefault(mid, {**r, 'method_scores': {}})
@@ -374,9 +473,10 @@ class PatternSearchEngine:
 
         if 'correlation' in methods:
             for r in self.search_by_correlation(
-                experimental_data,
+                full_pattern,
                 min_correlation=kwargs.get('min_correlation', 0.25),
-                max_results=max_results * 2
+                max_results=max_results * 2,
+                ambient_only=ambient_only,
             ):
                 mid = r['mineral_id']
                 entry = fused.setdefault(mid, {**r, 'method_scores': {}})
@@ -390,7 +490,9 @@ class PatternSearchEngine:
                 experimental_data,
                 peak_tolerance=kwargs.get('peak_tolerance', 0.2),
                 min_correlation=kwargs.get('min_correlation', 0.25),
-                max_results=max_results * 2
+                max_results=max_results * 2,
+                full_pattern=full_pattern,
+                ambient_only=ambient_only,
             ):
                 mid = r['mineral_id']
                 entry = fused.setdefault(mid, {**r, 'method_scores': {}})
@@ -403,9 +505,10 @@ class PatternSearchEngine:
             fast_engine = kwargs.get('fast_search_engine')
             if fast_engine is not None:
                 for r in fast_engine.ultra_fast_correlation_search(
-                    experimental_data,
+                    full_pattern,
                     min_correlation=kwargs.get('min_correlation', 0.25),
-                    max_results=max_results * 2
+                    max_results=max_results * 2,
+                    ambient_only=ambient_only,
                 ):
                     mid = r['mineral_id']
                     entry = fused.setdefault(mid, {**r, 'method_scores': {}})
@@ -568,15 +671,15 @@ class PatternSearchEngine:
         return pattern
     
     def _convert_wavelength(self, d_spacings: np.ndarray, target_wavelength: float) -> np.ndarray:
-        """Convert d-spacings to 2θ values for target wavelength using Bragg's law"""
-        two_theta_values = []
-        
-        for d in d_spacings:
-            if d > 0:
-                sin_theta = target_wavelength / (2 * d)
-                if sin_theta <= 1.0:
-                    theta_rad = np.arcsin(sin_theta)
-                    two_theta_deg = 2 * np.degrees(theta_rad)
-                    two_theta_values.append(two_theta_deg)
-        
-        return np.array(two_theta_values)
+        """
+        2θ for a set of d-spacings at the target wavelength, via Bragg's law.
+
+        Reflections with no solution — d ≤ 0, or sin θ > 1 at this wavelength —
+        come back as NaN rather than being dropped, so the result stays aligned
+        with the intensities belonging to the same lines.
+        """
+        d = np.asarray(d_spacings, dtype=float)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            sin_theta = np.where(d > 0, target_wavelength / (2.0 * d), np.nan)
+        sin_theta = np.where(sin_theta <= 1.0, sin_theta, np.nan)
+        return 2.0 * np.degrees(np.arcsin(sin_theta))

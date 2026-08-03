@@ -7,7 +7,7 @@ import os
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QDragEnterEvent, QDropEvent
 from PyQt5.QtWidgets import (
-    QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout,
+    QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
     QLabel, QMessageBox, QPushButton, QVBoxLayout, QWidget,
 )
 
@@ -26,10 +26,6 @@ class LoadStage(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(10)
-
-        title = QLabel("Load Pattern")
-        title.setStyleSheet("font-weight: 600; font-size: 14px;")
-        layout.addWidget(title)
 
         hint = QLabel("Open a diffraction file or drag & drop onto this panel.")
         hint.setObjectName("mutedLabel")
@@ -74,14 +70,6 @@ class LoadStage(QWidget):
         self.meta_label.setObjectName("mutedLabel")
         self.meta_label.setWordWrap(True)
         layout.addWidget(self.meta_label)
-
-        next_row = QHBoxLayout()
-        next_row.addStretch()
-        self.next_btn = QPushButton("Continue to Process →")
-        self.next_btn.setEnabled(False)
-        self.next_btn.clicked.connect(lambda: self.workspace.set_stage("process"))
-        next_row.addWidget(self.next_btn)
-        layout.addLayout(next_row)
 
         layout.addStretch()
 
@@ -135,7 +123,6 @@ class LoadStage(QWidget):
                 f"{pattern['file_format']} · {n} points · "
                 f"2θ {t0:.2f}–{t1:.2f}° · λ {pattern['wavelength']:.4f} Å"
             )
-            self.next_btn.setEnabled(True)
             self.workspace.refresh_plot()
             self.workspace.set_status(f"Loaded {name}")
         except Exception as e:

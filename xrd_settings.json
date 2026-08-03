@@ -1,0 +1,36 @@
+{
+  "general": {
+    "default_data_dir": "/Users/aaroncelestian/XRD_Data",
+    "auto_save": true,
+    "backup_files": true,
+    "max_threads": 4,
+    "cache_size_mb": 100
+  },
+  "wavelengths": {
+    "default": "Cu K\u03b11 (1.5406)",
+    "custom": ""
+  },
+  "database": {
+    "amcsd_url": "https://rruff.geo.arizona.edu/AMS",
+    "timeout": 30,
+    "max_results": 100,
+    "local_db_path": "",
+    "use_local": false
+  },
+  "matching": {
+    "default_tolerance": 0.02,
+    "min_match_score": 0.1,
+    "min_peak_intensity": 5,
+    "peak_prominence": 1.0,
+    "peak_distance": 5
+  },
+  "display": {
+    "plot_dpi": 300,
+    "line_width": 1.2,
+    "marker_size": 4,
+    "show_grid": false,
+    "show_legend": true,
+    "show_error_bars": false,
+    "color_scheme": "Light"
+  }
+}
