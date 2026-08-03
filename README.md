@@ -45,15 +45,40 @@ A comprehensive GUI application for X-ray diffraction phase matching using the A
 
 ## Installation
 
-### Prerequisites
-- Python 3.8 or higher
-- pip package manager
+### Quick install (recommended)
 
-### Setup
+**macOS / Linux**
+
+```bash
+chmod +x install.sh
+./install.sh
+```
+
+Creates a Desktop app (**XRDmatch.app** on macOS) and the `xrdmatch` conda env.
+
+**Windows**
+
+Double-click `install.bat` (or run it from Command Prompt).  
+Creates a Desktop shortcut (**XRDmatch.lnk**) and the `xrdmatch` conda env.
+
+Then launch from the Desktop shortcut, or:
+
+```bash
+conda activate xrdmatch
+python main.py
+```
+
+### Prerequisites
+- Anaconda or Miniconda (`conda`), **or** Python 3.8+ with pip
+- The installer will offer to install Miniconda if conda is not found
+
+### Manual setup
 1. Clone or download this repository
 2. Navigate to the project directory
-3. Install dependencies:
+3. Create an environment and install dependencies:
 ```bash
+conda create -n xrdmatch python=3.11
+conda activate xrdmatch
 pip install -r requirements.txt
 ```
 
