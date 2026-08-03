@@ -98,4 +98,5 @@ data/
 # Docs
 docs/
 
-docs/
+# Offline dependency cache (pip download)
+offline_packages/
