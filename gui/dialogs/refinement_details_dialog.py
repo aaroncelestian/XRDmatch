@@ -24,15 +24,19 @@ class RefinementDetailsDialog(QDialog):
     to show a value, which left the two halves of the same job in different
     places: you read a number here and went elsewhere to act on it. The grid on
     the first tab is the same information made editable, so reading a parameter
-    and deciding what to do about it are one gesture.
+    and deciding what to do about it are one gesture. The run controls now sit
+    on the tab beside it, for the same reason.
+
+    ``refine_panel`` is the caller's RefineStage. It is reparented, not copied,
+    so the values it holds stay the ones a run reads.
     """
 
-    def __init__(self, session, parent=None):
+    def __init__(self, session, parent=None, refine_panel=None):
         super().__init__(parent)
         self.session = session
         self.setWindowTitle("Refinement Parameters")
         self.setWindowModality(Qt.NonModal)
-        self.resize(940, 660)
+        self.resize(1060, 700)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
@@ -43,8 +47,11 @@ class RefinementDetailsDialog(QDialog):
         self.headline.setWordWrap(True)
         root.addWidget(self.headline)
 
+        self.refine_panel = refine_panel
         self.tabs = QTabWidget()
-        self.tabs.addTab(self._build_matrix_tab(), "Parameters")
+        if refine_panel is not None:
+            self.tabs.addTab(self._build_refine_tab(refine_panel), "Refine")
+        self.tabs.addTab(self._build_matrix_tab(), "Per phase")
         self.tabs.addTab(self._build_table_tab("global_table"), "Statistics")
         self.tabs.addTab(self._build_table_tab("phase_table"), "All values")
         root.addWidget(self.tabs, 1)
@@ -70,6 +77,13 @@ class RefinementDetailsDialog(QDialog):
         self.refresh()
 
     # --- construction ------------------------------------------------------
+
+    def _build_refine_tab(self, panel: QWidget) -> QWidget:
+        wrapper = QWidget()
+        layout = QVBoxLayout(wrapper)
+        layout.setContentsMargins(0, 6, 0, 0)
+        layout.addWidget(panel)
+        return wrapper
 
     def _build_matrix_tab(self) -> QWidget:
         wrapper = QWidget()
@@ -112,6 +126,8 @@ class RefinementDetailsDialog(QDialog):
 
     def showEvent(self, event):
         super().showEvent(event)
+        if self.refine_panel is not None:
+            self.refine_panel.on_enter()
         self.refresh()
 
     def refresh(self):
@@ -159,21 +175,33 @@ class RefinementDetailsDialog(QDialog):
         "microstrain": 1000.0,
         "crystallite_size": 1.0,
         "asymmetry": 0.0,
-        "lattice_scale": 1.0,
         "absorption": 0.0,
     }
+
+    # Database column to grid row, so the cell shows the phase's own starting
+    # values rather than a placeholder nobody would want to refine from.
+    _CELL_SOURCES = (
+        ("cell_a", "cell_a"), ("cell_b", "cell_b"), ("cell_c", "cell_c"),
+        ("cell_alpha", "cell_alpha"), ("cell_beta", "cell_beta"),
+        ("cell_gamma", "cell_gamma"),
+    )
 
     def _phases_before_first_run(self, overrides):
         """Seed the grid from the matched phases so the first run can be set up."""
         names = []
+        cells = {}
         for phase in self.session.selected_phases or self.session.matched_phases or []:
             info = phase.get("phase") or phase
             name = info.get("mineral") or info.get("mineral_name")
             if name and name not in names:
                 names.append(name)
+                cells[name] = {
+                    key: info.get(source) for key, source in self._CELL_SOURCES
+                }
         values = {}
         for name in names:
             entry = dict(self._DEFAULT_FLAGS)
+            entry.update(cells.get(name) or {})
             entry.update(overrides.get(name) or {})
             values[name] = entry
         return names, values

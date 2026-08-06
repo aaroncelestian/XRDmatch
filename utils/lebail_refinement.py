@@ -13,9 +13,11 @@ from typing import Dict, List, Tuple, Optional
 import copy
 import warnings
 
+from utils import kalpha_filter as kalpha
+from utils import unit_cell as cells
 from utils.profile_functions import (
     MAX_ASYMMETRY, asymmetry_exponent, flank_widths, phase_widths,
-    skew_description,
+    pseudo_voigt_flanks, skew_description,
 )
 
 warnings.filterwarnings('ignore')
@@ -86,12 +88,18 @@ class LeBailRefinement:
             'x_param': 0.0,         # instrument Lorentzian; normally zero
             'y_param': 0.0,
             'axial_asymmetry': 0.0,  # axial divergence skew, as cot(2-theta)
+            # Kalpha2/Kalpha1 intensity ratio. Zero models one line per
+            # reflection, which is right for monochromated or stripped data;
+            # the nominal doublet is 0.5. See _peak_windows.
+            'alpha2_ratio': 0.0,
             'refine_zero_shift': True,
             'refine_displacement': False,
             'refine_instrument_profile': False,
             'refine_axial_asymmetry': False,
+            'refine_alpha2_ratio': False,
         }
         self.wavelength = 1.5406
+        self._alpha2_wavelength_cache = (None, kalpha.GENERIC_RATIO)
 
         # Restrict the residual to the neighbourhood of the modelled reflections,
         # so the optimizer is not pulled by counting noise in the empty stretches
@@ -197,6 +205,7 @@ class LeBailRefinement:
         
         # Estimate initial scale factor from intensity ratio
         initial_scale = self._estimate_initial_scale(phase_data['theoretical_peaks'])
+        base_cell = self._extract_unit_cell(phase_data)
             
         # Default refinement parameters
         default_params = {
@@ -215,10 +224,11 @@ class LeBailRefinement:
             'asymmetry': 0.0,
             'refine_asymmetry': False,
             'zero_shift': 0.0,    # legacy per-phase offset; the global term is used now
-            'unit_cell': self._extract_unit_cell(phase_data),
-            # Isotropic lattice dilation: every d-spacing scales by this factor.
-            # Anisotropic a/b/c refinement needs Miller indices, which the stored
-            # reference patterns do not carry.
+            'unit_cell': dict(base_cell),
+            # Fallback for a pattern whose reflections could not be indexed: an
+            # isotropic dilation, where every d-spacing scales by this factor.
+            # Where indices are recovered, a, b, c and the angles refine on
+            # their own and this stays at one.
             'lattice_scale': 1.0,
             'absorption': 0.0,        # angle-dependent intensity loss
             'harmonic_order': 0,      # even spherical-harmonic order (0, 2, 4, 6)
@@ -257,26 +267,133 @@ class LeBailRefinement:
         if len(coeffs) != n_harmonics:
             coeffs = (coeffs + [0.0] * n_harmonics)[:n_harmonics]
         default_params['harmonic_coeffs'] = coeffs
-        # Lattice dilation is refined against the starting cell, so keep a copy
-        default_params['_base_unit_cell'] = dict(default_params['unit_cell'])
+        # The cell is always refined against the starting one, never against the
+        # cell the last cycle happened to reach, so keep a copy of it
+        default_params['_base_unit_cell'] = dict(base_cell)
 
-        # A dilation carried over from an earlier run has to be applied to the
-        # reported cell here, because the cell is otherwise only recomputed when
-        # lattice_scale is among the parameters actually being refined.
-        carried_scale = float(default_params.get('lattice_scale', 1.0) or 1.0)
-        if abs(carried_scale - 1.0) > 1e-12:
-            default_params['unit_cell'] = self._scaled_unit_cell(
-                default_params['_base_unit_cell'], carried_scale
-            )
+        # Miller indices are what let a, b and c move apart, since they say how
+        # each reflection responds to each edge. Without them the cell can only
+        # breathe as a whole.
+        hkl, indexed = self._index_phase(phase_data, base_cell)
+        groups = ()
+        if hkl is not None:
+            groups = cells.cell_groups(base_cell, reflections=int(indexed.sum()))
+        default_params['_cell_groups'] = groups
 
+        default_params['unit_cell'] = self._starting_cell(base_cell, default_params)
+        if groups:
+            # The dilation is now expressed in the cell itself, so leaving it
+            # here as well would apply it twice
+            default_params['lattice_scale'] = 1.0
 
         phase = {
             'data': phase_data,
             'parameters': default_params,
-            'theoretical_peaks': phase_data['theoretical_peaks'].copy()
+            'theoretical_peaks': phase_data['theoretical_peaks'].copy(),
+            'hkl': hkl,
         }
         
         self.phases.append(phase)
+
+    # Below this many identified reflections there is nothing to refine a cell
+    # against, whatever the symmetry allows.
+    _MIN_INDEXED_REFLECTIONS = 4
+
+    def _index_phase(self, phase_data: Dict, base_cell: Dict
+                     ) -> Tuple[Optional[np.ndarray], np.ndarray]:
+        """
+        Miller indices for this phase's reference reflections, where they exist.
+
+        The stored patterns carry a d-spacing per reflection but no index, so the
+        index is recovered by asking which reflection of the starting cell has
+        that d-spacing. Both come from the same structure, so a real pattern
+        matches to the last digit its table carries; anything that does not match
+        is refused here rather than being refined on a guess.
+        """
+        peaks = phase_data.get('theoretical_peaks') or {}
+        positions = np.asarray(peaks.get('two_theta', []), dtype=float)
+        stored_d = np.asarray(peaks.get('d_spacing', []), dtype=float)
+        empty = np.zeros(len(positions), dtype=bool)
+        if len(positions) < self._MIN_INDEXED_REFLECTIONS:
+            return None, empty
+        if len(stored_d) != len(positions):
+            return None, empty
+
+        # The d-spacings have to be this pattern's own. A list that does not
+        # agree with the peak positions through Bragg's law describes some other
+        # cell, and indexing against it would invent a response to a and c that
+        # the reflections do not have. The window is wide enough to allow for a
+        # specimen shift already folded into the positions.
+        sin_theta = np.sin(np.radians(np.clip(positions, 1e-6, 179.9) / 2.0))
+        with np.errstate(divide='ignore', invalid='ignore'):
+            from_positions = self.wavelength / (2.0 * sin_theta)
+        agree = (
+            np.isfinite(stored_d) & (stored_d > 0) & np.isfinite(from_positions)
+            & (np.abs(stored_d - from_positions) <= 0.03 * from_positions)
+        )
+        if np.mean(agree) < 0.9:
+            self._log(
+                "  Reference d-spacings do not match the peak positions; "
+                "refining this cell isotropically"
+            )
+            return None, empty
+
+        hkl, matched = cells.index_reflections(stored_d, base_cell)
+        if hkl is None or int(matched.sum()) < self._MIN_INDEXED_REFLECTIONS:
+            return None, empty
+        if float(np.mean(matched)) < 0.75:
+            return None, empty
+        return hkl, matched
+
+    def _starting_cell(self, base_cell: Dict, params: Dict) -> Dict:
+        """
+        Where the cell starts: the database cell, unless something says otherwise.
+
+        A run can be handed a cell three ways, in increasing precedence: an
+        isotropic dilation left by an older refinement, the whole cell a previous
+        run arrived at, and a single edge or angle the user typed into the
+        parameter grid. Typed values honour the same ties as the refinement: if
+        a and b are equal by symmetry, typing a also moves b.
+        """
+        cell = dict(base_cell)
+
+        scale = float(params.get('lattice_scale', 1.0) or 1.0)
+        if abs(scale - 1.0) > 1e-12:
+            cell = self._scaled_unit_cell(base_cell, scale)
+
+        carried = params.get('unit_cell')
+        if isinstance(carried, dict):
+            for key in cells.CELL_KEYS:
+                if carried.get(key):
+                    cell[key] = float(carried[key])
+
+        typed = {}
+        for key in cells.CELL_KEYS:
+            given = params.pop(f'cell_{key}', None)
+            if given is not None:
+                try:
+                    typed[f'cell_{key}'] = float(given)
+                except (TypeError, ValueError):
+                    pass
+        if typed:
+            # Rebuild through the groups so a typed a also moves a tied b.
+            # An empty group list is the isotropic fallback and must not be
+            # replaced by inventing free parameters the refinement will not use.
+            groups = params.get('_cell_groups')
+            if groups is None:
+                groups = cells.cell_groups(base_cell)
+            values = cells.free_cell_values(cell, groups)
+            values.update({name: value for name, value in typed.items()
+                           if name in values})
+            cell = cells.cell_from_free(base_cell, values, groups)
+            # A parameter the user typed that is not free -- a right angle they
+            # overwrote, say -- is applied directly, since they asked for it
+            for name, value in typed.items():
+                if name not in values:
+                    cell[name[5:]] = value
+
+        cell['volume'] = self._cell_volume(cell)
+        return cell
     
     def _apply_two_theta_filter(self):
         """Apply 2-theta range filter to experimental data"""
@@ -423,21 +540,7 @@ class LeBailRefinement:
     @staticmethod
     def _cell_volume(cell: Dict) -> float:
         """Triclinic cell volume, valid for every crystal system."""
-        try:
-            a, b, c = float(cell['a']), float(cell['b']), float(cell['c'])
-            alpha, beta, gamma = (
-                np.radians(float(cell.get('alpha', 90.0))),
-                np.radians(float(cell.get('beta', 90.0))),
-                np.radians(float(cell.get('gamma', 90.0))),
-            )
-        except (KeyError, TypeError, ValueError):
-            return 0.0
-        term = (
-            1.0
-            - np.cos(alpha) ** 2 - np.cos(beta) ** 2 - np.cos(gamma) ** 2
-            + 2.0 * np.cos(alpha) * np.cos(beta) * np.cos(gamma)
-        )
-        return float(a * b * c * np.sqrt(max(term, 0.0)))
+        return cells.cell_volume(cell)
         
     def refine_phases(self, max_iterations: int = 20, 
                      convergence_threshold: float = 1e-5,
@@ -505,6 +608,7 @@ class LeBailRefinement:
             
         self._log(f"Starting Le Bail refinement ({self.mode}) with {len(self.phases)} phases")
         self._log(f"Experimental data: {len(self.experimental_data['two_theta'])} points")
+        self._log_alpha2_setting()
         
         total_pawley_params = 0
         for phase in self.phases:
@@ -816,6 +920,14 @@ class LeBailRefinement:
             names.append('axial_asymmetry')
             vector.append(float(self.global_parameters.get('axial_asymmetry', 0.0)))
             bounds.append((-0.2, 0.2))
+        if self.global_parameters.get('refine_alpha2_ratio', False):
+            # The transition probabilities put the doublet at 1:2, and nothing
+            # about a specimen changes that. What varies is how much of the
+            # satellite survived a monochromator or a stripping algorithm, so
+            # the range runs down to none of it and stops just above nominal.
+            names.append('alpha2_ratio')
+            vector.append(float(self.global_parameters.get('alpha2_ratio', 0.0)))
+            bounds.append((0.0, 0.6))
         if not names:
             return
 
@@ -880,6 +992,8 @@ class LeBailRefinement:
             if 'axial_asymmetry' in names:
                 axial = self.global_parameters['axial_asymmetry']
                 message += f", axial asymmetry={axial:+.4f}"
+            if 'alpha2_ratio' in names:
+                message += f", Kα2/Kα1={self.global_parameters['alpha2_ratio']:.3f}"
             self._log(message)
         except Exception as e:
             for name, value in saved.items():
@@ -892,7 +1006,9 @@ class LeBailRefinement:
     # Parameters that move peak positions. Fitting them in the same least-squares
     # step as the profile widths makes the Jacobian so ill-conditioned that the
     # trust-region SVD hangs; they are refined in a separate pass instead.
-    _POSITION_PARAM_NAMES = frozenset({'lattice_scale'})
+    @staticmethod
+    def _is_position_param(name: str) -> bool:
+        return name == 'lattice_scale' or cells.is_cell_parameter(name)
 
     def _refine_single_phase(self, phase_idx: int):
         """Refine parameters for a single phase"""
@@ -908,10 +1024,24 @@ class LeBailRefinement:
             if i != phase_idx:
                 other_pattern += self._calculate_phase_pattern(i, self.phases[i]['parameters'])
 
-        position_idx = [i for i, n in enumerate(param_names) if n in self._POSITION_PARAM_NAMES]
-        intensity_idx = [i for i, n in enumerate(param_names) if n not in self._POSITION_PARAM_NAMES]
-        # Position first so the profile fit starts with peaks already aligned
-        groups = [g for g in (position_idx, intensity_idx) if g]
+        # Edges before angles: a, c and beta of a monoclinic cell are so
+        # strongly correlated that freeing them together finds a local minimum
+        # where the edges absorb what belongs to the angle. Fitting the edges
+        # first, then the angles against those edges, and only then everything
+        # at once, keeps each step in the basin the data actually supports.
+        edge_idx = [i for i, n in enumerate(param_names)
+                    if n == 'lattice_scale'
+                    or (cells.is_cell_parameter(n) and n[5:] in cells.EDGE_KEYS)]
+        angle_idx = [i for i, n in enumerate(param_names)
+                     if cells.is_cell_parameter(n) and n[5:] in cells.ANGLE_KEYS]
+        intensity_idx = [i for i, n in enumerate(param_names)
+                         if not self._is_position_param(n)]
+        groups = [g for g in (edge_idx, angle_idx, edge_idx + angle_idx,
+                              intensity_idx) if g]
+        # The joint cell pass is only useful when both kinds are free; otherwise
+        # the single-kind pass already did the work
+        if not edge_idx or not angle_idx:
+            groups = [g for g in (edge_idx or angle_idx, intensity_idx) if g]
 
         try:
             # Le Bail step: partition once, then hold intensities fixed while the
@@ -938,12 +1068,18 @@ class LeBailRefinement:
                 self._log(f"  Sample broadening refined: size={size:.4g} um, "
                           f"microstrain={strain:.4g}")
 
-            if 'lattice_scale' in optimized_params:
-                cell = optimized_params.get('unit_cell', params.get('unit_cell', {}))
+            if 'unit_cell' in optimized_params:
+                cell = optimized_params['unit_cell']
+                delta = cells.cell_deltas(cell, params.get('_base_unit_cell'))
                 self._log(
-                    f"  Lattice scale: {optimized_params['lattice_scale']:.6f} "
-                    f"(a={cell.get('a', 0.0):.4f}, b={cell.get('b', 0.0):.4f}, "
-                    f"c={cell.get('c', 0.0):.4f} Å)"
+                    "  Unit cell: "
+                    f"a={cell.get('a', 0.0):.4f} ({delta.get('a', 0.0):+.3f}%), "
+                    f"b={cell.get('b', 0.0):.4f} ({delta.get('b', 0.0):+.3f}%), "
+                    f"c={cell.get('c', 0.0):.4f} ({delta.get('c', 0.0):+.3f}%) Å, "
+                    f"α={cell.get('alpha', 0.0):.3f}, β={cell.get('beta', 0.0):.3f}, "
+                    f"γ={cell.get('gamma', 0.0):.3f}°, "
+                    f"V={cell.get('volume', 0.0):.3f} Å³ "
+                    f"({delta.get('volume', 0.0):+.3f}%)"
                 )
 
             if 'asymmetry' in optimized_params:
@@ -995,15 +1131,8 @@ class LeBailRefinement:
             total = self._calculate_phase_pattern(phase_idx, merged) + other_pattern
             return self._fitted_residual((observed - total) / errors)
 
-        if len(group) == 1 and names[0] == 'lattice_scale':
-            # A 1-D bracketed search is cheaper and more robust than TRF for the
-            # single lattice dilation; peak sliding makes the Jacobian noisy
-            best_x, best_val = float(x0[0]), float(np.sum(residuals(x0) ** 2))
-            for trial in np.linspace(lower[0], upper[0], 21):
-                value = float(np.sum(residuals(np.array([trial])) ** 2))
-                if value < best_val:
-                    best_x, best_val = float(trial), value
-            x0 = np.array([best_x])
+        if names and all(self._is_position_param(name) for name in names):
+            x0 = self._bracket_cell(residuals, x0, lower, upper, names)
 
         result = least_squares(
             residuals, x0, bounds=(lower, upper), method='trf',
@@ -1014,6 +1143,45 @@ class LeBailRefinement:
         updated = working.copy()
         updated[group] = result.x
         return updated
+
+    def _bracket_cell(self, residuals, x0: np.ndarray, lower: np.ndarray,
+                      upper: np.ndarray, names: List[str]) -> np.ndarray:
+        """
+        Find the basin before least squares takes the axial ratios.
+
+        The residual as a function of peak position is multimodal: a reflection
+        can settle on its neighbour and look convincing, and a gradient step has
+        no way of knowing. A uniform dilation moves every reflection the same
+        way and finds the right basin for the edges cheaply; each free angle is
+        then scanned on its own, because an angle that starts a degree off can
+        look like an edge change to a local search.
+        """
+        best_x = np.asarray(x0, dtype=float)
+        best_value = float(np.sum(residuals(best_x) ** 2))
+
+        scalable = [
+            index for index, name in enumerate(names)
+            if name == 'lattice_scale' or name[5:] in cells.EDGE_KEYS
+        ]
+        if scalable:
+            for factor in np.linspace(0.95, 1.05, 21):
+                trial = np.asarray(x0, dtype=float).copy()
+                for index in scalable:
+                    trial[index] = np.clip(x0[index] * factor, lower[index], upper[index])
+                value = float(np.sum(residuals(trial) ** 2))
+                if value < best_value:
+                    best_x, best_value = trial, value
+
+        for index, name in enumerate(names):
+            if not (cells.is_cell_parameter(name) and name[5:] in cells.ANGLE_KEYS):
+                continue
+            for trial_value in np.linspace(lower[index], upper[index], 21):
+                trial = best_x.copy()
+                trial[index] = trial_value
+                value = float(np.sum(residuals(trial) ** 2))
+                if value < best_value:
+                    best_x, best_value = trial, value
+        return best_x
             
     def _create_parameter_vector(self, params: Dict) -> Tuple[np.ndarray, List, List]:
         """Create parameter vector for optimization"""
@@ -1067,9 +1235,25 @@ class LeBailRefinement:
 
         # Zero shift and specimen displacement are refined globally, not here
         if params.get('refine_cell', True):
-            param_vector.append(params.get('lattice_scale', 1.0))
-            param_bounds.append((0.95, 1.05))
-            param_names.append('lattice_scale')
+            cell = params.get('unit_cell') or {}
+            base = params.get('_base_unit_cell') or cell
+            groups = params.get('_cell_groups') or ()
+            for group in groups:
+                start = float(base.get(group.key) or 0.0)
+                if start <= 0:
+                    continue
+                # Bounded against the starting cell rather than the current one,
+                # so refining in stages cannot walk the cell away a few percent
+                # at a time
+                lower, upper = cells.cell_bounds(group, start)
+                value = float(np.clip(float(cell.get(group.key, start)), lower, upper))
+                param_vector.append(value)
+                param_bounds.append((lower, upper))
+                param_names.append(group.name)
+            if not groups:
+                param_vector.append(params.get('lattice_scale', 1.0))
+                param_bounds.append((0.95, 1.05))
+                param_names.append('lattice_scale')
 
         if params.get('refine_absorption', False) and use_scaled:
             param_vector.append(params.get('absorption', 0.0))
@@ -1091,11 +1275,30 @@ class LeBailRefinement:
         # and off as it moves between stages -- cannot hand one back.
         locked = self._locked_parameters(params)
         if locked:
+            groups = params.get('_cell_groups') or ()
             keep = [i for i, name in enumerate(param_names)
-                    if not self._is_locked(name, locked)]
+                    if not self._is_locked(name, locked, groups)]
             param_vector = [param_vector[i] for i in keep]
             param_bounds = [param_bounds[i] for i in keep]
             param_names = [param_names[i] for i in keep]
+
+        free_cell = [name[5:] if name.startswith('cell_') else name
+                     for name in param_names if self._is_position_param(name)]
+        if free_cell:
+            # After locks, so the log says what will actually move
+            groups = params.get('_cell_groups') or ()
+            labels = []
+            for name in free_cell:
+                if name == 'lattice_scale':
+                    labels.append('lattice_scale')
+                    continue
+                for group in groups:
+                    if group.key == name:
+                        labels.append("=".join(group.tied))
+                        break
+                else:
+                    labels.append(name)
+            self._log("  Cell parameters free: " + ", ".join(labels))
 
         return np.array(param_vector), param_bounds, param_names
 
@@ -1105,11 +1308,22 @@ class LeBailRefinement:
         return frozenset(params.get('_locked') or ())
 
     @staticmethod
-    def _is_locked(name: str, locked: frozenset) -> bool:
+    def _is_locked(name: str, locked: frozenset, groups=()) -> bool:
         if name in locked:
             return True
         # The harmonic terms are pinned as a group, being one correction
-        return name.startswith('harmonic_') and 'harmonic_coeffs' in locked
+        if name.startswith('harmonic_') and 'harmonic_coeffs' in locked:
+            return True
+        # Equal axes move as one free parameter. Locking any of them locks the
+        # whole group: unticking b for a tetragonal phase must hold a as well,
+        # since there is no direction the data can use to tell them apart.
+        if cells.is_cell_parameter(name):
+            for group in groups:
+                if group.name == name and any(
+                    f'cell_{key}' in locked for key in group.tied
+                ):
+                    return True
+        return False
         
     def _vector_to_parameters(self, vector: np.ndarray, names: List[str], 
                             original_params: Dict) -> Dict:
@@ -1117,12 +1331,11 @@ class LeBailRefinement:
         params = {}
         harmonics = dict(enumerate(original_params.get('harmonic_coeffs') or []))
         harmonics_seen = False
+        cell_values = {}
         
         for i, name in enumerate(names):
-            if name.startswith('cell_'):
-                if 'unit_cell' not in params:
-                    params['unit_cell'] = original_params['unit_cell'].copy()
-                params['unit_cell'][name[5:]] = vector[i]
+            if cells.is_cell_parameter(name):
+                cell_values[name] = float(vector[i])
             elif name.startswith('harmonic_'):
                 harmonics[int(name.split('_')[1])] = float(vector[i])
                 harmonics_seen = True
@@ -1132,14 +1345,22 @@ class LeBailRefinement:
         if harmonics_seen:
             params['harmonic_coeffs'] = [harmonics[k] for k in sorted(harmonics)]
 
-        # A refined lattice dilation is only meaningful if it is also reported as
-        # cell edges, so keep the stored cell in step with it
-        if 'lattice_scale' in params:
-            base = original_params.get('_base_unit_cell') or original_params.get('unit_cell')
-            if base:
-                params['unit_cell'] = self._scaled_unit_cell(
-                    base, float(params['lattice_scale'])
-                )
+        base = original_params.get('_base_unit_cell') or original_params.get('unit_cell')
+        groups = original_params.get('_cell_groups') or ()
+        if cell_values and groups and base:
+            # Rebuilt from the starting cell rather than adjusted in place, so
+            # the ties hold and repeated cycles cannot compound. Parameters this
+            # step is not fitting keep the value they already had.
+            current = original_params.get('unit_cell') or base
+            values = cells.free_cell_values(current, groups)
+            values.update(cell_values)
+            params['unit_cell'] = cells.cell_from_free(base, values, groups)
+        elif 'lattice_scale' in params and base:
+            # A refined dilation is only meaningful if it is also reported as
+            # cell edges, so keep the stored cell in step with it
+            params['unit_cell'] = self._scaled_unit_cell(
+                base, float(params['lattice_scale'])
+            )
 
         return params
 
@@ -1152,31 +1373,85 @@ class LeBailRefinement:
         cell['volume'] = self._cell_volume(cell)
         return cell
         
+    def _peak_mask(self, theo_peaks: Dict) -> Optional[np.ndarray]:
+        """Which reference reflections are strong enough to be worth modelling."""
+        if self.peak_intensity_cutoff <= 0:
+            return None
+        intensities = np.asarray(theo_peaks.get('intensity', []), dtype=float)
+        if not len(intensities):
+            return None
+        imax = np.max(intensities) if np.max(intensities) > 0 else 1.0
+        return intensities >= (self.peak_intensity_cutoff * imax)
+
     def _filter_peaks(self, theo_peaks: Dict) -> Tuple[np.ndarray, np.ndarray]:
         """Apply intensity cutoff; return positions and intensities"""
         positions = np.asarray(theo_peaks.get('two_theta', []), dtype=float)
         intensities = np.asarray(theo_peaks.get('intensity', []), dtype=float)
         if len(positions) == 0:
             return positions, intensities
-        if self.peak_intensity_cutoff > 0:
-            imax = np.max(intensities) if np.max(intensities) > 0 else 1.0
-            mask = intensities >= (self.peak_intensity_cutoff * imax)
-            return positions[mask], intensities[mask]
-        return positions, intensities
+        mask = self._peak_mask(theo_peaks)
+        if mask is None or len(mask) != len(positions):
+            return positions, intensities
+        return positions[mask], intensities[mask]
 
-    def _shift_positions(self, positions: np.ndarray, parameters: Dict) -> np.ndarray:
+    def _phase_peaks(self, phase: Dict
+                     ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+        """Positions, intensities and Miller indices in one consistent order."""
+        theo_peaks = phase['theoretical_peaks']
+        positions, intensities = self._filter_peaks(theo_peaks)
+        hkl = phase.get('hkl')
+        if hkl is not None:
+            mask = self._peak_mask(theo_peaks)
+            if mask is not None and len(mask) == len(hkl):
+                hkl = hkl[mask]
+            if len(hkl) != len(positions):
+                hkl = None
+        return positions, intensities, hkl
+
+    def _lattice_factors(self, parameters: Dict, hkl: Optional[np.ndarray],
+                         count: int):
+        """
+        How far this phase's d-spacings have moved, per reflection or as one.
+
+        With Miller indices the answer differs from reflection to reflection,
+        which is the whole point: 200 follows a and 002 follows c, so the same
+        cell change moves them by different amounts and the pattern can tell the
+        axes apart. Without indices there is only one number for all of them.
+        """
+        groups = parameters.get('_cell_groups') or ()
+        cell = parameters.get('unit_cell') or {}
+        base = parameters.get('_base_unit_cell') or {}
+        if hkl is not None and groups and cell and base and len(hkl) == count:
+            ratio = cells.d_spacing_ratio(hkl, cell, base)
+            if ratio is not None:
+                # A reflection that never indexed rides on the volume change,
+                # which is the best that can be said about it
+                unindexed = ~np.any(np.asarray(hkl) != 0, axis=1)
+                if unindexed.any():
+                    start = float(base.get('volume') or 0.0)
+                    now = float(cell.get('volume') or 0.0)
+                    ratio[unindexed] = (now / start) ** (1.0 / 3.0) if start > 0 else 1.0
+                return ratio
+        return float(parameters.get('lattice_scale', 1.0) or 1.0)
+
+    def _shift_positions(self, positions: np.ndarray, parameters: Dict,
+                         hkl: Optional[np.ndarray] = None) -> np.ndarray:
         """
         Reference positions moved by the phase lattice and the shared instrument terms.
 
-        An isotropic lattice dilation scales every d-spacing, so sin(theta) scales
-        by 1/factor. Working in sin(theta) keeps this independent of wavelength.
+        A d-spacing that grows by some factor moves sin(theta) by its reciprocal,
+        so the reference positions can be carried to where the refined cell puts
+        them without recalculating the pattern. Working in sin(theta) keeps this
+        independent of wavelength and keeps whatever else those positions already
+        carried, such as a mount shift measured for this phase.
+
         Specimen displacement in Bragg-Brentano geometry adds a cos(theta) term.
         """
         positions = np.asarray(positions, dtype=float)
 
-        lattice_scale = float(parameters.get('lattice_scale', 1.0) or 1.0)
-        if lattice_scale > 0 and abs(lattice_scale - 1.0) > 1e-12:
-            sin_theta = np.sin(np.radians(positions / 2.0)) / lattice_scale
+        factors = self._lattice_factors(parameters, hkl, len(positions))
+        if np.any(np.abs(np.asarray(factors) - 1.0) > 1e-12) and np.all(factors > 0):
+            sin_theta = np.sin(np.radians(positions / 2.0)) / factors
             positions = 2.0 * np.degrees(np.arcsin(np.clip(sin_theta, -1.0, 1.0)))
 
         positions = positions + float(self.global_parameters.get('zero_shift', 0.0))
@@ -1242,11 +1517,11 @@ class LeBailRefinement:
         if len(theo_peaks.get('two_theta', [])) == 0:
             return np.zeros_like(self.experimental_data['two_theta'])
 
-        positions, intensities = self._filter_peaks(theo_peaks)
+        positions, intensities, hkl = self._phase_peaks(phase)
         if len(positions) == 0:
             return np.zeros_like(self.experimental_data['two_theta'])
-            
-        shifted_positions = self._shift_positions(positions, parameters)
+
+        shifted_positions = self._shift_positions(positions, parameters, hkl)
         peak_widths, eta = self._calculate_peak_widths(shifted_positions, parameters)
         skew = self._peak_asymmetry(shifted_positions, parameters)
         scale_factor = parameters.get('scale_factor', 1.0)
@@ -1438,6 +1713,14 @@ class LeBailRefinement:
         varies with angle, and the skew from axial divergence varies with angle
         too, so every reflection carries its own.
 
+        A Kα2 satellite, where one is being modelled, is part of its parent's
+        profile rather than a reflection of its own. It has no independent
+        intensity to extract or solve for -- its height is fixed at a ratio of
+        the parent's -- so building it in here leaves every reflection one
+        column of the design matrix, one extracted intensity and one row of the
+        report, and puts the doublet into the pattern, the Le Bail partitioning
+        and the Pawley solve at once.
+
         Returns the grid indices each window covers, the profiles, and the
         number of grid points under each unit-height peak.
         """
@@ -1451,6 +1734,11 @@ class LeBailRefinement:
         mixing = self._as_column(eta, positions.size)
         skew = self._as_column(asymmetry, positions.size)
         low_width, high_width = flank_widths(widths[:, None], skew)
+
+        alpha2_ratio = float(self.global_parameters.get('alpha2_ratio', 0.0) or 0.0)
+        separation = (
+            self._alpha2_separation(positions)[:, None] if alpha2_ratio > 0.0 else None
+        )
         # How far a peak has to be followed depends on how Lorentzian it is. A
         # Gaussian is dead by three widths, but a Lorentzian still holds a few
         # percent of its area past five, and cutting it there leaves that
@@ -1462,7 +1750,11 @@ class LeBailRefinement:
         # cut off exactly where it was added to model something
         cutoff = (reach * np.maximum(low_width, high_width)).ravel()
 
-        half = int(np.ceil(float(np.max(cutoff)) / self._dx)) + 1
+        # The satellite sits outside its parent's window, so the window has to
+        # grow by the separation or the doublet is cut in half
+        span = cutoff + (separation.ravel() if separation is not None else 0.0)
+
+        half = int(np.ceil(float(np.max(span)) / self._dx)) + 1
         # Broad peaks on a fine grid would otherwise make the array enormous
         budget = max(3, self._max_window_elements // (2 * positions.size))
         half = int(min(half, budget, n))
@@ -1477,16 +1769,62 @@ class LeBailRefinement:
         offset = x[indices] - positions[:, None]
         # A split profile: each flank keeps its own width, and the two agree at
         # the centre because both are unit height there
-        width = np.where(offset < 0.0, low_width, high_width)
-        sigma = width / (2.0 * np.sqrt(2.0 * np.log(2.0)))
-        gamma = width / 2.0
-        profiles = (
-            (1.0 - mixing) * np.exp(-0.5 * (offset / sigma) ** 2)
-            + mixing / (1.0 + (offset / gamma) ** 2)
-        )
-        profiles *= on_grid & (np.abs(offset) <= cutoff[:, None])
+        profiles = pseudo_voigt_flanks(offset, low_width, high_width, mixing)
+        inside = np.abs(offset) <= cutoff[:, None]
+
+        if separation is not None:
+            # The satellite carries the shape of its parent and differs only in
+            # where it is centred and how much of the parent's height it has
+            satellite = offset - separation
+            profiles = profiles + alpha2_ratio * pseudo_voigt_flanks(
+                satellite, low_width, high_width, mixing
+            )
+            inside = inside | (np.abs(satellite) <= cutoff[:, None])
+
+        profiles *= on_grid & inside
 
         return indices, profiles, profiles.sum(axis=1)
+
+    def _alpha2_separation(self, positions: np.ndarray) -> np.ndarray:
+        """
+        Where this pattern's Kα2 satellites fall relative to their parents.
+
+        The wavelength ratio comes from the anode the recorded wavelength
+        belongs to, and falls back to the ratio common to all of them when the
+        wavelength matches none. It is cached because the separation is
+        recomputed on every objective evaluation and the anode never changes
+        inside a run.
+        """
+        wavelength = float(self.wavelength)
+        cached_wavelength, ratio = self._alpha2_wavelength_cache
+        if cached_wavelength != wavelength:
+            ratio = kalpha.alpha2_ratio(wavelength)
+            self._alpha2_wavelength_cache = (wavelength, ratio)
+        return kalpha.alpha2_separation(positions, ratio)
+
+    def _log_alpha2_setting(self):
+        """
+        Say whether satellites are being modelled, and on which parent line.
+
+        A pattern is commonly recorded against the weighted average of the
+        doublet, which is the correct single wavelength while the satellite is
+        absent from the model and the wrong one once it is there: the parent then
+        belongs at Kα1. Getting this wrong leaves every peak a third of a
+        separation out of place, which the refinement absorbs into a zero shift
+        and a lattice that are both slightly wrong.
+        """
+        ratio = float(self.global_parameters.get('alpha2_ratio', 0.0) or 0.0)
+        if ratio <= 0.0:
+            return
+        message = f"Modelling Kα2 satellites at {ratio:.3f} of each parent line"
+        alpha1 = kalpha.kalpha1_wavelength(self.wavelength)
+        if alpha1 is not None and abs(alpha1 - float(self.wavelength)) > 1e-4:
+            message += (
+                f". Wavelength {float(self.wavelength):.5f} Å is the doublet average; "
+                f"with satellites modelled the parent line belongs at "
+                f"Kα1 = {alpha1:.5f} Å"
+            )
+        self._log(message)
 
     def _accumulate_pseudo_voigt(self, positions: np.ndarray, widths: np.ndarray,
                                   intensities: np.ndarray, eta,
@@ -1619,7 +1957,8 @@ class LeBailRefinement:
         """Peak positions a phase currently predicts, corrections included."""
         phase = self.phases[phase_idx]
         return self._shift_positions(
-            phase['theoretical_peaks'].get('two_theta', []), phase['parameters']
+            phase['theoretical_peaks'].get('two_theta', []), phase['parameters'],
+            phase.get('hkl'),
         )
         
     def _calculate_total_pattern(self) -> np.ndarray:
@@ -1716,10 +2055,10 @@ class LeBailRefinement:
 
         for phase in self.phases:
             params = phase['parameters']
-            positions, _ = self._filter_peaks(phase['theoretical_peaks'])
+            positions, _, hkl = self._phase_peaks(phase)
             if len(positions) == 0:
                 continue
-            positions = self._shift_positions(positions, params)
+            positions = self._shift_positions(positions, params, hkl)
             widths, _ = self._calculate_peak_widths(positions, params)
             span = reach * np.maximum(widths, 1e-6)
             starts = np.searchsorted(x, positions - span, side='left')
@@ -1748,12 +2087,12 @@ class LeBailRefinement:
         """
         phase = self.phases[phase_idx]
         params = phase['parameters']
-        positions, reference = self._filter_peaks(phase['theoretical_peaks'])
+        positions, reference, hkl = self._phase_peaks(phase)
         if len(positions) == 0:
             return 1.0, 0.0
 
         strongest = int(np.argmax(reference))
-        shifted = self._shift_positions(positions, params)
+        shifted = self._shift_positions(positions, params, hkl)
         widths, eta = self._calculate_peak_widths(shifted, params)
         skew = self._peak_asymmetry(shifted, params)
 
@@ -1840,10 +2179,10 @@ class LeBailRefinement:
 
             for index, phase in enumerate(self.phases):
                 params = phase['parameters']
-                positions, reference = self._filter_peaks(phase['theoretical_peaks'])
+                positions, reference, hkl = self._phase_peaks(phase)
                 if len(positions) == 0:
                     continue
-                positions = self._shift_positions(positions, params)
+                positions = self._shift_positions(positions, params, hkl)
                 widths, eta = self._calculate_peak_widths(positions, params)
                 skew = self._peak_asymmetry(positions, params)
 
@@ -1969,6 +2308,15 @@ class LeBailRefinement:
                 'lattice_scale': float(params.get('lattice_scale', 1.0)),
                 'unit_cell': dict(params.get('unit_cell') or {}),
                 'base_unit_cell': dict(params.get('_base_unit_cell') or {}),
+                # What the cell was allowed to do, and what it did. Without the
+                # first the second cannot be read: an angle that did not move
+                # may have been held by symmetry rather than by the data.
+                # Parameters that move together are written a=b.
+                'cell_free': ["=".join(group.tied)
+                              for group in (params.get('_cell_groups') or ())],
+                'cell_delta': cells.cell_deltas(
+                    params.get('unit_cell'), params.get('_base_unit_cell')
+                ),
                 'absorption': float(params.get('absorption', 0.0) or 0.0),
                 'harmonic_coeffs': list(params.get('harmonic_coeffs') or []),
                 'profile': {
@@ -2089,17 +2437,28 @@ class LeBailRefinement:
             if params.get('refine_cell', True):
                 cell = params['unit_cell']
                 base = params.get('_base_unit_cell') or cell
-                scale = params.get('lattice_scale', 1.0)
-                report.append(f"  Lattice scale: {scale:.6f} ({(scale - 1.0) * 100:+.3f}%)")
-                report.append(f"  Unit cell:")
-                report.append(f"    a = {cell['a']:.4f} Å  (start {base.get('a', 0.0):.4f})")
-                report.append(f"    b = {cell['b']:.4f} Å  (start {base.get('b', 0.0):.4f})")
-                report.append(f"    c = {cell['c']:.4f} Å  (start {base.get('c', 0.0):.4f})")
-                report.append(f"    α = {cell['alpha']:.3f}°")
-                report.append(f"    β = {cell['beta']:.3f}°")
-                report.append(f"    γ = {cell['gamma']:.3f}°")
+                delta = cells.cell_deltas(cell, base)
+                groups = params.get('_cell_groups') or ()
+                free = ", ".join(group.key for group in groups)
+                report.append(
+                    f"  Unit cell (free: {free})" if free
+                    else "  Unit cell (isotropic dilation; reflections not indexed)"
+                )
+                for key, unit in (('a', 'Å'), ('b', 'Å'), ('c', 'Å')):
+                    report.append(
+                        f"    {key} = {cell[key]:.4f} {unit}  "
+                        f"(start {base.get(key, 0.0):.4f}, {delta.get(key, 0.0):+.3f}%)"
+                    )
+                for key, symbol in (('alpha', 'α'), ('beta', 'β'), ('gamma', 'γ')):
+                    report.append(
+                        f"    {symbol} = {cell[key]:.3f}°  "
+                        f"(start {base.get(key, 0.0):.3f}, {delta.get(key, 0.0):+.3f}°)"
+                    )
                 if cell.get('volume'):
-                    report.append(f"    V = {cell['volume']:.3f} Å³")
+                    report.append(
+                        f"    V = {cell['volume']:.3f} Å³  "
+                        f"({delta.get('volume', 0.0):+.3f}%)"
+                    )
             
             # Show space group if available
             space_group = phase['data']['phase'].get('space_group', 'Unknown')

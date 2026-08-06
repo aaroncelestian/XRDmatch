@@ -266,7 +266,7 @@ def results():
 def test_summary_table_reports_the_whole_cell(results):
     labels = [label for label, _ in refinement_table.SUMMARY_COLUMNS]
     for expected in ("a (Å)", "b (Å)", "c (Å)", "α (°)", "β (°)", "γ (°)",
-                     "V (Å³)", "Δlattice %", "wt%", "Scale", "Strain",
+                     "V (Å³)", "ΔV %", "wt%", "Scale", "Strain",
                      "Contrib.%"):
         assert expected in labels
 
@@ -298,7 +298,8 @@ def test_detail_rows_cover_every_phase(results):
     rows = refinement_table.detail_rows(results)
     labels = [row[0] for row in rows]
     for expected in ("Absorption", "Harmonic coefficients", "Crystallite size (µm)",
-                     "Microstrain (×10⁻⁶)", "Starting a (Å)", "RIR (I/Ic)"):
+                     "Microstrain (×10⁻⁶)", "Starting a (Å)", "RIR (I/Ic)",
+                     "Cell parameters free", "Δa (%)", "ΔV (%)"):
         assert expected in labels
     for row in rows:
         assert len(row) == 1 + len(names)

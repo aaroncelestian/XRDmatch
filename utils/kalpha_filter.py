@@ -33,6 +33,10 @@ GENERIC_RATIO = 1.00249
 
 DEFAULT_MAX_INTENSITY_RATIO = 0.75  # nominal is 0.5; overlap inflates it
 
+# The Kα doublet's intensity ratio is set by the transition probabilities, so it
+# is the same 1:2 on every anode and is a value to start from rather than guess.
+NOMINAL_INTENSITY_RATIO = 0.5
+
 
 def identify_anode(wavelength: float, tol: float = 0.004) -> Optional[str]:
     """Match a wavelength against Kα1 or the Kα1/Kα2 weighted average."""
@@ -41,6 +45,38 @@ def identify_anode(wavelength: float, tol: float = 0.004) -> Optional[str]:
         if abs(wavelength - a1) <= tol or abs(wavelength - weighted) <= tol:
             return anode
     return None
+
+
+def kalpha1_wavelength(wavelength: float, tol: float = 0.004) -> Optional[float]:
+    """
+    The Kα1 line of the anode a wavelength belongs to, if it can be identified.
+
+    A pattern is often recorded against the weighted average of the doublet,
+    which is the right single wavelength to use when the satellite is not
+    modelled and the wrong one as soon as it is: the parent line then has to sit
+    where Kα1 puts it, not a third of the way towards Kα2. Returns None when the
+    wavelength matches no known anode, and the Kα1 value otherwise, which the
+    caller can compare against what it has.
+    """
+    anode = identify_anode(wavelength, tol=tol)
+    return KALPHA_DOUBLETS[anode][0] if anode else None
+
+
+def alpha2_separation(two_theta, ratio: float):
+    """
+    How far each Kα2 satellite sits above its parent line, in degrees 2θ.
+
+    Both lines diffract off the same d-spacing, so Bragg's law puts the
+    satellite at the angle whose sin θ is larger by the wavelength ratio. The
+    separation therefore grows as tan θ, from under a tenth of a degree at low
+    angle to well past a peak width at high angle.
+    """
+    two_theta = np.asarray(two_theta, dtype=float)
+    sin_theta = np.sin(np.radians(two_theta / 2.0)) * float(ratio)
+    satellite = 2.0 * np.degrees(np.arcsin(np.clip(sin_theta, -1.0, 1.0)))
+    # A reflection whose satellite would fall past the backscattering limit has
+    # nowhere to put it; leaving the separation at zero merges it into the parent
+    return np.where(sin_theta < 1.0, satellite - two_theta, 0.0)
 
 
 def alpha2_ratio(wavelength: float) -> float:

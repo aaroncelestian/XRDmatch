@@ -7,7 +7,7 @@ import os
 import numpy as np
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
-    QDialog, QHBoxLayout, QLabel, QPushButton, QSplitter, QVBoxLayout, QWidget,
+    QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget,
 )
 
 from matplotlib_config import apply_plot_style, draw_error_bars, get_plot_palette
@@ -35,32 +35,24 @@ class QuantDialog(QDialog):
         root = QVBoxLayout(self)
         root.setContentsMargins(6, 6, 6, 6)
 
-        splitter = QSplitter(Qt.Horizontal)
-        splitter.setChildrenCollapsible(False)
-
-        # RefineStage expects a "workspace" with plot + status helpers — use self
+        # RefineStage expects a "workspace" with plot + status helpers — use
+        # self. It is built here but shown in the parameters window, which is
+        # where every refinement control lives.
         self.refine_stage = RefineStage(session, self)
-        left = QWidget()
-        left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.addWidget(self.refine_stage)
-        left.setMinimumWidth(280)
-        left.setMaximumWidth(420)
-        splitter.addWidget(left)
 
-        right = QWidget()
-        right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(2)
+        body = QWidget()
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(0, 0, 0, 0)
+        body_layout.setSpacing(2)
 
         host, self.quant_figure, self.quant_canvas, self.quant_toolbar = create_plot_host(
-            right, figsize=(9, 6)
+            body, figsize=(9, 6)
         )
         self.quant_ax = self.quant_figure.add_subplot(111)
         self.figure = self.quant_figure
         self.canvas = self.quant_canvas
         self.ax = self.quant_ax
-        right_layout.addWidget(host, 1)
+        body_layout.addWidget(host, 1)
 
         results_wrap = QWidget()
         qr = QVBoxLayout(results_wrap)
@@ -74,10 +66,12 @@ class QuantDialog(QDialog):
         # it has to wrap rather than clip the very part that qualifies them
         self.quant_results_label.setWordWrap(True)
         header_row.addWidget(self.quant_results_label, 1)
-        self.details_btn = QPushButton("Parameters…")
+        self.details_btn = QPushButton("Refinement Controls…")
+        self.details_btn.setObjectName("primaryButton")
         self.details_btn.setToolTip(
-            "Edit which terms refine for each phase, hold a value at a number "
-            "you choose, or read every refined parameter in one place."
+            "Set up and run the refinement: every global and per-phase control, "
+            "which terms refine for each phase, values held at a number you "
+            "choose, and the exports."
         )
         self.details_btn.clicked.connect(self.show_details)
         header_row.addWidget(self.details_btn)
@@ -90,13 +84,9 @@ class QuantDialog(QDialog):
             "Ctrl-C copies the selection, or the whole table when nothing is selected"
         )
         qr.addWidget(self.quant_results_table)
-        right_layout.addWidget(results_wrap)
+        body_layout.addWidget(results_wrap)
 
-        splitter.addWidget(right)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([320, 780])
-        root.addWidget(splitter)
+        root.addWidget(body)
 
         self._details_dialog = None
 
@@ -106,7 +96,9 @@ class QuantDialog(QDialog):
 
     def show_details(self):
         if self._details_dialog is None:
-            self._details_dialog = RefinementDetailsDialog(self.session, self)
+            self._details_dialog = RefinementDetailsDialog(
+                self.session, self, refine_panel=self.refine_stage
+            )
             # Closing the parameter window should come back here, not to the
             # main window behind it
             self._details_dialog.finished.connect(lambda _result: hold_focus(self))
@@ -161,11 +153,9 @@ class QuantDialog(QDialog):
                 "Refinement — run Le Bail, or RIR Quant in the Phases tab"
             )
             self.quant_results_table.set_content([], [])
-        has_phases = bool(
-            self.session.selected_phases or self.session.matched_phases
-            or (results and results.get("success"))
-        )
-        self.details_btn.setEnabled(has_phases)
+        # Always reachable: it is the only way to the refinement controls, and
+        # a run has to be set up before there is anything to report.
+        self.details_btn.setEnabled(True)
 
     def _show_lebail_details(self, results: dict):
         parts = refinement_table.summary_headline(results)

@@ -870,6 +870,9 @@ class MultiPhaseAnalyzer:
                     ),
                     'asymmetry': carry('asymmetry', 0.0),
                     'lattice_scale': carry('lattice_scale', 1.0),
+                    # The whole cell, so a run that refined a and c apart starts
+                    # where it left off rather than at a single dilation
+                    'unit_cell': carry('unit_cell', None),
                     'absorption': carry('absorption', 0.0),
                     'harmonic_coeffs': carry('harmonic_coeffs', []),
                     'zero_shift': 0.0,
@@ -908,12 +911,14 @@ class MultiPhaseAnalyzer:
                 'refine_displacement': settings.get('refine_displacement', False),
                 'refine_instrument_profile': settings.get('refine_instrument_profile', False),
                 'refine_axial_asymmetry': settings.get('refine_axial_asymmetry', False),
+                'alpha2_ratio': float(settings.get('alpha2_ratio', 0.0) or 0.0),
+                'refine_alpha2_ratio': settings.get('refine_alpha2_ratio', False),
             }
             # Starting values carried over from a previous run. This has to come
             # after add_phase, which seeds the instrument widths from the
             # per-phase initial_u/v/w.
             for key in ('zero_shift', 'displacement', 'u_param', 'v_param', 'w_param',
-                        'axial_asymmetry'):
+                        'axial_asymmetry', 'alpha2_ratio'):
                 value = (settings.get('carry_globals') or {}).get(key)
                 if value is not None:
                     globals_[key] = float(value)
