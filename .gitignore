@@ -7,6 +7,7 @@ ENV/
 
 # Bytecode / caches
 __pycache__/
+*.pyc
 *.py[cod]
 *$py.class
 *.so
@@ -97,3 +98,6 @@ data/
 
 # Docs
 docs/
+
+# Offline dependency cache (pip download)
+offline_packages/
