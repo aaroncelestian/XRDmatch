@@ -1,0 +1,26 @@
+Rwp (%),32.418
+Rwp near peaks (%),20.367
+Points near peaks (%),41.7
+Rp (%),57.377
+Rexp (%),12.116
+R_Bragg (%),—
+Durbin-Watson,0.262
+Residuals look,strongly correlated — systematic misfit
+Goodness of fit,2.676
+Fitted region,Whole pattern
+Cycles,10
+Intensity model,Reference intensities (quantitative)
+Zero shift (°),+0.48539
+Sample displacement (°),-0.50000
+Instrument U,0.000500
+Instrument V,0.000000
+Instrument W,0.010000
+Axial asymmetry,+0.00000
+Zero shift refined,yes
+Displacement refined,yes
+Instrument profile refined,yes
+Axial asymmetry refined,no
+
+Phase,wt%,Scale,Strain,a (Å),b (Å),c (Å),α (°),β (°),γ (°),V (Å³),Δlattice %,Contrib.%
+Troilite,63.7,1.332,3397,5.9674,5.9674,11.7678,90.000,90.000,120.000,362.91,+0.024,63.7
+Pyrrhotite,36.3,0.6076,6478,6.8871,11.9287,28.6103,90.000,90.000,90.000,2350.45,-0.086,36.3
