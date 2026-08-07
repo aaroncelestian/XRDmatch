@@ -177,7 +177,7 @@ class XRDMainWindow(QMainWindow):
             <ul>
             <li>Browse folders and load diffraction patterns</li>
             <li>Background, peak finding, and phase matching</li>
-            <li>Le Bail refinement in a dedicated Quant window</li>
+            <li>Le Bail refinement: Quant plot plus Parameters window for controls</li>
             <li>Local CIF database management</li>
             </ul>
             <p>Built with PyQt5 and scientific Python libraries</p>""",

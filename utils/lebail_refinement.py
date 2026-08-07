@@ -86,10 +86,15 @@ class LeBailRefinement:
             'x_param': 0.0,         # instrument Lorentzian; normally zero
             'y_param': 0.0,
             'axial_asymmetry': 0.0,  # axial divergence skew, as cot(2-theta)
+            # Residual continuum after ALS (or raw data). Chebyshev on the fitted
+            # 2θ range; solved by linear least squares each cycle when refined.
+            'background_coeffs': [],
+            'background_order': 3,
             'refine_zero_shift': True,
             'refine_displacement': False,
             'refine_instrument_profile': False,
             'refine_axial_asymmetry': False,
+            'refine_background': False,
         }
         self.wavelength = 1.5406
 
@@ -133,26 +138,31 @@ class LeBailRefinement:
     def set_experimental_data(self, two_theta: np.ndarray, intensity: np.ndarray, 
                             errors: Optional[np.ndarray] = None,
                             two_theta_range: Optional[Tuple[float, float]] = None,
-                            wavelength: Optional[float] = None):
+                            wavelength: Optional[float] = None,
+                            background_seed: Optional[np.ndarray] = None):
         """Set experimental diffraction data
         
         Args:
             two_theta: 2-theta values in degrees
-            intensity: Intensity values
-                      IMPORTANT: Should be background-subtracted intensity
-                      Background subtraction must be performed before Le Bail refinement
-                      to avoid fitting the background as part of the diffraction pattern
+            intensity: Intensity values. When refining background, pass the
+                      pattern with continuum still present (e.g. ALS-subtracted
+                      intensity plus the ALS curve) so the Chebyshev term can
+                      start from that model.
             errors: Optional error values (defaults to sqrt(intensity))
             two_theta_range: Optional (min, max) 2-theta range to limit refinement
             wavelength: Radiation wavelength in angstroms; used by the Scherrer
                         size term. Defaults to Cu K-alpha when omitted.
+            background_seed: Optional continuum on the same grid (typically the
+                      ALS background). Projected onto Chebyshev before the first
+                      cycle when refine_background is on and no coeffs were
+                      carried from a previous run.
         """
         if wavelength is not None and wavelength > 0:
             self.wavelength = float(wavelength)
 
         # Normalize intensity to 0-100 scale for better numerical stability
-        intensity = np.array(intensity)
-        max_intensity = np.max(intensity)
+        intensity = np.array(intensity, dtype=float)
+        max_intensity = float(np.max(intensity)) if len(intensity) else 0.0
         
         if max_intensity > 0:
             normalized_intensity = (intensity / max_intensity) * 100.0
@@ -162,16 +172,25 @@ class LeBailRefinement:
         
         # Scale errors proportionally
         if errors is not None:
-            errors = np.array(errors)
+            errors = np.array(errors, dtype=float)
             normalized_errors = (errors / max_intensity) * 100.0 if max_intensity > 0 else errors
         else:
             normalized_errors = np.sqrt(np.maximum(normalized_intensity, 1))
+
+        seed_norm = None
+        if background_seed is not None:
+            seed = np.asarray(background_seed, dtype=float)
+            if len(seed) == len(intensity) and max_intensity > 0:
+                seed_norm = seed / max_intensity * 100.0
+            elif len(seed) == len(intensity):
+                seed_norm = seed.copy()
         
         self.experimental_data = {
-            'two_theta': np.array(two_theta),
+            'two_theta': np.array(two_theta, dtype=float),
             'intensity': normalized_intensity,
             'errors': normalized_errors,
-            'original_max_intensity': max_intensity  # Store for reference
+            'original_max_intensity': max_intensity,  # Store for reference
+            'background_seed': seed_norm,
         }
         self.two_theta_range = two_theta_range
         self._update_grid()
@@ -282,27 +301,34 @@ class LeBailRefinement:
         """Apply 2-theta range filter to experimental data"""
         if self.two_theta_range is None:
             return
-        
+
         # Store original data if not already stored (to prevent double-filtering)
         if not hasattr(self, '_original_experimental_data'):
-            self._original_experimental_data = {
+            original = {
                 'two_theta': self.experimental_data['two_theta'].copy(),
                 'intensity': self.experimental_data['intensity'].copy(),
-                'errors': self.experimental_data['errors'].copy()
+                'errors': self.experimental_data['errors'].copy(),
             }
-            
+            seed = self.experimental_data.get('background_seed')
+            if seed is not None:
+                original['background_seed'] = np.asarray(seed, dtype=float).copy()
+            self._original_experimental_data = original
+
         min_2theta, max_2theta = self.two_theta_range
         two_theta = self._original_experimental_data['two_theta']
-        
+
         # Create mask for the specified range
         mask = (two_theta >= min_2theta) & (two_theta <= max_2theta)
-        
+
         # Filter all data arrays from original data
         self.experimental_data['two_theta'] = two_theta[mask]
         self.experimental_data['intensity'] = self._original_experimental_data['intensity'][mask]
         self.experimental_data['errors'] = self._original_experimental_data['errors'][mask]
+        seed = self._original_experimental_data.get('background_seed')
+        if seed is not None and len(seed) == len(two_theta):
+            self.experimental_data['background_seed'] = seed[mask]
         self._update_grid()
-        
+
         self._log(f"Applied 2-theta range filter: {min_2theta:.2f}° - {max_2theta:.2f}°")
         self._log(f"Data points: {len(two_theta)} → {len(self.experimental_data['two_theta'])}")
 
@@ -502,6 +528,9 @@ class LeBailRefinement:
             self._apply_two_theta_filter()
         if not self.experimental_data or not self.phases:
             raise ValueError("Must set experimental data and add phases before refinement")
+
+        # ALS continuum → Chebyshev before the first cycle (unless coeffs were carried)
+        self._apply_background_seed_if_needed()
             
         self._log(f"Starting Le Bail refinement ({self.mode}) with {len(self.phases)} phases")
         self._log(f"Experimental data: {len(self.experimental_data['two_theta'])} points")
@@ -554,6 +583,7 @@ class LeBailRefinement:
         # misaligned peaks drives a real phase towards zero, and a phase that
         # starts at zero contributes nothing for the position search to work with.
         self._refine_global_parameters()
+        self._refine_background()
         self._initialize_scales()
         
         # STAGE 1: Refine unit cell and zero shift only (if staged refinement)
@@ -582,7 +612,8 @@ class LeBailRefinement:
                         message=f"Cell — {self._phase_name(phase_idx)}",
                     )
                     self._refine_single_phase(phase_idx)
-                
+
+                self._refine_background()
                 calculated_pattern = self._calculate_total_pattern()
                 r_factors = self._calculate_r_factors(calculated_pattern)
                 self._log(f"R-factors: Rp={r_factors['Rp']:.3f}, Rwp={r_factors['Rwp']:.3f}")
@@ -638,7 +669,8 @@ class LeBailRefinement:
                     message=f"Profile — {phase_name}",
                 )
                 self._refine_single_phase(phase_idx)
-                
+
+            self._refine_background()
             calculated_pattern = self._calculate_total_pattern()
             r_factors = self._calculate_r_factors(calculated_pattern)
             phase_contributions = self._calculate_phase_contributions()
@@ -888,6 +920,113 @@ class LeBailRefinement:
         finally:
             self._freeze_extracted = False
             self._refresh_extracted()
+
+    def _chebyshev_basis(self, order: int) -> np.ndarray:
+        """Vandermonde of Chebyshev T_0 … T_order on the fitted 2θ range."""
+        tt = np.asarray(self.experimental_data['two_theta'], dtype=float)
+        lo = float(tt[0]) if len(tt) else 0.0
+        hi = float(tt[-1]) if len(tt) else 1.0
+        if hi <= lo:
+            x = np.zeros_like(tt)
+        else:
+            x = 2.0 * (tt - lo) / (hi - lo) - 1.0
+        x = np.clip(x, -1.0, 1.0)
+        # T_k(x) = cos(k arccos x); column 0 is ones
+        theta = np.arccos(x)
+        return np.column_stack([np.cos(k * theta) for k in range(order + 1)])
+
+    def _calculate_background(self) -> np.ndarray:
+        """Polynomial continuum from the current Chebyshev coefficients."""
+        n = len(self.experimental_data['two_theta'])
+        coeffs = self.global_parameters.get('background_coeffs') or []
+        if not coeffs:
+            return np.zeros(n, dtype=float)
+        order = len(coeffs) - 1
+        return self._chebyshev_basis(order) @ np.asarray(coeffs, dtype=float)
+
+    def _calculate_phases_only(self) -> np.ndarray:
+        """Sum of phase profiles, without the continuum background."""
+        total = np.zeros_like(self.experimental_data['two_theta'], dtype=float)
+        for phase_idx in range(len(self.phases)):
+            total += self._calculate_phase_pattern(
+                phase_idx, self.phases[phase_idx]['parameters']
+            )
+        return total
+
+    def _apply_background_seed_if_needed(self):
+        """
+        Project the ALS (or other) continuum onto Chebyshev before refining.
+
+        Skipped when coefficients were already carried from a previous run, so
+        staged refinement keeps the continuum it already found.
+        """
+        if not self.global_parameters.get('refine_background', False):
+            return
+        if self.global_parameters.get('background_coeffs'):
+            return
+        seed = (self.experimental_data or {}).get('background_seed')
+        if seed is None:
+            return
+        seed = np.asarray(seed, dtype=float)
+        n = len(self.experimental_data['two_theta'])
+        if len(seed) != n:
+            self._log(
+                f"Background seed length {len(seed)} ≠ data {n}; "
+                "starting Chebyshev from zero"
+            )
+            return
+        order = int(self.global_parameters.get('background_order', 3) or 0)
+        order = max(0, min(order, 12))
+        A = self._chebyshev_basis(order)
+        try:
+            coeffs, _, _, _ = np.linalg.lstsq(A, seed, rcond=None)
+        except Exception as e:
+            self._log(f"ALS → Chebyshev seed failed: {e}")
+            return
+        self.global_parameters['background_coeffs'] = [float(c) for c in coeffs]
+        self.global_parameters['background_order'] = order
+        rms = float(np.sqrt(np.mean((A @ coeffs - seed) ** 2)))
+        self._log(
+            f"  Background seeded from ALS (Chebyshev order {order}, "
+            f"seed RMS {rms:.4g})"
+        )
+
+    def _refine_background(self):
+        """
+        Fit a Chebyshev continuum to (observed − phases) by weighted linear LS.
+
+        Done each cycle after the phases move. The continuum is linear in its
+        coefficients, so a nonlinear joint step is unnecessary and would only
+        couple the background to every profile parameter. When an ALS seed was
+        applied, the first solve starts from that projection rather than zero.
+        """
+        if not self.global_parameters.get('refine_background', False):
+            return
+        if not self.experimental_data or not self.phases:
+            return
+
+        order = int(self.global_parameters.get('background_order', 3) or 0)
+        order = max(0, min(order, 12))
+        A = self._chebyshev_basis(order)
+        phases = self._calculate_phases_only()
+        obs = np.asarray(self.experimental_data['intensity'], dtype=float)
+        errors = np.maximum(
+            np.asarray(self.experimental_data['errors'], dtype=float), 1e-12
+        )
+        Aw = A / errors[:, None]
+        yw = (obs - phases) / errors
+        try:
+            coeffs, _, _, _ = np.linalg.lstsq(Aw, yw, rcond=None)
+        except Exception as e:
+            self._log(f"Background refinement failed: {e}")
+            return
+        self.global_parameters['background_coeffs'] = [float(c) for c in coeffs]
+        self.global_parameters['background_order'] = order
+        self._log(
+            f"  Background: Chebyshev order {order}, "
+            f"|c0|={abs(coeffs[0]):.4g}"
+            + (f", |c1|={abs(coeffs[1]):.4g}" if order >= 1 else "")
+        )
 
     # Parameters that move peak positions. Fitting them in the same least-squares
     # step as the profile widths makes the Jacobian so ill-conditioned that the
@@ -1623,21 +1762,16 @@ class LeBailRefinement:
         )
         
     def _calculate_total_pattern(self) -> np.ndarray:
-        """Calculate total calculated pattern from all phases"""
-        total_pattern = np.zeros_like(self.experimental_data['two_theta'])
-        
-        for phase_idx in range(len(self.phases)):
-            phase_pattern = self._calculate_phase_pattern(phase_idx, self.phases[phase_idx]['parameters'])
-            total_pattern += phase_pattern
-            
-        return total_pattern
+        """Calculate total calculated pattern from all phases plus background."""
+        return self._calculate_phases_only() + self._calculate_background()
         
     def _calculate_phase_contributions(self) -> List[Dict]:
         """Calculate per-phase contributions and R-factors"""
         contributions = []
         obs = self.experimental_data['intensity']
         errors = self.experimental_data['errors']
-        total_pattern = self._calculate_total_pattern()
+        # Contribution is among the crystalline phases, not vs the continuum
+        total_pattern = self._calculate_phases_only()
         
         for phase_idx in range(len(self.phases)):
             phase_pattern = self._calculate_phase_pattern(phase_idx, self.phases[phase_idx]['parameters'])
@@ -2058,6 +2192,19 @@ class LeBailRefinement:
             f"V={self.global_parameters.get('v_param', 0.0):.6f}, "
             f"W={self.global_parameters.get('w_param', 0.0):.6f}"
         )
+        bg_coeffs = self.global_parameters.get('background_coeffs') or []
+        if self.global_parameters.get('refine_background') or bg_coeffs:
+            order = self.global_parameters.get('background_order', max(0, len(bg_coeffs) - 1))
+            report.append(
+                f"  Background    = Chebyshev order {order}"
+                + (" (refined)" if self.global_parameters.get('refine_background') else " (fixed)")
+            )
+            if bg_coeffs:
+                report.append(
+                    "                 coeffs = "
+                    + ", ".join(f"{c:+.4g}" for c in bg_coeffs[:6])
+                    + ("…" if len(bg_coeffs) > 6 else "")
+                )
         report.append(
             "  Intensity model = "
             + ("reference intensities, scale refined" if self.intensity_model == 'fixed'

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QHBoxLayout, QLabel, QMessageBox,
     QPushButton, QSlider, QSpinBox, QVBoxLayout, QWidget,
@@ -17,21 +17,47 @@ from gui.widgets.control_bar import ControlRow, OptionsDialog
 from utils.kalpha_filter import strip_alpha2_peaks
 
 
-def als_baseline(y, lam=1e5, p=0.01, niter=10):
+def als_baseline(y, lam=1e5, p=0.05, niter=10, center_noise=True):
+    """
+    Asymmetric least-squares baseline (Eilers & Boelens).
+
+    Small *p* down-weights points above the curve so peaks do not pull the
+    fit up — but left alone that also parks the curve under the noise floor.
+    When *center_noise* is set, the finished curve is shifted so that the
+    non-peak residuals sit about zero: the background runs through the middle
+    of the continuum noise rather than along its lower envelope.
+    """
     try:
+        y = np.asarray(y, dtype=float)
         L = len(y)
         D = diags([1, -2, 1], [0, -1, -2], shape=(L, L - 2))
         D = lam * D.dot(D.transpose())
         w = np.ones(L)
         W = diags(w, 0, shape=(L, L))
+        z = y.copy()
         for _ in range(niter):
             W.setdiag(w)
             Z = W + D
             z = spsolve(Z, w * y)
             w = p * (y > z) + (1 - p) * (y < z)
+        if center_noise:
+            z = _center_baseline_on_noise(y, z)
         return z
     except Exception:
-        return np.zeros_like(y)
+        return np.zeros_like(y, dtype=float)
+
+
+def _center_baseline_on_noise(y, z):
+    """Shift z so continuum residuals (noise, not peaks) average near zero."""
+    residual = np.asarray(y, dtype=float) - np.asarray(z, dtype=float)
+    med = float(np.median(residual))
+    mad = float(np.median(np.abs(residual - med)))
+    scale = 1.4826 * mad if mad > 0 else float(np.std(residual)) or 1.0
+    # Keep points that are not clear positive peaks
+    mask = residual < med + 3.0 * scale
+    if np.count_nonzero(mask) < max(10, len(residual) // 20):
+        mask = np.ones(len(residual), dtype=bool)
+    return z + float(np.median(residual[mask]))
 
 
 class ProcessStage(QWidget):
@@ -48,6 +74,12 @@ class ProcessStage(QWidget):
         self.background_panel = self._build_background_panel()
         self.peaks_panel = self._build_peaks_panel()
 
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.setInterval(150)
+        self._preview_timer.timeout.connect(self._live_preview)
+        self._wire_live_preview()
+
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
 
@@ -62,13 +94,21 @@ class ProcessStage(QWidget):
         row = ControlRow()
         self.apply_btn = QPushButton("Apply Processing")
         self.apply_btn.setObjectName("primaryButton")
-        self.apply_btn.setToolTip("Apply background subtraction and smoothing")
-        self.apply_btn.clicked.connect(self.apply_processing)
+        self.apply_btn.setToolTip(
+            "Commit background subtraction and smoothing. The plot also updates "
+            "live as you change the settings below."
+        )
+        self.apply_btn.clicked.connect(lambda: self.apply_processing(silent=False))
         row.add_widget(self.apply_btn)
         row.add_separator()
 
         self.enable_bg = QCheckBox("ALS background")
         self.enable_bg.setChecked(True)
+        self.enable_bg.setToolTip(
+            "Fit a smooth continuum under the pattern and subtract it. The curve "
+            "is placed through the middle of the background noise, not along its "
+            "lower edge."
+        )
         row.add_widget(self.enable_bg)
 
         self.lambda_slider = QSlider(Qt.Horizontal)
@@ -78,14 +118,24 @@ class ProcessStage(QWidget):
         self.lambda_slider.valueChanged.connect(
             lambda v: self.lambda_label.setText(f"1e{v}")
         )
+        self.lambda_slider.setToolTip(
+            "Smoothness of the background. Higher λ → stiffer curve that ignores "
+            "broad humps less; lower λ → more flexible and can follow peak feet."
+        )
         row.add_field("Smoothness λ:", self.lambda_slider, 120)
         row.add_widget(self.lambda_label)
 
         self.p_spin = QDoubleSpinBox()
-        self.p_spin.setRange(0.001, 0.1)
+        self.p_spin.setRange(0.001, 0.5)
         self.p_spin.setDecimals(3)
-        self.p_spin.setSingleStep(0.001)
-        self.p_spin.setValue(0.01)
+        self.p_spin.setSingleStep(0.005)
+        self.p_spin.setValue(0.05)
+        self.p_spin.setToolTip(
+            "ALS asymmetry. Lower values ignore points above the curve more "
+            "strongly (peaks cannot lift the fit, but the curve sits lower). "
+            "Higher values (~0.1–0.2) track the continuum more closely. The fit "
+            "is then recentered so residuals in the noise average near zero."
+        )
         row.add_field("Asymmetry p:", self.p_spin, 84)
 
         self.displacement = QDoubleSpinBox()
@@ -125,12 +175,33 @@ class ProcessStage(QWidget):
         self.enable_noise = QCheckBox("Median noise reduction")
         return panel
 
+    def _wire_live_preview(self):
+        for signal in (
+            self.enable_bg.stateChanged,
+            self.lambda_slider.valueChanged,
+            self.p_spin.valueChanged,
+            self.displacement.valueChanged,
+            self.iterations.valueChanged,
+            self.enable_smooth.stateChanged,
+            self.smooth_window.valueChanged,
+            self.enable_noise.stateChanged,
+        ):
+            signal.connect(self._schedule_preview)
+
+    def _schedule_preview(self, *_args):
+        if not self.session.has_pattern():
+            return
+        self._preview_timer.start()
+
+    def _live_preview(self):
+        self.apply_processing(silent=True)
+
     def _show_bg_options(self):
         if self._bg_options is None:
             dlg = OptionsDialog(
                 "Background Options",
                 self.workspace.window(),
-                "Applied the next time you press Apply Processing.",
+                "Changes update the plot live.",
             )
             dlg.add_row("ALS iterations:", self.iterations)
             dlg.add_row("", self.enable_smooth)
@@ -189,7 +260,7 @@ class ProcessStage(QWidget):
         self.min_height.setRange(0.0, 100.0)
         self.min_height.setDecimals(2)
         self.min_height.setSingleStep(0.10)
-        self.min_height.setValue(0.10)
+        self.min_height.setValue(10.0)
         self.min_height.setSuffix("%")
         self.min_height.setToolTip(
             "Extra height floor as a percent of the strongest peak. Left low, the "
@@ -201,7 +272,7 @@ class ProcessStage(QWidget):
         self.min_prominence.setRange(0.0, 100.0)
         self.min_prominence.setDecimals(2)
         self.min_prominence.setSingleStep(0.10)
-        self.min_prominence.setValue(0.10)
+        self.min_prominence.setValue(5.0)
         self.min_prominence.setSuffix("%")
         self.min_prominence.setToolTip(
             "Extra prominence floor above the local baseline, as a percent of the "
@@ -288,9 +359,19 @@ class ProcessStage(QWidget):
             self.peak_status.setText("Load a pattern first.")
             return
 
-        self.bg_status.setText("Adjust background, then Apply Processing.")
+        # Do not auto-run ALS here — it blocks the UI on every file-tree click.
+        # Processing starts when the user changes a control (live preview) or
+        # presses Apply / Find Peaks.
         if self.session.processed_pattern is None:
-            self.apply_processing(silent=True)
+            self.bg_status.setText(
+                "Raw pattern loaded. Adjust λ / p for a live preview, "
+                "or press Apply Processing."
+            )
+        else:
+            self.bg_status.setText(
+                "Background updates live as you change λ and p. "
+                "The fit runs through the middle of the continuum noise."
+            )
         # Entering the tab must not overwrite the result of a completed run
         if not self.session.has_peaks():
             self.peak_status.setText("Apply background/smoothing, then Find Peaks.")
@@ -317,8 +398,10 @@ class ProcessStage(QWidget):
                 lam=lam,
                 p=self.p_spin.value(),
                 niter=self.iterations.value(),
+                center_noise=True,
             )
-            intensity = np.maximum(intensity - background, 0)
+            # Leave negative continuum noise; clipping would recreate a floor bias
+            intensity = intensity - background
 
         if self.enable_smooth.isChecked():
             intensity = uniform_filter1d(intensity, size=self.smooth_window.value())
@@ -340,6 +423,11 @@ class ProcessStage(QWidget):
         if not silent:
             self.bg_status.setText("Processing applied.")
             self.workspace.set_status("Processing applied")
+        elif self.enable_bg.isChecked():
+            self.bg_status.setText(
+                f"Live preview — λ=1e{self.lambda_slider.value()}, "
+                f"p={self.p_spin.value():.3f}"
+            )
 
     def clear_peaks(self):
         if not self.session.has_peaks():

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Optional, Tuple
 
 import numpy as np
 
@@ -13,8 +12,15 @@ SUPPORTED_EXTENSIONS = (".xy", ".xye", ".chi", ".xml", ".txt", ".dat", ".csv")
 
 COMMENT_PREFIXES = ("#", "!", ";", "'", "//")
 
+# Tiny toy/demo patterns still need to load; below this is almost never XRD.
+_MIN_POINTS = 5
+
 # TOPAS / jEdit style XYE files wrap headers in C comments, sometimes multi-line
 _C_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
+
+
+class PatternLoadError(ValueError):
+    """Raised when a file cannot be read as a diffraction pattern."""
 
 
 def strip_comments(text: str) -> str:
@@ -24,10 +30,44 @@ def strip_comments(text: str) -> str:
     return text[:start] if start != -1 else text
 
 
+def _validate_pattern_arrays(tt: np.ndarray, inten: np.ndarray) -> None:
+    """Reject arrays that clearly are not a diffraction scan."""
+    n = len(tt)
+    if n < _MIN_POINTS:
+        raise PatternLoadError(
+            f"Only {n} numeric point{'s' if n != 1 else ''} found "
+            f"(need at least {_MIN_POINTS}). "
+            "This does not look like a diffraction pattern."
+        )
+    if not np.isfinite(tt).all() or not np.isfinite(inten).all():
+        raise PatternLoadError("Pattern contains non-finite values.")
+    if float(np.ptp(tt)) <= 0:
+        raise PatternLoadError(
+            "All x-axis values are identical — not a diffraction scan."
+        )
+    # A measured 2θ / Q / d scan is almost always monotonically ordered.
+    # Allow a few out-of-order points; reject scrambled tables/logs.
+    diffs = np.diff(tt)
+    n_diff = max(len(diffs), 1)
+    forward = float(np.count_nonzero(diffs > 0)) / n_diff
+    backward = float(np.count_nonzero(diffs < 0)) / n_diff
+    if max(forward, backward) < 0.85:
+        raise PatternLoadError(
+            "X-axis values are not ordered like a diffraction scan "
+            "(expected mostly increasing or decreasing 2θ / Q / d)."
+        )
+
+
 def parse_text_file(file_path: str):
     """Parse XY / XYE / CHI / CSV / DAT text diffraction files."""
-    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-        text = strip_comments(f.read())
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            text = strip_comments(f.read())
+    except OSError as e:
+        raise PatternLoadError(f"Could not read file: {e}") from e
+
+    if not text.strip():
+        raise PatternLoadError("File is empty.")
 
     two_theta = []
     intensity = []
@@ -59,7 +99,10 @@ def parse_text_file(file_path: str):
         intensity_error.append(err)
 
     if not two_theta:
-        raise ValueError("No numeric diffraction data found in file")
+        raise PatternLoadError(
+            "No numeric columns found. Expected lines like "
+            "'2theta  intensity' (optional error)."
+        )
 
     tt = np.asarray(two_theta, dtype=float)
     inten = np.asarray(intensity, dtype=float)
@@ -73,7 +116,9 @@ def parse_text_file(file_path: str):
         if err is not None:
             err = err[valid]
     if len(tt) == 0:
-        raise ValueError("No finite diffraction data found in file")
+        raise PatternLoadError("No finite diffraction data found in file.")
+
+    _validate_pattern_arrays(tt, inten)
 
     # Zero-filled error columns are unusable as Le Bail weights
     if err is not None and not np.any(err > 0):
@@ -90,7 +135,13 @@ def parse_xml_file(file_path: str):
     intensity_error = []
     wavelength = None
 
-    tree = ET.parse(file_path)
+    try:
+        tree = ET.parse(file_path)
+    except ET.ParseError as e:
+        raise PatternLoadError(f"Invalid XML: {e}") from e
+    except OSError as e:
+        raise PatternLoadError(f"Could not read file: {e}") from e
+
     root = tree.getroot()
 
     w_elem = root.find("w")
@@ -113,15 +164,16 @@ def parse_xml_file(file_path: str):
             continue
 
     if not two_theta:
-        raise ValueError("No valid intensity data found in XML file")
+        raise PatternLoadError(
+            "No <intensity X=… Y=…> entries found — not an XRD pattern XML."
+        )
+
+    tt = np.asarray(two_theta, dtype=float)
+    inten = np.asarray(intensity, dtype=float)
+    _validate_pattern_arrays(tt, inten)
 
     err = np.asarray(intensity_error, dtype=float) if intensity_error else None
-    return (
-        np.asarray(two_theta, dtype=float),
-        np.asarray(intensity, dtype=float),
-        err,
-        wavelength,
-    )
+    return tt, inten, err, wavelength
 
 
 def normalize_for_comparison(intensity) -> np.ndarray:
@@ -151,7 +203,7 @@ def normalize_for_comparison(intensity) -> np.ndarray:
 def load_pattern_file(file_path: str, wavelength: float = 1.5406) -> dict:
     """Load a pattern file into the session dict format."""
     if not os.path.isfile(file_path):
-        raise FileNotFoundError(file_path)
+        raise PatternLoadError(f"File not found:\n{file_path}")
 
     wl = wavelength
     if file_path.lower().endswith(".xml"):

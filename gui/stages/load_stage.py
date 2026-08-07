@@ -11,7 +11,7 @@ from PyQt5.QtWidgets import (
     QLabel, QMessageBox, QPushButton, QVBoxLayout, QWidget,
 )
 
-from gui.pattern_io import SUPPORTED_EXTENSIONS, load_pattern_file
+from gui.pattern_io import PatternLoadError, SUPPORTED_EXTENSIONS, load_pattern_file
 
 
 class LoadStage(QWidget):
@@ -125,8 +125,20 @@ class LoadStage(QWidget):
             )
             self.workspace.refresh_plot()
             self.workspace.set_status(f"Loaded {name}")
+        except PatternLoadError as e:
+            name = os.path.basename(file_path)
+            QMessageBox.warning(
+                self,
+                "Not a Diffraction Pattern",
+                f"“{name}” could not be read as a diffraction pattern.\n\n{e}",
+            )
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Could not load pattern:\n{e}")
+            name = os.path.basename(file_path)
+            QMessageBox.critical(
+                self,
+                "Could Not Load File",
+                f"Unexpected error reading “{name}”:\n\n{e}",
+            )
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():

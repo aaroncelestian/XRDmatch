@@ -313,11 +313,24 @@ def global_rows(results: Optional[Dict]) -> List[Tuple[str, str]]:
         ("Instrument W", _number(globals_.get("w_param"), ".6f")),
         ("Axial asymmetry", _number(globals_.get("axial_asymmetry"), "+.5f")),
     ]
+    bg_coeffs = globals_.get("background_coeffs") or []
+    if globals_.get("refine_background") or bg_coeffs:
+        order = globals_.get("background_order")
+        if order is None and bg_coeffs:
+            order = len(bg_coeffs) - 1
+        rows.append(("Background order", str(order if order is not None else _MISSING)))
+        if bg_coeffs:
+            rows.append((
+                "Background coeffs",
+                ", ".join(f"{float(c):+.4g}" for c in bg_coeffs[:6])
+                + ("…" if len(bg_coeffs) > 6 else ""),
+            ))
     for label, key in (
         ("Zero shift refined", "refine_zero_shift"),
         ("Displacement refined", "refine_displacement"),
         ("Instrument profile refined", "refine_instrument_profile"),
         ("Axial asymmetry refined", "refine_axial_asymmetry"),
+        ("Background refined", "refine_background"),
     ):
         rows.append((label, "yes" if globals_.get(key) else "no"))
     return rows

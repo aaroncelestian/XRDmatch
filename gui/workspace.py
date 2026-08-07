@@ -24,7 +24,9 @@ from gui.theme import get_current_mode
 from gui.widgets.file_browser import FileBrowser
 from gui.widgets.plot_host import create_plot_host
 from gui.stages import ProcessStage, IdentifyStage
-from gui.pattern_io import load_pattern_file, normalize_for_comparison
+from gui.pattern_io import (
+    PatternLoadError, load_pattern_file, normalize_for_comparison,
+)
 from utils import emphasis
 from utils.two_theta_shift import DISPLACEMENT, describe as describe_shift
 
@@ -334,11 +336,11 @@ class AnalysisWorkspace(QWidget):
                 self.session, parent=parent, status_callback=self.set_status
             )
         self._quant_dialog.show()
-        self._quant_dialog.raise_()
-        self._quant_dialog.activateWindow()
+        self._quant_dialog.refresh_plot()
+        # Parameters owns the controls and opens with Quant; keep it in front
+        self._quant_dialog.show_details()
         if hasattr(self._quant_dialog.refine_stage, "on_enter"):
             self._quant_dialog.refine_stage.on_enter()
-        self._quant_dialog.refresh_plot()
 
     def open_database(self):
         from gui.dialogs.database_dialog import DatabaseManagerDialog
@@ -411,6 +413,7 @@ class AnalysisWorkspace(QWidget):
 
     def open_pattern_file(self, path: str):
         self._comparison = []
+        name = os.path.basename(path)
         try:
             wl = self.file_browser.current_wavelength()
             pattern = load_pattern_file(path, wl)
@@ -421,7 +424,6 @@ class AnalysisWorkspace(QWidget):
 
             self.session.set_raw_pattern(pattern)
             self.clear_peaks_table()
-            name = os.path.basename(path)
             n = len(pattern["two_theta"])
             t0, t1 = float(pattern["two_theta"][0]), float(pattern["two_theta"][-1])
             meta = (
@@ -430,13 +432,26 @@ class AnalysisWorkspace(QWidget):
             )
             self.file_browser.set_file_info(name, meta)
             self.file_browser.reveal_file(path)
-            self.process_stage.on_enter()
+            # Show raw data immediately — ALS / smoothing wait for the user
+            # (live preview or Apply). Auto-processing made tree clicks hang.
             self.identify_stage.on_enter()
             self.show_bottom_tab("background")
             self.refresh_plot()
             self.set_status(f"Loaded {name}")
+        except PatternLoadError as e:
+            self.set_status(f"Not a pattern: {name}")
+            QMessageBox.warning(
+                self,
+                "Not a Diffraction Pattern",
+                f"“{name}” could not be read as a diffraction pattern.\n\n{e}",
+            )
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Could not load pattern:\n{e}")
+            self.set_status(f"Failed to load {name}")
+            QMessageBox.critical(
+                self,
+                "Could Not Load File",
+                f"Unexpected error reading “{name}”:\n\n{e}",
+            )
 
     # --- multi-pattern comparison ---
 
@@ -1593,11 +1608,21 @@ class AnalysisWorkspace(QWidget):
                     processed.get("intensity_error"), palette["exp_line"],
                 )
             bg = self.session.background
-            if bg is not None and raw is not None and self._visible("background"):
-                ax.plot(
-                    raw["two_theta"], bg, color=palette["calc_line"],
-                    lw=display_settings.line_width(0.85), ls="--", label="Background",
-                )
+            if bg is not None and self._visible("background"):
+                # Same 2θ grid as the intensity the background was fit to
+                bg_tt = processed["two_theta"]
+                if len(bg) == len(bg_tt):
+                    ax.plot(
+                        bg_tt, bg, color=palette["calc_line"],
+                        lw=display_settings.line_width(0.85), ls="--",
+                        label="Background",
+                    )
+                elif raw is not None and len(bg) == len(raw["two_theta"]):
+                    ax.plot(
+                        raw["two_theta"], bg, color=palette["calc_line"],
+                        lw=display_settings.line_width(0.85), ls="--",
+                        label="Background",
+                    )
         peaks = self.session.peaks
         if peaks is not None and processed is not None and self._visible("peaks"):
             ax.plot(
@@ -1700,11 +1725,18 @@ class AnalysisWorkspace(QWidget):
             bgn = np.asarray(bg, dtype=float)
             rint = np.asarray(raw["intensity"], dtype=float)
             rmax = np.max(rint) if len(rint) else 1.0
-            ax.plot(
-                raw["two_theta"], (bgn / rmax * 100.0) if rmax > 0 else bgn,
-                color=palette["calc_line"], lw=display_settings.line_width(0.85),
-                ls="--", label="Background",
+            processed = self.session.processed_pattern
+            bg_tt = (
+                processed["two_theta"]
+                if processed is not None and len(bgn) == len(processed["two_theta"])
+                else raw["two_theta"]
             )
+            if len(bgn) == len(bg_tt):
+                ax.plot(
+                    bg_tt, (bgn / rmax * 100.0) if rmax > 0 else bgn,
+                    color=palette["calc_line"], lw=display_settings.line_width(0.85),
+                    ls="--", label="Background",
+                )
 
         colors = ["#c45c26", "#7a5cff", "#2a7a4b", "#b33a3a", "#5a6a7a"]
         selected = self.session.selected_phases

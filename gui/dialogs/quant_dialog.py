@@ -1,4 +1,4 @@
-"""Quant Analysis dialog — Le Bail refinement in its own window."""
+"""Quant Analysis dialog — Le Bail plot and results; controls live in Parameters."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import os
 import numpy as np
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
-    QDialog, QHBoxLayout, QLabel, QPushButton, QSplitter, QVBoxLayout, QWidget,
+    QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget,
 )
 
 from matplotlib_config import apply_plot_style, draw_error_bars, get_plot_palette
@@ -17,11 +17,10 @@ from gui.dialogs.refinement_details_dialog import RefinementDetailsDialog
 from gui.focus import hold_focus
 from gui.widgets.copyable_table import CopyableTable
 from gui.widgets.plot_host import create_plot_host
-from gui.stages.refine_stage import RefineStage
 
 
 class QuantDialog(QDialog):
-    """Non-modal tool window for quantitative / Le Bail analysis."""
+    """Non-modal plot window for quantitative / Le Bail analysis."""
 
     def __init__(self, session, parent=None, status_callback=None):
         super().__init__(parent)
@@ -34,33 +33,16 @@ class QuantDialog(QDialog):
 
         root = QVBoxLayout(self)
         root.setContentsMargins(6, 6, 6, 6)
-
-        splitter = QSplitter(Qt.Horizontal)
-        splitter.setChildrenCollapsible(False)
-
-        # RefineStage expects a "workspace" with plot + status helpers — use self
-        self.refine_stage = RefineStage(session, self)
-        left = QWidget()
-        left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.addWidget(self.refine_stage)
-        left.setMinimumWidth(280)
-        left.setMaximumWidth(420)
-        splitter.addWidget(left)
-
-        right = QWidget()
-        right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(2)
+        root.setSpacing(2)
 
         host, self.quant_figure, self.quant_canvas, self.quant_toolbar = create_plot_host(
-            right, figsize=(9, 6)
+            self, figsize=(9, 6)
         )
         self.quant_ax = self.quant_figure.add_subplot(111)
         self.figure = self.quant_figure
         self.canvas = self.quant_canvas
         self.ax = self.quant_ax
-        right_layout.addWidget(host, 1)
+        root.addWidget(host, 1)
 
         results_wrap = QWidget()
         qr = QVBoxLayout(results_wrap)
@@ -76,8 +58,8 @@ class QuantDialog(QDialog):
         header_row.addWidget(self.quant_results_label, 1)
         self.details_btn = QPushButton("Parameters…")
         self.details_btn.setToolTip(
-            "Edit which terms refine for each phase, hold a value at a number "
-            "you choose, or read every refined parameter in one place."
+            "Open the refinement controls: global and per-phase parameters, "
+            "Run Le Bail, and export."
         )
         self.details_btn.clicked.connect(self.show_details)
         header_row.addWidget(self.details_btn)
@@ -90,13 +72,7 @@ class QuantDialog(QDialog):
             "Ctrl-C copies the selection, or the whole table when nothing is selected"
         )
         qr.addWidget(self.quant_results_table)
-        right_layout.addWidget(results_wrap)
-
-        splitter.addWidget(right)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([320, 780])
-        root.addWidget(splitter)
+        root.addWidget(results_wrap)
 
         self._details_dialog = None
 
@@ -104,12 +80,21 @@ class QuantDialog(QDialog):
         session.matches_changed.connect(self._on_phases_changed)
         session.pattern_changed.connect(self._on_phases_changed)
 
-    def show_details(self):
+    @property
+    def refine_stage(self):
+        """Controls live in the Parameters window; exposed for callers/tests."""
+        self._ensure_details()
+        return self._details_dialog.refine_stage
+
+    def _ensure_details(self):
         if self._details_dialog is None:
             self._details_dialog = RefinementDetailsDialog(self.session, self)
             # Closing the parameter window should come back here, not to the
             # main window behind it
             self._details_dialog.finished.connect(lambda _result: hold_focus(self))
+
+    def show_details(self):
+        self._ensure_details()
         self._details_dialog.show()
         self._details_dialog.raise_()
         self._details_dialog.activateWindow()
@@ -119,15 +104,24 @@ class QuantDialog(QDialog):
             self._status_callback(message)
 
     def _on_phases_changed(self):
-        if hasattr(self.refine_stage, "on_enter"):
-            self.refine_stage.on_enter()
+        if self._details_dialog is not None and hasattr(
+            self._details_dialog.refine_stage, "on_enter"
+        ):
+            self._details_dialog.refine_stage.on_enter()
+        if self._details_dialog is not None and self._details_dialog.isVisible():
+            self._details_dialog.refresh()
         self.refresh_plot()
 
     def showEvent(self, event):
         super().showEvent(event)
-        if hasattr(self.refine_stage, "on_enter"):
-            self.refine_stage.on_enter()
         self.refresh_plot()
+        # Parameters owns Run / export / all refinement controls
+        self.show_details()
+
+    def closeEvent(self, event):
+        if self._details_dialog is not None:
+            self._details_dialog.close()
+        super().closeEvent(event)
 
     def on_theme_changed(self, mode: str):
         apply_plot_style(self.quant_figure, mode, show_grid=display_settings.show_grid())
@@ -135,7 +129,7 @@ class QuantDialog(QDialog):
 
     def on_display_settings_changed(self, prefs: dict):
         dpi = prefs.get("plot_dpi")
-        if dpi is not None:
+        if dpi is not None and self._details_dialog is not None:
             self.refine_stage.dpi.setValue(int(dpi))
         self.refresh_plot()
 
@@ -158,14 +152,10 @@ class QuantDialog(QDialog):
             self._show_rir_details(self.session.rir_results)
         else:
             self.quant_results_label.setText(
-                "Refinement — run Le Bail, or RIR Quant in the Phases tab"
+                "Refinement — run Le Bail from Parameters, or RIR Quant in Phases"
             )
             self.quant_results_table.set_content([], [])
-        has_phases = bool(
-            self.session.selected_phases or self.session.matched_phases
-            or (results and results.get("success"))
-        )
-        self.details_btn.setEnabled(has_phases)
+        self.details_btn.setEnabled(True)
 
     def _show_lebail_details(self, results: dict):
         parts = refinement_table.summary_headline(results)
@@ -253,10 +243,10 @@ class QuantDialog(QDialog):
                     ax, pattern["two_theta"], pattern["intensity"],
                     pattern.get("intensity_error"), palette["exp_line"],
                 )
-            ax.set_title(self._plot_title("Quant — run Le Bail to see fit"))
+            ax.set_title(self._plot_title("Quant — run Le Bail from Parameters"))
         else:
             ax.text(
-                0.5, 0.5, "Match phases, then run Le Bail",
+                0.5, 0.5, "Match phases, then run Le Bail from Parameters",
                 ha="center", va="center", transform=ax.transAxes,
                 color=palette.get("muted", palette["tick"]),
             )

@@ -47,8 +47,12 @@ class RefineStage(QWidget):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(8)
 
-        title = QLabel("Refine & Export")
+        title = QLabel("Run & defaults")
         title.setStyleSheet("font-weight: 600; font-size: 14px;")
+        title.setToolTip(
+            "Run settings and defaults for every phase. Override one phase at a "
+            "time in the Phases tab on the right."
+        )
         layout.addWidget(title)
 
         form = QFormLayout()
@@ -167,6 +171,32 @@ class RefineStage(QWidget):
             "with it off."
         )
         glob_form.addRow(self.fit_peaks_only)
+
+        self.refine_background = QCheckBox("Refine polynomial background")
+        self.refine_background.setChecked(True)
+        self.refine_background.setToolTip(
+            "Fit a Chebyshev continuum each cycle. When an ALS background was "
+            "fitted in Process, that curve is projected onto the Chebyshev basis "
+            "as the starting model — refinement continues from ALS rather than "
+            "from a flat zero. The continuum is put back into the pattern for "
+            "the fit so the polynomial can inherit that shape.\n\n"
+            "If you already refined background in a previous Quant run and "
+            "“Start from previous refinement” is on, those coefficients are "
+            "kept instead of re-seeding from ALS.\n\n"
+            "Raise the order only if a low-order curve leaves a clear slow "
+            "wiggle in the difference plot."
+        )
+        glob_form.addRow(self.refine_background)
+
+        self.background_order = QSpinBox()
+        self.background_order.setRange(0, 8)
+        self.background_order.setValue(3)
+        self.background_order.setToolTip(
+            "Highest Chebyshev term. Order 2–3 is usually enough after ALS; "
+            "higher orders can start to eat into broad peaks."
+        )
+        self.background_order_label = QLabel("Background order:")
+        glob_form.addRow(self.background_order_label, self.background_order)
 
         toolbox.addItem(glob, "Global parameters")
 
@@ -297,6 +327,9 @@ class RefineStage(QWidget):
         self.refine_intensities.toggled.connect(self._on_pawley_toggled)
         self._on_pawley_toggled()
 
+        self.refine_background.toggled.connect(self._on_background_toggled)
+        self._on_background_toggled()
+
     def _build_export_group(self):
         content = QWidget()
         group_layout = QVBoxLayout(content)
@@ -379,6 +412,11 @@ class RefineStage(QWidget):
         self.max_scale_label.setEnabled(enabled)
         self.max_scale_label.setToolTip(hint)
 
+    def _on_background_toggled(self, *_args):
+        enabled = self.refine_background.isChecked()
+        self.background_order.setEnabled(enabled)
+        self.background_order_label.setEnabled(enabled)
+
     def on_enter(self):
         n = len(self.session.selected_phases) or len(self.session.matched_phases)
         self.refine_btn.setEnabled(n > 0 and self.session.has_pattern())
@@ -431,6 +469,12 @@ class RefineStage(QWidget):
         if previous.get("refine_instrument_profile"):
             for key in ("u_param", "v_param", "w_param"):
                 carried_globals[key] = previous.get(key)
+        coeffs = previous.get("background_coeffs")
+        if coeffs:
+            carried_globals["background_coeffs"] = list(coeffs)
+            carried_globals["background_order"] = previous.get(
+                "background_order", len(coeffs) - 1
+            )
         return per_phase, carried_globals
 
     def run_lebail(self):
@@ -454,11 +498,25 @@ class RefineStage(QWidget):
             self.progress.setRange(0, 0)
             self.status.setText("Running Le Bail refinement…")
 
+            intensity = np.asarray(pattern["intensity"], dtype=float)
+            background_seed = None
+            # When refining background, put the ALS continuum back so Chebyshev
+            # can start from that model instead of a flat zero on subtracted data.
+            als_bg = getattr(self.session, "background", None)
+            if (
+                self.refine_background.isChecked()
+                and als_bg is not None
+                and len(np.asarray(als_bg)) == len(intensity)
+            ):
+                background_seed = np.asarray(als_bg, dtype=float)
+                intensity = intensity + background_seed
+
             experimental_data = {
                 "two_theta": pattern["two_theta"],
-                "intensity": pattern["intensity"],
+                "intensity": intensity,
                 "wavelength": self.session.wavelength,
                 "errors": pattern.get("intensity_error"),
+                "background_seed": background_seed,
             }
 
             two_theta_range = None
@@ -503,6 +561,8 @@ class RefineStage(QWidget):
                 "refine_displacement": self.refine_displacement.isChecked(),
                 "refine_absorption": self.refine_absorption.isChecked(),
                 "refine_harmonics": self.refine_harmonics.isChecked(),
+                "refine_background": self.refine_background.isChecked(),
+                "background_order": self.background_order.value(),
                 # The order stays set even when the coefficients are not being
                 # refined, so that a texture correction already found is still
                 # applied. All-zero coefficients make the correction a no-op.

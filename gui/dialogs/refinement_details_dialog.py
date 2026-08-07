@@ -1,4 +1,4 @@
-"""Everything the refinement holds, and the controls to change it."""
+"""Refinement control window — parameters, run, and export."""
 
 from __future__ import annotations
 
@@ -7,24 +7,22 @@ import csv
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
     QDialog, QFileDialog, QHBoxLayout, QLabel, QMessageBox, QPushButton,
-    QTabWidget, QVBoxLayout, QWidget,
+    QSplitter, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from gui import refinement_table
 from gui.focus import restores_focus
+from gui.stages.refine_stage import RefineStage
 from gui.widgets.copyable_table import CopyableTable
 from gui.widgets.parameter_matrix import ParameterMatrix
 
 
 class RefinementDetailsDialog(QDialog):
     """
-    The parameters behind the summary table, laid out to be worked in.
+    Everything needed to set up and run a refinement.
 
-    This began as a read-only window because the refinement panel had nowhere
-    to show a value, which left the two halves of the same job in different
-    places: you read a number here and went elsewhere to act on it. The grid on
-    the first tab is the same information made editable, so reading a parameter
-    and deciding what to do about it are one gesture.
+    Global and per-phase controls, the editable parameter matrix, Run / Export,
+    and the post-run tables live here so the Quant window can stay a plot.
     """
 
     def __init__(self, session, parent=None):
@@ -32,22 +30,40 @@ class RefinementDetailsDialog(QDialog):
         self.session = session
         self.setWindowTitle("Refinement Parameters")
         self.setWindowModality(Qt.NonModal)
-        self.resize(940, 660)
+        self.resize(1180, 760)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(6)
 
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+
+        # RefineStage uses this dialog as its workspace; plot/status forward to Quant
+        self.refine_stage = RefineStage(session, self)
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.addWidget(self.refine_stage)
+        left.setMinimumWidth(300)
+        left.setMaximumWidth(440)
+        splitter.addWidget(left)
+
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(6)
+
         self.headline = QLabel()
         self.headline.setObjectName("mutedLabel")
         self.headline.setWordWrap(True)
-        root.addWidget(self.headline)
+        right_layout.addWidget(self.headline)
 
         self.tabs = QTabWidget()
-        self.tabs.addTab(self._build_matrix_tab(), "Parameters")
+        self.tabs.addTab(self._build_matrix_tab(), "Phases")
         self.tabs.addTab(self._build_table_tab("global_table"), "Statistics")
         self.tabs.addTab(self._build_table_tab("phase_table"), "All values")
-        root.addWidget(self.tabs, 1)
+        right_layout.addWidget(self.tabs, 1)
 
         buttons = QHBoxLayout()
         self.hint = QLabel()
@@ -64,10 +80,40 @@ class RefinementDetailsDialog(QDialog):
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.close)
         buttons.addWidget(close_btn)
-        root.addLayout(buttons)
+        right_layout.addLayout(buttons)
+
+        splitter.addWidget(right)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([360, 820])
+        root.addWidget(splitter)
 
         session.refinement_changed.connect(self.refresh)
         self.refresh()
+
+    # --- workspace API for RefineStage (forwards to Quant parent) -----------
+
+    def refresh_plot(self):
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "refresh_plot"):
+            parent.refresh_plot()
+
+    def set_status(self, message: str):
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "set_status"):
+            parent.set_status(message)
+
+    @property
+    def quant_figure(self):
+        parent = self.parent()
+        return getattr(parent, "quant_figure", None) if parent is not None else None
+
+    @property
+    def figure(self):
+        parent = self.parent()
+        if parent is None:
+            return None
+        return getattr(parent, "quant_figure", None) or getattr(parent, "figure", None)
 
     # --- construction ------------------------------------------------------
 
@@ -79,7 +125,9 @@ class RefinementDetailsDialog(QDialog):
 
         caption = QLabel(
             "Tick to refine a term for that phase; untick to hold it at the "
-            "value shown, which you can edit. Changes apply to the next run."
+            "value shown, which you can edit. Changes apply to the next run. "
+            "The phase checkboxes on the left set defaults for every phase; "
+            "this grid overrides them one phase at a time."
         )
         caption.setObjectName("mutedLabel")
         caption.setWordWrap(True)
@@ -112,6 +160,8 @@ class RefinementDetailsDialog(QDialog):
 
     def showEvent(self, event):
         super().showEvent(event)
+        if hasattr(self.refine_stage, "on_enter"):
+            self.refine_stage.on_enter()
         self.refresh()
 
     def refresh(self):
@@ -238,5 +288,4 @@ class RefinementDetailsDialog(QDialog):
         except Exception as e:
             QMessageBox.critical(self, "Export Error", str(e))
             return
-        if hasattr(self.parent(), "set_status"):
-            self.parent().set_status(f"Exported {path}")
+        self.set_status(f"Exported {path}")

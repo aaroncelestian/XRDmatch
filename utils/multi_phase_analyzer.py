@@ -821,6 +821,7 @@ class MultiPhaseAnalyzer:
                 experimental_data['intensity'],
                 errors,
                 wavelength=experimental_data.get('wavelength'),
+                background_seed=experimental_data.get('background_seed'),
             )
             
             params = refinement_params or {}
@@ -908,14 +909,22 @@ class MultiPhaseAnalyzer:
                 'refine_displacement': settings.get('refine_displacement', False),
                 'refine_instrument_profile': settings.get('refine_instrument_profile', False),
                 'refine_axial_asymmetry': settings.get('refine_axial_asymmetry', False),
+                'refine_background': settings.get('refine_background', False),
+                'background_order': int(settings.get('background_order', 3) or 3),
             }
             # Starting values carried over from a previous run. This has to come
             # after add_phase, which seeds the instrument widths from the
             # per-phase initial_u/v/w.
             for key in ('zero_shift', 'displacement', 'u_param', 'v_param', 'w_param',
-                        'axial_asymmetry'):
+                        'axial_asymmetry', 'background_coeffs', 'background_order'):
                 value = (settings.get('carry_globals') or {}).get(key)
-                if value is not None:
+                if value is None:
+                    continue
+                if key == 'background_coeffs':
+                    globals_[key] = list(value)
+                elif key == 'background_order':
+                    globals_[key] = int(value)
+                else:
                     globals_[key] = float(value)
             self.lebail_engine.set_global_parameters(**globals_)
 
