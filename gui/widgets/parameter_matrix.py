@@ -37,6 +37,16 @@ class ParameterRow:
         self.quantitative = quantitative
 
 
+_CELL_HINT = (
+    "Cell parameters refine separately, so a can grow while c contracts. What "
+    "the symmetry of the starting cell fixes is held: equal axes move together "
+    "and a right angle stays a right angle, since a pattern cannot tell those "
+    "directions apart.\n\n"
+    "Untick to hold this one at the value shown while the rest of the cell "
+    "refines around it."
+)
+
+
 PHASE_ROWS: tuple = (
     ParameterRow("Scale factor", "scale_factor", "refine_scale", ".6g",
                  "How much of this phase the pattern holds. Untick and type a "
@@ -52,8 +62,12 @@ PHASE_ROWS: tuple = (
     ParameterRow("Peak asymmetry", "asymmetry", "refine_asymmetry", "+.4f",
                  "Skew of this phase's peaks alone. Stacking disorder in the "
                  "layered minerals is the usual cause."),
-    ParameterRow("Lattice scale", "lattice_scale", "refine_cell", ".6f",
-                 "Isotropic dilation of the starting cell."),
+    ParameterRow("a (Å)", "cell_a", "refine_cell", ".5f", _CELL_HINT),
+    ParameterRow("b (Å)", "cell_b", "refine_cell", ".5f", _CELL_HINT),
+    ParameterRow("c (Å)", "cell_c", "refine_cell", ".5f", _CELL_HINT),
+    ParameterRow("α (°)", "cell_alpha", "refine_cell", ".4f", _CELL_HINT),
+    ParameterRow("β (°)", "cell_beta", "refine_cell", ".4f", _CELL_HINT),
+    ParameterRow("γ (°)", "cell_gamma", "refine_cell", ".4f", _CELL_HINT),
     ParameterRow("Absorption", "absorption", "refine_absorption", "+.5f",
                  "Angle-dependent intensity loss, exp(-a / sin θ). Absorbs "
                  "microabsorption contrast between phases.", quantitative=True),
@@ -170,7 +184,11 @@ class ParameterMatrix(QTableWidget):
                 if value is not None:
                     entry[row.value_key] = value
                 refined = item.checkState() == Qt.Checked
-                entry[row.refine_key] = refined
+                # The six cell parameters share one flag, so the cell is refined
+                # if any of them is ticked and the unticked ones are held. Were
+                # the last row to decide the flag on its own, clearing γ would
+                # quietly stop a and c from refining as well.
+                entry[row.refine_key] = bool(entry.get(row.refine_key)) or refined
                 if not refined and value is not None:
                     locked.append(row.value_key)
             if locked:

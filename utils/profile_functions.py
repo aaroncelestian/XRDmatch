@@ -135,6 +135,57 @@ def tch_mix(gamma_gauss: np.ndarray, gamma_lorentz: np.ndarray
     return gamma, eta
 
 
+def tch_split(fwhm: float, eta: float) -> Tuple[float, float]:
+    """
+    The Gaussian and Lorentzian widths behind a pseudo-Voigt, inverting `tch_mix`.
+
+    Fitting a single peak gives a total width and a mixing parameter, but the
+    refinement is parameterized on the two components separately because they
+    belong to different things: the Gaussian to the instrument and the
+    Lorentzian to the sample. Going back through the mixing is what turns one
+    measured peak into a starting instrument resolution curve.
+
+    Both polynomials are monotonic over the range that matters, so each is
+    solved for its one root there rather than iterated on.
+    """
+    fwhm = float(fwhm)
+    eta = float(np.clip(eta, 0.0, 1.0))
+    if fwhm <= 0.0:
+        return 0.0, 0.0
+    if eta <= 0.0:
+        return fwhm, 0.0
+    if eta >= 1.0:
+        return 0.0, fwhm
+
+    b1, b2, b3 = _TCH_ETA
+    q = _real_root([b3, b2, b1, -eta], 0.0, 1.0)
+    lorentz = q * fwhm
+
+    a0, a1, a2, a3, a4, a5 = _TCH_WIDTH
+    gauss = _real_root(
+        [
+            a0,
+            a1 * lorentz,
+            a2 * lorentz ** 2,
+            a3 * lorentz ** 3,
+            a4 * lorentz ** 4,
+            a5 * lorentz ** 5 - fwhm ** 5,
+        ],
+        0.0, fwhm,
+    )
+    return gauss, lorentz
+
+
+def _real_root(coefficients, low: float, high: float) -> float:
+    """The one real root of a polynomial in [low, high], or the nearer end."""
+    roots = np.roots(coefficients)
+    real = roots[np.abs(roots.imag) < 1e-9].real
+    inside = real[(real >= low - 1e-9) & (real <= high + 1e-9)]
+    if not len(inside):
+        return float(low if not len(real) else np.clip(real[np.argmin(np.abs(real))], low, high))
+    return float(np.clip(inside[0], low, high))
+
+
 def pseudo_voigt(offset: np.ndarray, fwhm: np.ndarray, eta: np.ndarray,
                  asymmetry: np.ndarray = 0.0) -> np.ndarray:
     """
@@ -147,11 +198,22 @@ def pseudo_voigt(offset: np.ndarray, fwhm: np.ndarray, eta: np.ndarray,
     """
     offset = np.asarray(offset, dtype=float)
     fwhm = np.maximum(np.asarray(fwhm, dtype=float), 1e-9)
-    eta = np.asarray(eta, dtype=float)
-
     low, high = flank_widths(fwhm, asymmetry)
-    width = np.where(offset < 0.0, low, high)
+    return pseudo_voigt_flanks(offset, low, high, eta)
 
+
+def pseudo_voigt_flanks(offset: np.ndarray, low_width: np.ndarray,
+                        high_width: np.ndarray, eta: np.ndarray) -> np.ndarray:
+    """
+    Unit-height split pseudo-Voigt from flank widths already in hand.
+
+    Separated from `pseudo_voigt` because the flank widths of one reflection are
+    reused: the Kα2 satellite has the same shape as its parent and only sits
+    elsewhere, so it is evaluated from the same pair of widths.
+    """
+    offset = np.asarray(offset, dtype=float)
+    eta = np.asarray(eta, dtype=float)
+    width = np.where(offset < 0.0, low_width, high_width)
     sigma = width * FWHM_TO_SIGMA
     gaussian = np.exp(-0.5 * (offset / sigma) ** 2)
     lorentzian = 1.0 / (1.0 + (offset / (width / 2.0)) ** 2)

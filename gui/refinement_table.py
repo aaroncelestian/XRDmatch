@@ -25,11 +25,12 @@ SUMMARY_COLUMNS: Tuple[Tuple[str, str], ...] = (
     ("a (Å)", "Refined a axis"),
     ("b (Å)", "Refined b axis"),
     ("c (Å)", "Refined c axis"),
-    ("α (°)", "Cell angle; unchanged by an isotropic dilation"),
-    ("β (°)", "Cell angle; unchanged by an isotropic dilation"),
-    ("γ (°)", "Cell angle; unchanged by an isotropic dilation"),
+    ("α (°)", "Refined cell angle. An angle fixed at 90° by symmetry is held there"),
+    ("β (°)", "Refined cell angle. An angle fixed at 90° by symmetry is held there"),
+    ("γ (°)", "Refined cell angle. An angle fixed at 90° by symmetry is held there"),
     ("V (Å³)", "Refined cell volume"),
-    ("Δlattice %", "Isotropic lattice dilation from the starting cell"),
+    ("ΔV %", "Cell volume change from the starting cell. The per-axis changes "
+             "are in the parameter window, since they need not agree"),
     ("Contrib.%", "Share of the calculated pattern intensity"),
 )
 
@@ -136,13 +137,37 @@ def _number(value, spec: str, missing: str = _MISSING) -> str:
         return missing
 
 
+def _cell_change(phase: Dict, key: str) -> Optional[float]:
+    """
+    How far one cell parameter moved: percent for the edges and the volume,
+    degrees for the angles.
+
+    Taken from what the refinement reported where it said, and worked out from
+    the two cells where it did not, so a result saved by an older version still
+    fills the column.
+    """
+    delta = phase.get("cell_delta") or {}
+    if key in delta:
+        return delta[key]
+    now = (phase.get("unit_cell") or {}).get(key)
+    start = (phase.get("base_unit_cell") or {}).get(key)
+    if now is None or start is None:
+        return None
+    try:
+        now, start = float(now), float(start)
+    except (TypeError, ValueError):
+        return None
+    if key in ("alpha", "beta", "gamma"):
+        return now - start
+    return (now / start - 1.0) * 100.0 if start > 0 else None
+
+
 def summary_rows(results: Optional[Dict]) -> List[List[str]]:
     """One formatted row per phase, matching SUMMARY_COLUMNS."""
     inner = (results or {}).get("refinement_results") or {}
     rows = []
     for index, phase in enumerate(inner.get("phase_summary") or []):
         cell = phase.get("unit_cell") or {}
-        lattice = phase.get("lattice_scale")
         rows.append([
             str(phase.get("name") or f"Phase {index + 1}"),
             _number(phase.get("weight_percent"), ".1f"),
@@ -155,7 +180,7 @@ def summary_rows(results: Optional[Dict]) -> List[List[str]]:
             _number(cell.get("beta"), ".3f"),
             _number(cell.get("gamma"), ".3f"),
             _number(cell.get("volume"), ".2f"),
-            _number(None if lattice is None else (float(lattice) - 1.0) * 100.0, "+.3f"),
+            _number(_cell_change(phase, "volume"), "+.3f"),
             _number(phase.get("contribution_percent"), ".1f"),
         ])
     return rows
@@ -171,14 +196,21 @@ def summary_tooltips(results: Optional[Dict]) -> List[List[str]]:
             phase.get("weight_percent_basis"),
             "Not available for a Le Bail extraction",
         )
+        free = ", ".join(phase.get("cell_free") or ())
+        cell_note = (
+            f"Free: {free}. Anything not listed is held by the symmetry of the "
+            "starting cell" if free else
+            "Reflections could not be indexed, so the cell was dilated as a whole"
+        )
         tooltips.append([
             str(phase.get("formula") or ""),
             wt_note, "", "",
             _start_note(base.get("a")), _start_note(base.get("b")),
             _start_note(base.get("c")),
-            "", "", "",
+            _start_note(base.get("alpha"), "°"), _start_note(base.get("beta"), "°"),
+            _start_note(base.get("gamma"), "°"),
             _start_note(base.get("volume"), "Å³"),
-            "Isotropic lattice dilation", "",
+            cell_note, "",
         ])
     return tooltips
 
@@ -254,13 +286,15 @@ def phase_parameters(results: Optional[Dict],
         name = row.get("name")
         if not name:
             continue
+        cell = row.get("unit_cell") or {}
         entry = {
             "scale_factor": row.get("scale"),
             "microstrain": row.get("microstrain"),
             "crystallite_size": row.get("crystallite_size"),
             "asymmetry": row.get("asymmetry"),
-            "lattice_scale": row.get("lattice_scale"),
             "absorption": row.get("absorption"),
+            **{f"cell_{key}": cell.get(key)
+               for key in ("a", "b", "c", "alpha", "beta", "gamma")},
             # Defaults match the refine-stage checkboxes; an older result that
             # never recorded its flags still opens looking like a fresh run
             "refine_scale": True,
@@ -281,6 +315,24 @@ def phase_parameters(results: Optional[Dict],
 
 
 # --- everything the refinement holds, for the details window and the CSV ----
+
+def _alpha2_description(ratio) -> str:
+    """
+    What the doublet setting was, in terms of what it does to the peaks.
+
+    Worth spelling out rather than printing a bare number: a reader comparing
+    two runs needs to see at a glance that one modelled two lines per reflection
+    and the other one, since almost every peak-shape quantity beside it means
+    something different depending on which.
+    """
+    try:
+        ratio = float(ratio)
+    except (TypeError, ValueError):
+        return "not modelled"
+    if ratio <= 0.0:
+        return "not modelled (one line per reflection)"
+    return f"modelled at {ratio:.3f} of each parent line"
+
 
 def global_rows(results: Optional[Dict]) -> List[Tuple[str, str]]:
     """(name, value) for the parameters shared by every phase."""
@@ -312,6 +364,7 @@ def global_rows(results: Optional[Dict]) -> List[Tuple[str, str]]:
         ("Instrument V", _number(globals_.get("v_param"), ".6f")),
         ("Instrument W", _number(globals_.get("w_param"), ".6f")),
         ("Axial asymmetry", _number(globals_.get("axial_asymmetry"), "+.5f")),
+        ("Kα2 satellites", _alpha2_description(globals_.get("alpha2_ratio"))),
     ]
     bg_coeffs = globals_.get("background_coeffs") or []
     if globals_.get("refine_background") or bg_coeffs:
@@ -331,6 +384,7 @@ def global_rows(results: Optional[Dict]) -> List[Tuple[str, str]]:
         ("Instrument profile refined", "refine_instrument_profile"),
         ("Axial asymmetry refined", "refine_axial_asymmetry"),
         ("Background refined", "refine_background"),
+        ("Kα2 ratio refined", "refine_alpha2_ratio"),
     ):
         rows.append((label, "yes" if globals_.get(key) else "no"))
     return rows
@@ -357,10 +411,8 @@ _DETAIL_FIELDS = (
     ("Crystallite size (µm)", lambda p: _number(p.get("crystallite_size"), ".4g")),
     ("Phase asymmetry", lambda p: _number(p.get("asymmetry"), "+.4f")),
     ("Peak skew", lambda p: _skew_direction(p.get("asymmetry"))),
-    ("Lattice scale", lambda p: _number(p.get("lattice_scale"), ".6f")),
-    ("Δlattice (%)", lambda p: _number(
-        None if p.get("lattice_scale") is None
-        else (float(p["lattice_scale"]) - 1.0) * 100.0, "+.4f")),
+    ("Cell parameters free", lambda p: ", ".join(p.get("cell_free") or ())
+     or "none refined separately — dilated as a whole"),
     ("a (Å)", lambda p: _number((p.get("unit_cell") or {}).get("a"), ".5f")),
     ("b (Å)", lambda p: _number((p.get("unit_cell") or {}).get("b"), ".5f")),
     ("c (Å)", lambda p: _number((p.get("unit_cell") or {}).get("c"), ".5f")),
@@ -368,9 +420,22 @@ _DETAIL_FIELDS = (
     ("β (°)", lambda p: _number((p.get("unit_cell") or {}).get("beta"), ".4f")),
     ("γ (°)", lambda p: _number((p.get("unit_cell") or {}).get("gamma"), ".4f")),
     ("Volume (Å³)", lambda p: _number((p.get("unit_cell") or {}).get("volume"), ".3f")),
+    ("Δa (%)", lambda p: _number(_cell_change(p, "a"), "+.4f")),
+    ("Δb (%)", lambda p: _number(_cell_change(p, "b"), "+.4f")),
+    ("Δc (%)", lambda p: _number(_cell_change(p, "c"), "+.4f")),
+    ("Δα (°)", lambda p: _number(_cell_change(p, "alpha"), "+.4f")),
+    ("Δβ (°)", lambda p: _number(_cell_change(p, "beta"), "+.4f")),
+    ("Δγ (°)", lambda p: _number(_cell_change(p, "gamma"), "+.4f")),
+    ("ΔV (%)", lambda p: _number(_cell_change(p, "volume"), "+.4f")),
     ("Starting a (Å)", lambda p: _number((p.get("base_unit_cell") or {}).get("a"), ".5f")),
     ("Starting b (Å)", lambda p: _number((p.get("base_unit_cell") or {}).get("b"), ".5f")),
     ("Starting c (Å)", lambda p: _number((p.get("base_unit_cell") or {}).get("c"), ".5f")),
+    ("Starting α (°)",
+     lambda p: _number((p.get("base_unit_cell") or {}).get("alpha"), ".4f")),
+    ("Starting β (°)",
+     lambda p: _number((p.get("base_unit_cell") or {}).get("beta"), ".4f")),
+    ("Starting γ (°)",
+     lambda p: _number((p.get("base_unit_cell") or {}).get("gamma"), ".4f")),
     ("Starting volume (Å³)",
      lambda p: _number((p.get("base_unit_cell") or {}).get("volume"), ".3f")),
     ("Absorption", lambda p: _number(p.get("absorption"), "+.5f")),

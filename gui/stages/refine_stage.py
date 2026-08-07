@@ -1,21 +1,30 @@
-"""Refine stage — Le Bail refinement and export."""
+"""Refine stage — Le Bail refinement and export.
+
+The controls live in the Refinement Parameters window, beside the per-phase
+grid, so that setting up a run and reading what the last one found are the same
+place rather than two.
+"""
 
 from __future__ import annotations
 
 import csv
 
 import numpy as np
+from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
-    QAbstractButton, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
-    QFormLayout, QHBoxLayout, QLabel, QMessageBox, QProgressBar,
-    QPushButton, QSpinBox, QToolBox, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout,
+    QHBoxLayout, QLabel, QMessageBox, QProgressBar, QPushButton, QSpinBox,
+    QVBoxLayout, QWidget,
 )
 
+from utils import kalpha_filter as kalpha
 from utils.multi_phase_analyzer import MultiPhaseAnalyzer
 from utils.lebail_refinement import LeBailRefinement
 from gui import display_settings, refinement_table
 from gui.focus import hold_focus, restores_focus
-from gui.widgets.section import CollapsibleSection
+from gui.widgets.control_bar import compact, no_wheel
+from gui.widgets.section import SectionFrame
+from gui.dialogs.profile_seed_dialog import ProfileSeedDialog
 from gui.dialogs.refinement_progress_dialog import (
     RefinementProgressDialog, RefinementWorker,
 )
@@ -44,7 +53,7 @@ class RefineStage(QWidget):
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setContentsMargins(0, 4, 0, 0)
         layout.setSpacing(8)
 
         title = QLabel("Run & defaults")
@@ -55,19 +64,58 @@ class RefineStage(QWidget):
         )
         layout.addWidget(title)
 
-        form = QFormLayout()
-        self.max_iter = QSpinBox()
+        layout.addLayout(self._build_run_row())
+
+        self.progress = QProgressBar()
+        self.progress.setVisible(False)
+        layout.addWidget(self.progress)
+
+        self.status = QLabel("Select matched phases in the Phases tab, then refine.")
+        self.status.setObjectName("mutedLabel")
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+
+        columns = QHBoxLayout()
+        columns.setSpacing(8)
+        for column in (
+            self._build_global_group(),
+            self._build_phase_group(),
+            self._build_side_column(),
+        ):
+            columns.addWidget(column, 1, Qt.AlignTop)
+        layout.addLayout(columns, 1)
+
+        self.intensity_model.currentIndexChanged.connect(self._on_intensity_model_changed)
+        self.refine_harmonics.toggled.connect(self._on_intensity_model_changed)
+        self._on_intensity_model_changed()
+
+        self.refine_intensities.toggled.connect(self._on_pawley_toggled)
+        self._on_pawley_toggled()
+
+    def _build_run_row(self):
+        """The run button and the settings that qualify a whole run."""
+        row = QHBoxLayout()
+        row.setSpacing(8)
+
+        self.refine_btn = QPushButton("Run Le Bail Refinement")
+        self.refine_btn.setObjectName("primaryButton")
+        self.refine_btn.clicked.connect(self.run_lebail)
+        row.addWidget(self.refine_btn)
+
+        self.max_iter = no_wheel(QSpinBox())
         self.max_iter.setRange(3, 50)
         self.max_iter.setValue(10)
-        form.addRow("Max iterations:", self.max_iter)
+        row.addWidget(self._muted("Max iterations:"))
+        row.addWidget(compact(self.max_iter, 70))
 
-        self.fwhm = QDoubleSpinBox()
+        self.fwhm = no_wheel(QDoubleSpinBox())
         self.fwhm.setRange(0.005, 1.0)
         self.fwhm.setDecimals(3)
         self.fwhm.setSingleStep(0.005)
         self.fwhm.setValue(0.1)
         self.fwhm.setSuffix("°")
-        form.addRow("Initial FWHM:", self.fwhm)
+        row.addWidget(self._muted("Initial FWHM:"))
+        row.addWidget(compact(self.fwhm, 90))
 
         self.intensity_model = QComboBox()
         self.intensity_model.addItem("Reference intensities (quantitative)", "fixed")
@@ -80,28 +128,29 @@ class RefineStage(QWidget):
             "pattern. It gives the best profile and cell fit, but it absorbs the scale "
             "factor, so nothing is left to quantify with."
         )
-        form.addRow("Intensity model:", self.intensity_model)
-        layout.addLayout(form)
+        row.addWidget(self._muted("Intensity model:"))
+        row.addWidget(compact(self.intensity_model, 300))
+        row.addStretch()
+        return row
 
-        self.refine_btn = QPushButton("Run Le Bail Refinement")
-        self.refine_btn.setObjectName("primaryButton")
-        self.refine_btn.clicked.connect(self.run_lebail)
-        layout.addWidget(self.refine_btn)
+    @staticmethod
+    def _muted(text: str) -> QLabel:
+        label = QLabel(text)
+        label.setObjectName("mutedLabel")
+        return label
 
-        self.progress = QProgressBar()
-        self.progress.setVisible(False)
-        layout.addWidget(self.progress)
+    @staticmethod
+    def _section(title: str):
+        """A titled group whose rows sit at their natural spacing."""
+        group = SectionFrame(title)
+        form = QFormLayout()
+        form.setSpacing(6)
+        group.body.addLayout(form)
+        return group, form
 
-        self.status = QLabel("Select matched phases in the Phases tab, then refine.")
-        self.status.setObjectName("mutedLabel")
-        self.status.setWordWrap(True)
-        layout.addWidget(self.status)
-
-        toolbox = QToolBox()
-
-        # --- Global parameters: one value for the whole pattern ---
-        glob = QWidget()
-        glob_form = QFormLayout(glob)
+    def _build_global_group(self):
+        """Global parameters: one value for the whole pattern."""
+        group, glob_form = self._section("Global parameters")
 
         self.continue_previous = QCheckBox("Start from previous refinement")
         self.continue_previous.setChecked(True)
@@ -156,6 +205,23 @@ class RefineStage(QWidget):
             "instead."
         )
         glob_form.addRow(self.refine_axial)
+        glob_form.addRow(self._build_alpha2_row())
+
+        self.seed_btn = QPushButton("Seed profile from a peak…")
+        self.seed_btn.setToolTip(
+            "Fit one isolated peak and start the instrument width from what it "
+            "measures, instead of from a default that has never seen this "
+            "diffractometer.\n\n"
+            "The fit splits the peak's width into a Gaussian part, which belongs "
+            "to the instrument, and a Lorentzian part, which belongs to the "
+            "specimen. Left uncalibrated, the instrument width is too narrow and "
+            "microstrain grows to make up the difference, which gets the total "
+            "width right and the peak shape wrong.\n\n"
+            "It also fits the Kα2 ratio, which is how to find out whether the "
+            "satellites are in your data."
+        )
+        self.seed_btn.clicked.connect(self.seed_profile_from_peak)
+        glob_form.addRow(self.seed_btn)
 
         self.fit_peaks_only = QCheckBox("Fit only near modelled peaks")
         self.fit_peaks_only.setChecked(False)
@@ -171,6 +237,7 @@ class RefineStage(QWidget):
             "with it off."
         )
         glob_form.addRow(self.fit_peaks_only)
+        return group
 
         self.refine_background = QCheckBox("Refine polynomial background")
         self.refine_background.setChecked(True)
@@ -200,9 +267,93 @@ class RefineStage(QWidget):
 
         toolbox.addItem(glob, "Global parameters")
 
-        # --- Phase-specific parameters ---
-        per_phase = QWidget()
-        phase_form = QFormLayout(per_phase)
+    def _build_alpha2_row(self):
+        """Whether each reflection is one line or a doublet."""
+        row = QHBoxLayout()
+        row.setSpacing(6)
+
+        self.model_alpha2 = QCheckBox("Model Kα2 satellites")
+        self.model_alpha2.setChecked(False)
+        self.model_alpha2.setToolTip(
+            "A lab source emits two Kα lines, so every reflection is a doublet: "
+            "a Kα1 line and a satellite at higher 2θ with about half the "
+            "intensity, a tenth of a degree away at 36° and growing as tan θ.\n\n"
+            "Satellites that are in the data but not in the model cannot be "
+            "fitted, only compensated: the missing intensity is taken up as extra "
+            "width and a lean towards high 2θ, on every peak of every phase. If "
+            "your phases refine a large negative asymmetry, this is the first "
+            "thing to suspect.\n\n"
+            "Leave off for synchrotron or monochromated data, or if the "
+            "satellites have already been stripped. 'Seed profile from a peak' "
+            "will tell you which you have.\n\n"
+            "With satellites modelled the pattern wavelength should be Kα1, not "
+            "the doublet average."
+        )
+        row.addWidget(self.model_alpha2)
+
+        self.alpha2_ratio = no_wheel(QDoubleSpinBox())
+        self.alpha2_ratio.setRange(0.0, 0.6)
+        self.alpha2_ratio.setDecimals(2)
+        self.alpha2_ratio.setSingleStep(0.05)
+        self.alpha2_ratio.setValue(kalpha.NOMINAL_INTENSITY_RATIO)
+        self.alpha2_ratio.setToolTip(
+            "Satellite intensity as a fraction of its parent. The transition "
+            "probabilities put it at 0.50; a lower value fits data whose "
+            "satellites were partly removed."
+        )
+        row.addWidget(self._muted("Kα2/Kα1:"))
+        row.addWidget(compact(self.alpha2_ratio, 70))
+
+        self.refine_alpha2 = QCheckBox("refine")
+        self.refine_alpha2.setToolTip(
+            "Refine the ratio against the whole pattern. Worth one run as a "
+            "diagnostic: a value that settles near 0.5 confirms the doublet is "
+            "there, and one that goes to zero says it is not."
+        )
+        row.addWidget(self.refine_alpha2)
+        row.addStretch()
+
+        self.model_alpha2.toggled.connect(self.alpha2_ratio.setEnabled)
+        self.model_alpha2.toggled.connect(self.refine_alpha2.setEnabled)
+        self.alpha2_ratio.setEnabled(False)
+        self.refine_alpha2.setEnabled(False)
+        return row
+
+    @restores_focus
+    def seed_profile_from_peak(self):
+        """Fit one peak and take the instrument terms it implies."""
+        pattern = self.session.active_pattern()
+        if not pattern:
+            QMessageBox.warning(self, "No Pattern",
+                                "Load and process a pattern first.")
+            return
+
+        dialog = ProfileSeedDialog(
+            pattern["two_theta"], pattern["intensity"],
+            self.session.wavelength, self,
+        )
+        if dialog.exec_() != QDialog.Accepted or not dialog.applied:
+            return
+
+        taken = []
+        if "fwhm" in dialog.applied:
+            self.fwhm.setValue(round(float(dialog.applied["fwhm"]), 3))
+            taken.append(f"initial FWHM {self.fwhm.value():.3f}°")
+        if "alpha2_ratio" in dialog.applied:
+            ratio = float(dialog.applied["alpha2_ratio"])
+            self.model_alpha2.setChecked(ratio > 0.0)
+            self.alpha2_ratio.setValue(round(ratio, 2))
+            taken.append(f"Kα2/Kα1 = {ratio:.2f}")
+        if taken:
+            self.status.setText(
+                "Seeded from the fitted peak: " + ", ".join(taken)
+                + ". The instrument now carries the width it measured, so start "
+                "the sample terms low."
+            )
+
+    def _build_phase_group(self):
+        """Terms carried by each phase in its own right."""
+        group, phase_form = self._section("Phase parameters")
 
         self.refine_strain = QCheckBox("Refine microstrain")
         self.refine_strain.setChecked(True)
@@ -242,10 +393,14 @@ class RefineStage(QWidget):
         self.refine_cell = QCheckBox("Refine unit cell")
         self.refine_cell.setChecked(True)
         self.refine_cell.setToolTip(
-            "Refines an isotropic lattice dilation per phase, reported as scaled "
-            "cell edges and volume.\n\n"
-            "Anisotropic a/b/c refinement needs Miller indices per reflection, "
-            "which the stored reference patterns do not carry."
+            "Refines a, b, c and the cell angles separately for each phase, so "
+            "one axis can expand while another contracts.\n\n"
+            "What the symmetry of the starting cell fixes is held: equal axes "
+            "move together and a right angle stays a right angle. Miller "
+            "indices are recovered from the reference d-spacings to do this; a "
+            "phase whose reflections will not index is dilated as a whole "
+            "instead, and the parameter window says which happened.\n\n"
+            "Hold one parameter while the rest refine by unticking it there."
         )
         phase_form.addRow(self.refine_cell)
 
@@ -271,7 +426,7 @@ class RefineStage(QWidget):
         )
         phase_form.addRow(self.refine_harmonics)
 
-        self.harmonic_order = QComboBox()
+        self.harmonic_order = no_wheel(QComboBox())
         for label, value in (("2 (1 term)", 2), ("4 (2 terms)", 4), ("6 (3 terms)", 6)):
             self.harmonic_order.addItem(label, value)
         self.harmonic_order.setCurrentIndex(1)
@@ -289,105 +444,83 @@ class RefineStage(QWidget):
         )
         phase_form.addRow(self.refine_intensities)
 
-        self.max_scale = QDoubleSpinBox()
+        self.max_scale = no_wheel(QDoubleSpinBox())
         self.max_scale.setRange(1.0, 1000.0)
         self.max_scale.setValue(100.0)
         self.max_scale_label = QLabel("Max scale:")
-        phase_form.addRow(self.max_scale_label, self.max_scale)
+        phase_form.addRow(self.max_scale_label, compact(self.max_scale, 90))
+        return group
 
-        toolbox.addItem(per_phase, "Phase parameters")
+    def _build_side_column(self):
+        """The window a run fits over, and what leaves the program after it."""
+        column = QWidget()
+        column_layout = QVBoxLayout(column)
+        column_layout.setContentsMargins(0, 0, 0, 0)
+        column_layout.setSpacing(8)
+        column_layout.addWidget(self._build_range_group())
+        column_layout.addWidget(self._build_export_group())
+        return column
 
-        # --- Fitted 2θ range ---
-        adv = QWidget()
-        adv_form = QFormLayout(adv)
+    def _build_range_group(self):
+        group, adv_form = self._section("Fitted range")
 
         self.use_range = QCheckBox("Limit 2θ range")
         adv_form.addRow(self.use_range)
-        self.min_2th = QDoubleSpinBox()
+        self.min_2th = no_wheel(QDoubleSpinBox())
         self.min_2th.setRange(0, 180)
         self.min_2th.setValue(10)
         self.min_2th.setSuffix("°")
-        adv_form.addRow("Min 2θ:", self.min_2th)
-        self.max_2th = QDoubleSpinBox()
+        adv_form.addRow("Min 2θ:", compact(self.min_2th, 90))
+        self.max_2th = no_wheel(QDoubleSpinBox())
         self.max_2th.setRange(0, 180)
         self.max_2th.setValue(90)
         self.max_2th.setSuffix("°")
-        adv_form.addRow("Max 2θ:", self.max_2th)
-
-        toolbox.addItem(adv, "Fitted range")
-        self._fix_toolbox_tab_heights(toolbox)
-        layout.addWidget(toolbox)
-        layout.addStretch()
-        layout.addWidget(self._build_export_group())
-
-        self.intensity_model.currentIndexChanged.connect(self._on_intensity_model_changed)
-        self.refine_harmonics.toggled.connect(self._on_intensity_model_changed)
-        self._on_intensity_model_changed()
-
-        self.refine_intensities.toggled.connect(self._on_pawley_toggled)
-        self._on_pawley_toggled()
+        adv_form.addRow("Max 2θ:", compact(self.max_2th, 90))
+        return group
 
         self.refine_background.toggled.connect(self._on_background_toggled)
         self._on_background_toggled()
 
     def _build_export_group(self):
-        content = QWidget()
-        group_layout = QVBoxLayout(content)
-        group_layout.setContentsMargins(8, 4, 8, 4)
+        group, export_form = self._section("Export")
 
-        button_row = QHBoxLayout()
+        plot_row = QHBoxLayout()
         self.export_png = QPushButton("PNG")
         self.export_png.setToolTip("Save the plot as a raster image.")
         self.export_png.clicked.connect(lambda: self.export_plot("png"))
-        button_row.addWidget(self.export_png)
+        plot_row.addWidget(self.export_png)
         self.export_pdf = QPushButton("PDF")
         self.export_pdf.setToolTip("Save the plot as a vector figure.")
         self.export_pdf.clicked.connect(lambda: self.export_plot("pdf"))
-        button_row.addWidget(self.export_pdf)
-        group_layout.addLayout(button_row)
+        plot_row.addWidget(self.export_pdf)
+        export_form.addRow("Plot:", plot_row)
 
+        data_row = QHBoxLayout()
         self.export_csv = QPushButton("Results table")
         self.export_csv.setToolTip(
             "Write the per-phase results as CSV, under the statistics that "
             "qualify them."
         )
         self.export_csv.clicked.connect(self.export_csv_data)
-        group_layout.addWidget(self.export_csv)
-
+        data_row.addWidget(self.export_csv)
         self.export_pattern_btn = QPushButton("Pattern data")
         self.export_pattern_btn.setToolTip(
             "Write the pattern point by point as CSV: observed, and the "
             "calculated and difference curves once a refinement has run."
         )
         self.export_pattern_btn.clicked.connect(self.export_pattern_csv)
-        group_layout.addWidget(self.export_pattern_btn)
+        data_row.addWidget(self.export_pattern_btn)
+        export_form.addRow("Data:", data_row)
 
-        dpi_form = QFormLayout()
-        self.dpi = QSpinBox()
+        self.dpi = no_wheel(QSpinBox())
         self.dpi.setRange(72, 600)
         self.dpi.setValue(display_settings.export_dpi())
         self.dpi.setToolTip("Resolution of the PNG export.")
         self.dpi.valueChanged.connect(
             lambda value: display_settings.update({"plot_dpi": value})
         )
-        dpi_form.addRow("Image DPI:", self.dpi)
-        group_layout.addLayout(dpi_form)
-
-        self.export_section = CollapsibleSection("Export", content, expanded=False)
-        return self.export_section
-
-    @staticmethod
-    def _fix_toolbox_tab_heights(toolbox):
-        """Keep the tab labels from clipping.
-
-        The tab buttons size themselves from the font alone, so the padding the
-        stylesheet adds eats into the text rather than growing the button.
-        """
-        for button in toolbox.findChildren(QAbstractButton):
-            if button.parent() is toolbox:
-                button.setMinimumHeight(
-                    button.fontMetrics().height() + 16
-                )
+        export_form.addRow("Image DPI:", compact(self.dpi, 90))
+        return group
 
     def _on_intensity_model_changed(self, *_args):
         """Absorption and texture are only determinable with fixed intensities."""
@@ -437,6 +570,7 @@ class RefineStage(QWidget):
         ("microstrain", "microstrain"),
         ("asymmetry", "asymmetry"),
         ("lattice_scale", "lattice_scale"),
+        ("unit_cell", "unit_cell"),
         ("absorption", "absorption"),
         ("harmonic_coeffs", "harmonic_coeffs"),
     )
@@ -475,6 +609,11 @@ class RefineStage(QWidget):
             carried_globals["background_order"] = previous.get(
                 "background_order", len(coeffs) - 1
             )
+
+        # Likewise the satellite ratio: the box holds it unless a run refined it,
+        # and unticking the doublet has to turn it off rather than carry it on
+        if previous.get("refine_alpha2_ratio") and self.model_alpha2.isChecked():
+            carried_globals["alpha2_ratio"] = previous.get("alpha2_ratio")
         return per_phase, carried_globals
 
     def run_lebail(self):
@@ -551,6 +690,10 @@ class RefineStage(QWidget):
                 "refine_asymmetry": refine_asymmetry,
                 "refine_instrument_profile": self.refine_instrument.isChecked(),
                 "refine_axial_asymmetry": self.refine_axial.isChecked(),
+                "alpha2_ratio": (self.alpha2_ratio.value()
+                                 if self.model_alpha2.isChecked() else 0.0),
+                "refine_alpha2_ratio": (self.model_alpha2.isChecked()
+                                        and self.refine_alpha2.isChecked()),
                 "refine_intensities": self.refine_intensities.isChecked(),
                 "intensity_model": self.intensity_model.currentData() or "fixed",
                 "fit_peak_regions_only": self.fit_peaks_only.isChecked(),

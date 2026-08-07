@@ -37,11 +37,17 @@ def qt_app():
 
 VALUES = {
     "Quartz": {"scale_factor": 1.25, "microstrain": 800.0, "crystallite_size": 0.5,
-               "asymmetry": 0.0, "lattice_scale": 1.0, "absorption": 0.0,
-               "refine_scale": True, "refine_strain": True, "refine_size": False},
+               "asymmetry": 0.0, "absorption": 0.0,
+               "cell_a": 4.913, "cell_b": 4.913, "cell_c": 5.405,
+               "cell_alpha": 90.0, "cell_beta": 90.0, "cell_gamma": 120.0,
+               "refine_scale": True, "refine_strain": True, "refine_size": False,
+               "refine_cell": True},
     "Albite": {"scale_factor": 0.75, "microstrain": 150.0, "crystallite_size": 0.2,
-               "asymmetry": -0.3, "lattice_scale": 0.99, "absorption": 0.0,
-               "refine_scale": True, "refine_strain": False, "refine_size": False},
+               "asymmetry": -0.3, "absorption": 0.0,
+               "cell_a": 8.14, "cell_b": 12.8, "cell_c": 7.16,
+               "cell_alpha": 94.3, "cell_beta": 116.6, "cell_gamma": 87.7,
+               "refine_scale": True, "refine_strain": False, "refine_size": False,
+               "refine_cell": True},
 }
 
 
@@ -132,6 +138,27 @@ def test_one_parameter_can_be_set_across_every_phase(qt_app):
     matrix.set_all("Microstrain (×10⁻⁶)", False)
     overrides = matrix.overrides()
     assert all("microstrain" in overrides[n]["_locked"] for n in VALUES)
+
+
+def test_the_cell_shows_as_six_rows_not_one_dilation(qt_app):
+    labels = [row.label for row in PHASE_ROWS]
+    for expected in ("a (Å)", "b (Å)", "c (Å)", "α (°)", "β (°)", "γ (°)"):
+        assert expected in labels
+    assert "Lattice scale" not in labels
+
+
+def test_unticking_one_axis_holds_it_without_stopping_the_cell(qt_app):
+    """
+    The six cell rows share one refine flag. Clearing c must hold c, not turn
+    the whole cell off, or a and b would stop refining with it.
+    """
+    matrix = _filled(qt_app)
+    column = 1 + list(VALUES).index("Quartz")
+    matrix.item(_row_index("c (Å)"), column).setCheckState(Qt.Unchecked)
+    overrides = matrix.overrides()["Quartz"]
+    assert overrides["refine_cell"] is True
+    assert "cell_c" in overrides["_locked"]
+    assert "cell_a" not in overrides.get("_locked", [])
 
 
 # --- the whole path --------------------------------------------------------
